@@ -117,8 +117,8 @@ int run_differential() {
 
 int run_benchmark() {
   constexpr int kGames = 1 << 20;
-  constexpr int kWarmups = 3;
-  constexpr int kIterations = 12;
+  constexpr int kWarmups = 8;
+  constexpr int kIterations = 256;
   constexpr std::uint64_t kMasterSeed = 0x62656e63685f3031ULL;
   constexpr std::array<int, 3> kBlockSizes{128, 256, 512};
   const std::size_t words = static_cast<std::size_t>(kGames) * kFieldCount;
@@ -150,6 +150,8 @@ int run_benchmark() {
   std::cout << "deal_kernel registers/thread=" << attributes.numRegs
             << " local_bytes/thread=" << attributes.localSizeBytes
             << " static_shared_bytes/block=" << attributes.sharedSizeBytes << '\n';
+  std::cout << "benchmark_warmups=" << kWarmups
+            << " benchmark_iterations=" << kIterations << '\n';
 
   for (const int threads : kBlockSizes) {
     const int blocks = (kGames + threads - 1) / threads;
@@ -211,9 +213,12 @@ int run_benchmark() {
     const double occupancy =
         static_cast<double>(active_blocks_per_sm * threads) /
         static_cast<double>(properties.maxThreadsPerMultiProcessor);
+    const double average_kernel_us =
+        static_cast<double>(elapsed_ms) * 1000.0 / kIterations;
 
     std::cout << std::fixed << std::setprecision(2)
               << "threads=" << threads << " elapsed_ms=" << elapsed_ms
+              << " avg_kernel_us=" << average_kernel_us
               << " games/s=" << games_per_second
               << " sampled_cards/s=" << sampled_cards_per_second
               << " theoretical_occupancy=" << occupancy * 100.0 << "%\n";

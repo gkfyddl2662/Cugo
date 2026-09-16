@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
@@ -58,6 +59,19 @@ __global__ void draw_stock_kernel(ResidentStateSoA48 states,
   states.stock[index] = stock;
   states.rng_state[index] = rng_state;
   drawn[index] = card;
+}
+
+void enqueue_stock_round(ResidentStateSoA48 states,
+                         std::uint8_t* drawn,
+                         int games,
+                         int blocks,
+                         std::uint64_t master_seed,
+                         cudaStream_t stream) {
+  init_resident_state_kernel<<<blocks, kThreads, 0, stream>>>(
+      states, games, master_seed);
+  for (int step = 0; step < cugo::game::kBaseStockCards; ++step) {
+    draw_stock_kernel<<<blocks, kThreads, 0, stream>>>(states, drawn, games);
+  }
 }
 
 bool check_cuda(cudaError_t status, const char* what) {
@@ -145,7 +159,8 @@ int run_differential() {
 
     for (int step = 0; step < kSteps; ++step) {
       const auto expected = cugo::game::draw_stock_card(cpu);
-      const auto actual = host_trace[static_cast<std::size_t>(step) * kGames + game];
+      const auto actual =
+          host_trace[static_cast<std::size_t>(step) * kGames + game];
       if (actual != expected) {
         std::cerr << "CPU/GPU draw mismatch at game " << game << ", step " << step
                   << ": gpu=" << static_cast<unsigned>(actual)
@@ -172,8 +187,8 @@ int run_differential() {
 int run_benchmark() {
   constexpr int kGames = 1 << 20;
   constexpr int kSteps = cugo::game::kBaseStockCards;
-  constexpr int kWarmups = 3;
-  constexpr int kIterations = 12;
+  constexpr int kWarmups = 8;
+  constexpr int kIterations = 256;
   constexpr std::uint64_t kMasterSeed = 0x73746174655f626dULL;
   const int blocks = (kGames + kThreads - 1) / kThreads;
   const std::size_t words = static_cast<std::size_t>(kGames) * kStateFieldCount;
@@ -182,7 +197,8 @@ int run_benchmark() {
   cudaDeviceProp properties{};
   cudaFuncAttributes attributes{};
   if (!check_cuda(cudaGetDevice(&device_id), "cudaGetDevice") ||
-      !check_cuda(cudaGetDeviceProperties(&properties, device_id), "cudaGetDeviceProperties") ||
+      !check_cuda(cudaGetDeviceProperties(&properties, device_id),
+                  "cudaGetDeviceProperties") ||
       !check_cuda(cudaFuncGetAttributes(&attributes, draw_stock_kernel),
                   "cudaFuncGetAttributes(draw_stock_kernel)")) {
     return 1;
@@ -197,89 +213,221 @@ int run_benchmark() {
 
   std::uint64_t* device_words = nullptr;
   std::uint8_t* device_drawn = nullptr;
+  cudaStream_t stream = nullptr;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graph_exec = nullptr;
+
+  auto cleanup = [&]() {
+    if (graph_exec != nullptr) {
+      cudaGraphExecDestroy(graph_exec);
+    }
+    if (graph != nullptr) {
+      cudaGraphDestroy(graph);
+    }
+    if (start != nullptr) {
+      cudaEventDestroy(start);
+    }
+    if (stop != nullptr) {
+      cudaEventDestroy(stop);
+    }
+    if (stream != nullptr) {
+      cudaStreamDestroy(stream);
+    }
+    cudaFree(device_words);
+    cudaFree(device_drawn);
+  };
+
   if (!check_cuda(cudaMalloc(&device_words, words * sizeof(std::uint64_t)),
                   "cudaMalloc(state)") ||
       !check_cuda(cudaMalloc(&device_drawn, static_cast<std::size_t>(kGames)),
-                  "cudaMalloc(drawn)")) {
-    cudaFree(device_words);
-    cudaFree(device_drawn);
+                  "cudaMalloc(drawn)") ||
+      !check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                  "cudaStreamCreateWithFlags") ||
+      !check_cuda(cudaEventCreate(&start), "cudaEventCreate(start)") ||
+      !check_cuda(cudaEventCreate(&stop), "cudaEventCreate(stop)")) {
+    cleanup();
     return 1;
   }
+
   const ResidentStateSoA48 device_states =
       make_view(device_words, static_cast<std::size_t>(kGames));
 
-  cudaEvent_t start = nullptr;
-  cudaEvent_t stop = nullptr;
-  if (!check_cuda(cudaEventCreate(&start), "cudaEventCreate(start)") ||
-      !check_cuda(cudaEventCreate(&stop), "cudaEventCreate(stop)")) {
-    cudaFree(device_words);
-    cudaFree(device_drawn);
-    return 1;
-  }
-
   for (int warmup = 0; warmup < kWarmups; ++warmup) {
-    init_resident_state_kernel<<<blocks, kThreads>>>(
-        device_states, kGames, kMasterSeed + static_cast<std::uint64_t>(warmup));
-    for (int step = 0; step < kSteps; ++step) {
-      draw_stock_kernel<<<blocks, kThreads>>>(device_states, device_drawn, kGames);
-    }
+    enqueue_stock_round(device_states, device_drawn, kGames, blocks,
+                        kMasterSeed + static_cast<std::uint64_t>(warmup), stream);
   }
   if (!check_cuda(cudaGetLastError(), "benchmark warmup launch") ||
-      !check_cuda(cudaDeviceSynchronize(), "benchmark warmup synchronize")) {
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cudaFree(device_words);
-    cudaFree(device_drawn);
+      !check_cuda(cudaStreamSynchronize(stream), "benchmark warmup synchronize")) {
+    cleanup();
     return 1;
   }
 
-  double elapsed_ms = 0.0;
+  double draw_elapsed_ms = 0.0;
   for (int iteration = 0; iteration < kIterations; ++iteration) {
     const std::uint64_t master_seed =
         kMasterSeed + static_cast<std::uint64_t>(iteration + kWarmups) *
                           0x9e3779b97f4a7c15ULL;
-    init_resident_state_kernel<<<blocks, kThreads>>>(device_states, kGames, master_seed);
-    if (!check_cuda(cudaEventRecord(start), "cudaEventRecord(start)")) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      cudaFree(device_words);
-      cudaFree(device_drawn);
+    init_resident_state_kernel<<<blocks, kThreads, 0, stream>>>(
+        device_states, kGames, master_seed);
+    if (!check_cuda(cudaEventRecord(start, stream), "cudaEventRecord(start)")) {
+      cleanup();
       return 1;
     }
     for (int step = 0; step < kSteps; ++step) {
-      draw_stock_kernel<<<blocks, kThreads>>>(device_states, device_drawn, kGames);
+      draw_stock_kernel<<<blocks, kThreads, 0, stream>>>(
+          device_states, device_drawn, kGames);
     }
     if (!check_cuda(cudaGetLastError(), "benchmark transition launch") ||
-        !check_cuda(cudaEventRecord(stop), "cudaEventRecord(stop)") ||
+        !check_cuda(cudaEventRecord(stop, stream), "cudaEventRecord(stop)") ||
         !check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize(stop)")) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      cudaFree(device_words);
-      cudaFree(device_drawn);
+      cleanup();
       return 1;
     }
 
     float iteration_ms = 0.0f;
     if (!check_cuda(cudaEventElapsedTime(&iteration_ms, start, stop),
                     "cudaEventElapsedTime")) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      cudaFree(device_words);
-      cudaFree(device_drawn);
+      cleanup();
       return 1;
     }
-    elapsed_ms += iteration_ms;
+    draw_elapsed_ms += iteration_ms;
   }
 
-  const double seconds = elapsed_ms / 1000.0;
-  const double transitions = static_cast<double>(kGames) * kSteps * kIterations;
-  const double rounds = static_cast<double>(kGames) * kIterations;
-  const double transitions_per_second = transitions / seconds;
-  const double rounds_per_second = rounds / seconds;
-  const double average_kernel_us = elapsed_ms * 1000.0 / (kSteps * kIterations);
+  const double draw_seconds = draw_elapsed_ms / 1000.0;
+  const double draw_transitions =
+      static_cast<double>(kGames) * kSteps * kIterations;
+  const double draw_rounds = static_cast<double>(kGames) * kIterations;
+  const double draw_transitions_per_second = draw_transitions / draw_seconds;
+  const double draw_rounds_per_second = draw_rounds / draw_seconds;
+  const double average_kernel_us =
+      draw_elapsed_ms * 1000.0 / (kSteps * kIterations);
   const double occupancy =
       static_cast<double>(active_blocks_per_sm * kThreads) /
       static_cast<double>(properties.maxThreadsPerMultiProcessor);
+
+  const auto graph_setup_start = std::chrono::steady_clock::now();
+  if (!check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                  "cudaStreamBeginCapture")) {
+    cleanup();
+    return 1;
+  }
+  enqueue_stock_round(device_states, device_drawn, kGames, blocks, kMasterSeed,
+                      stream);
+  if (!check_cuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture") ||
+      !check_cuda(cudaGraphInstantiate(&graph_exec, graph, 0ULL),
+                  "cudaGraphInstantiate")) {
+    cleanup();
+    return 1;
+  }
+  std::size_t graph_nodes = 0;
+  if (!check_cuda(cudaGraphGetNodes(graph, nullptr, &graph_nodes),
+                  "cudaGraphGetNodes")) {
+    cleanup();
+    return 1;
+  }
+  const auto graph_setup_stop = std::chrono::steady_clock::now();
+  const double graph_setup_ms =
+      std::chrono::duration<double, std::milli>(graph_setup_stop -
+                                                graph_setup_start)
+          .count();
+
+  for (int warmup = 0; warmup < kWarmups; ++warmup) {
+    if (!check_cuda(cudaGraphLaunch(graph_exec, stream), "graph warmup launch")) {
+      cleanup();
+      return 1;
+    }
+  }
+  if (!check_cuda(cudaStreamSynchronize(stream), "graph warmup synchronize")) {
+    cleanup();
+    return 1;
+  }
+
+  if (!check_cuda(cudaEventRecord(start, stream), "manual cudaEventRecord(start)")) {
+    cleanup();
+    return 1;
+  }
+  const auto manual_wall_start = std::chrono::steady_clock::now();
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    enqueue_stock_round(device_states, device_drawn, kGames, blocks, kMasterSeed,
+                        stream);
+  }
+  const auto manual_submit_stop = std::chrono::steady_clock::now();
+  if (!check_cuda(cudaGetLastError(), "manual round launch") ||
+      !check_cuda(cudaEventRecord(stop, stream), "manual cudaEventRecord(stop)") ||
+      !check_cuda(cudaEventSynchronize(stop),
+                  "manual cudaEventSynchronize(stop)")) {
+    cleanup();
+    return 1;
+  }
+  const auto manual_wall_stop = std::chrono::steady_clock::now();
+
+  float manual_gpu_ms_f = 0.0f;
+  if (!check_cuda(cudaEventElapsedTime(&manual_gpu_ms_f, start, stop),
+                  "manual cudaEventElapsedTime")) {
+    cleanup();
+    return 1;
+  }
+  const double manual_gpu_ms = manual_gpu_ms_f;
+  const double manual_submit_ms =
+      std::chrono::duration<double, std::milli>(manual_submit_stop -
+                                                manual_wall_start)
+          .count();
+  const double manual_wall_ms =
+      std::chrono::duration<double, std::milli>(manual_wall_stop -
+                                                manual_wall_start)
+          .count();
+
+  if (!check_cuda(cudaEventRecord(start, stream), "graph cudaEventRecord(start)")) {
+    cleanup();
+    return 1;
+  }
+  const auto graph_wall_start = std::chrono::steady_clock::now();
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    if (!check_cuda(cudaGraphLaunch(graph_exec, stream), "cudaGraphLaunch")) {
+      cleanup();
+      return 1;
+    }
+  }
+  const auto graph_submit_stop = std::chrono::steady_clock::now();
+  if (!check_cuda(cudaEventRecord(stop, stream), "graph cudaEventRecord(stop)") ||
+      !check_cuda(cudaEventSynchronize(stop),
+                  "graph cudaEventSynchronize(stop)")) {
+    cleanup();
+    return 1;
+  }
+  const auto graph_wall_stop = std::chrono::steady_clock::now();
+
+  float graph_gpu_ms_f = 0.0f;
+  if (!check_cuda(cudaEventElapsedTime(&graph_gpu_ms_f, start, stop),
+                  "graph cudaEventElapsedTime")) {
+    cleanup();
+    return 1;
+  }
+  const double graph_gpu_ms = graph_gpu_ms_f;
+  const double graph_submit_ms =
+      std::chrono::duration<double, std::milli>(graph_submit_stop -
+                                                graph_wall_start)
+          .count();
+  const double graph_wall_ms =
+      std::chrono::duration<double, std::milli>(graph_wall_stop -
+                                                graph_wall_start)
+          .count();
+
+  const double schedule_rounds = static_cast<double>(kGames) * kIterations;
+  const double schedule_transitions = schedule_rounds * kSteps;
+  const double manual_rounds_per_second =
+      schedule_rounds / (manual_gpu_ms / 1000.0);
+  const double graph_rounds_per_second =
+      schedule_rounds / (graph_gpu_ms / 1000.0);
+  const double manual_transitions_per_second =
+      schedule_transitions / (manual_gpu_ms / 1000.0);
+  const double graph_transitions_per_second =
+      schedule_transitions / (graph_gpu_ms / 1000.0);
+  const double gpu_speedup = manual_gpu_ms / graph_gpu_ms;
+  const double submit_speedup = manual_submit_ms / graph_submit_ms;
+  const double wall_speedup = manual_wall_ms / graph_wall_ms;
 
   std::cout << "device=" << properties.name << " sms=" << properties.multiProcessorCount
             << " threads=" << kThreads << '\n';
@@ -288,16 +436,30 @@ int run_benchmark() {
             << " static_shared_bytes/block=" << attributes.sharedSizeBytes
             << " theoretical_occupancy=" << std::fixed << std::setprecision(2)
             << occupancy * 100.0 << "%\n";
+  std::cout << "benchmark_warmups=" << kWarmups
+            << " benchmark_iterations=" << kIterations << '\n';
   std::cout << std::fixed << std::setprecision(2)
-            << "resident_draw elapsed_ms=" << elapsed_ms
-            << " transitions/s=" << transitions_per_second
-            << " stock_rounds/s=" << rounds_per_second
+            << "resident_draw elapsed_ms=" << draw_elapsed_ms
+            << " transitions/s=" << draw_transitions_per_second
+            << " stock_rounds/s=" << draw_rounds_per_second
             << " avg_draw_kernel_us=" << average_kernel_us << '\n';
+  std::cout << "phase_graph nodes=" << graph_nodes
+            << " setup_ms=" << graph_setup_ms << '\n';
+  std::cout << "manual_round gpu_ms=" << manual_gpu_ms
+            << " submit_ms=" << manual_submit_ms
+            << " wall_ms=" << manual_wall_ms
+            << " stock_rounds/s=" << manual_rounds_per_second
+            << " transitions/s=" << manual_transitions_per_second << '\n';
+  std::cout << "graph_round gpu_ms=" << graph_gpu_ms
+            << " submit_ms=" << graph_submit_ms
+            << " wall_ms=" << graph_wall_ms
+            << " stock_rounds/s=" << graph_rounds_per_second
+            << " transitions/s=" << graph_transitions_per_second << '\n';
+  std::cout << "graph_speedup gpu=" << gpu_speedup
+            << "x submit=" << submit_speedup
+            << "x wall=" << wall_speedup << "x\n";
 
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
-  cudaFree(device_words);
-  cudaFree(device_drawn);
+  cleanup();
   return 0;
 }
 

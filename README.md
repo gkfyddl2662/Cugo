@@ -19,10 +19,11 @@ The repository now contains the first deterministic resident-state baseline shar
 - deterministic stock-draw transition shared by CPU and CUDA
 - CUDA differential validation across 65,536 games x 20 stock transitions
 - one-thread-per-game deal and resident-transition throughput baselines
+- CUDA Graph scheduling experiment for the 21-node init + 20-draw phase sequence
 
 The stock is represented as a remaining-card bitmask plus RNG state instead of a pre-shuffled per-game array. Each stock transition samples one rank from the remaining set, clears that bit, persists the RNG state, and emits the drawn card for a future resolve phase. This keeps the resident hot state compact and avoids a 20-card per-game stock array.
 
-The measured RTX 5080 deal baseline reached full theoretical occupancy with 24 registers/thread and zero local memory per thread. 128 and 256 threads/block were effectively tied, while 512 threads/block was slower, so resident transition kernels currently use 256 threads/block as the working baseline.
+Initial RTX 5080 measurements showed zero local-memory spill and full theoretical occupancy for both the deal and stock-draw kernels. The first block-size sweeps were only a few milliseconds long and produced inconsistent 128/256/512 ordering across runs, so the benchmarks now use much longer measurement windows before any block-size choice is treated as stable. Resident transitions still use 256 threads/block as the working baseline, not as a final optimum.
 
 ### 48-card scope
 
@@ -51,6 +52,16 @@ build\cugo_cuda_deal_test.exe --benchmark
 build\cugo_cuda_state_test.exe --benchmark
 ```
 
-The deal benchmark generates 1,048,576 independent base-48 deals per launch and sweeps 128/256/512 threads per block.
+The deal benchmark generates 1,048,576 independent base-48 deals per launch, sweeps 128/256/512 threads per block, and now uses 256 timed launches per block size to reduce short-run WDDM/clock noise. It reports average kernel time, games/s, sampled cards/s, theoretical occupancy, registers/thread, and local bytes/thread.
 
-The resident-state benchmark keeps 1,048,576 game states in field-major SoA memory and executes the full 20-card stock sequence as 20 separate 256-thread transition kernels. It reports transitions/s, completed stock rounds/s, average transition-kernel time, theoretical occupancy, registers/thread, and local bytes/thread. The separate launches intentionally expose the current launch/phase-boundary cost before CUDA Graph or persistent scheduling is introduced.
+The resident-state benchmark keeps 1,048,576 game states in field-major SoA memory. It first measures the 20 stock-draw phase kernels over a longer 256-round window. It then captures one complete stock round as a CUDA Graph containing the initialization node plus 20 draw nodes and compares:
+
+- manual host submission of the 21-kernel round
+- CUDA Graph replay of the same 21-node round
+- GPU event time
+- host submission time
+- end-to-end wall time
+- stock rounds/s and draw transitions/s
+- graph setup cost and graph/manual speedup
+
+Graph setup cost is reported separately from replay. The graph experiment is a measurement point, not yet an architectural commitment; the result will decide whether phase graphs are worth carrying forward before considering persistent kernels or more complex scheduling.
