@@ -22,8 +22,19 @@ def load_extension(*, verbose: bool = False) -> Any:
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{major}.{minor}")
 
     if os.name == "nt":
-        cxx_flags = ["/O2", "/std:c++20", "/EHsc", "/utf-8"]
-        cuda_flags = ["-O3", "-std=c++20", "-Xcompiler=/utf-8"]
+        cxx_flags = [
+            "/O2",
+            "/std:c++20",
+            "/EHsc",
+            "/utf-8",
+            "/Zc:preprocessor",
+        ]
+        cuda_flags = [
+            "-O3",
+            "-std=c++20",
+            "-Xcompiler=/utf-8",
+            "-Xcompiler=/Zc:preprocessor",
+        ]
     else:
         cxx_flags = ["-O3", "-std=c++20"]
         cuda_flags = ["-O3", "-std=c++20"]
