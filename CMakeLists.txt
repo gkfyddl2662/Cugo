@@ -16,6 +16,10 @@ if(BUILD_TESTING)
   add_executable(cugo_core_test tests/core_test.cpp)
   target_link_libraries(cugo_core_test PRIVATE cugo_core)
   add_test(NAME cugo_core_test COMMAND cugo_core_test)
+
+  add_executable(cugo_score_test tests/score_test.cpp)
+  target_link_libraries(cugo_score_test PRIVATE cugo_core)
+  add_test(NAME cugo_score_test COMMAND cugo_score_test)
 endif()
 
 if(CUGO_ENABLE_CUDA)
@@ -30,6 +34,10 @@ if(CUGO_ENABLE_CUDA)
       add_executable(cugo_cuda_core_test tests/cuda_core_test.cu)
       target_link_libraries(cugo_cuda_core_test PRIVATE cugo_core)
       set_target_properties(cugo_cuda_core_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
+      add_executable(cugo_cuda_score_test tests/cuda_score_test.cu)
+      target_link_libraries(cugo_cuda_score_test PRIVATE cugo_core)
+      set_target_properties(cugo_cuda_score_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
       add_executable(cugo_cuda_deal_test tests/cuda_deal_test.cu)
       target_link_libraries(cugo_cuda_deal_test PRIVATE cugo_core)
@@ -46,6 +54,8 @@ if(CUGO_ENABLE_CUDA)
       if(MSVC)
         target_compile_options(cugo_cuda_core_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        target_compile_options(cugo_cuda_score_test PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
         target_compile_options(cugo_cuda_deal_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
         target_compile_options(cugo_cuda_state_test PRIVATE
@@ -55,6 +65,7 @@ if(CUGO_ENABLE_CUDA)
       endif()
 
       add_test(NAME cugo_cuda_core_test COMMAND cugo_cuda_core_test)
+      add_test(NAME cugo_cuda_score_test COMMAND cugo_cuda_score_test)
       add_test(NAME cugo_cuda_deal_test COMMAND cugo_cuda_deal_test)
       add_test(NAME cugo_cuda_state_test COMMAND cugo_cuda_state_test)
       add_test(NAME cugo_cuda_turn_test COMMAND cugo_cuda_turn_test)

@@ -1,6 +1,6 @@
 # Hangame Shin Matgo rule lock
 
-This file records only rules that have been pinned to Hangame's own public guide. It is the correctness boundary for the CPU reference engine and the CUDA differential implementation. Generic Go-Stop conventions must not silently fill missing behavior.
+This file records rules pinned to Hangame's public guide and the explicit internal representation decisions made by Cugo. It is the correctness boundary for the CPU reference engine and the CUDA differential implementation. Generic Go-Stop conventions must not silently fill missing behavior.
 
 ## Authoritative sources
 
@@ -8,6 +8,7 @@ This file records only rules that have been pinned to Hangame's own public guide
 - Special capture/play situations: https://mgostop.hangame.com/guide/combine/02_02_rule.html
 - Card groups, scoring groups, bonus cards, and bomb cards: https://mgostop.hangame.com/guide/combine/02_03_rule.html
 - Hangame Shin Matgo vs. Match-Go mode differences: https://mgostop.hangame.com/guide/combine/04_03_game_mode.html
+- Legacy Hangame Shin Matgo card/art guide used to cross-check the 12 standard month groups: https://hangame-images.toastoven.net/hangame/pc/gostop/introduce/html/msduelgo/guide_msduelgo04_05.html
 
 ## Pinned base flow
 
@@ -20,6 +21,40 @@ This file records only rules that have been pinned to Hangame's own public guide
 - The winner of a completed game leads the next game; the first game uses a separate first-player selection process.
 
 The current engine intentionally uses only the 48 standard cards. With those 48 cards the temporary baseline layout is therefore 10 + 10 hands, 8 floor, and 20 stock. This is not the final exact 50-card setup.
+
+## Stable base-48 card identity convention
+
+`CardId = month * 4 + slot`, with zero-based months. The month identity follows Hangame's Korean ordering (1 Songhak through 12 Bi). Slot ordering is an engine-internal convention and is now frozen as follows:
+
+| Month | slot 0 | slot 1 | slot 2 | slot 3 |
+| --- | --- | --- | --- | --- |
+| 1 | bright | hongdan | pi | pi |
+| 2 | animal / godori | hongdan | pi | pi |
+| 3 | bright | hongdan | pi | pi |
+| 4 | animal / godori | chodan | pi | pi |
+| 5 | animal | chodan | pi | pi |
+| 6 | animal | cheongdan | pi | pi |
+| 7 | animal | chodan | pi | pi |
+| 8 | bright | animal / godori | pi | pi |
+| 9 | animal / Gukjin | cheongdan | pi | pi |
+| 10 | animal | cheongdan | pi | pi |
+| 11 | bright | fixed double-pi | pi | pi |
+| 12 | rain bright | animal | plain ribbon | fixed double-pi |
+
+This convention does not claim that Hangame assigns numeric slot IDs. It is Cugo's stable encoding of the standard card identities shown by the guide. Changing it later would invalidate deterministic seeds/replays, so new features must preserve it.
+
+The resulting primary groups are 5 brights, 9 animals, 10 ribbons, 22 plain pi cards, and two fixed double-pi cards. Gukjin (month 9 slot 0) is primarily an animal and can optionally be converted to double-pi, matching Hangame's explicit choice rule.
+
+## Pinned base scoring
+
+`score_captured()` implements the base group points from Hangame's guide without applying final win multipliers:
+
+- Brights: 3 brights = 3 points, but a 3-bright set containing the rain bright = 2; 4 brights = 4; all 5 = 15.
+- Animals: 5 cards = 1 point and each additional animal adds 1. Godori (months 2, 4, 8) adds 5 points. Seven or more animals sets the meongtta multiplier flag; the final multiplier itself is not applied in the base score.
+- Ribbons: 5 cards = 1 point and each additional ribbon adds 1. Hongdan (1,2,3), chodan (4,5,7), and cheongdan (6,9,10) each add 3 points. The month-12 ribbon belongs to none of those sets.
+- Pi: 10 pi units = 1 point and each additional unit adds 1. Plain pi contributes 1 unit. The fixed month-11/month-12 double-pi cards contribute 2. Gukjin contributes 2 only when `ScoreOptions::gukjin_as_double_pi` is true, in which case it no longer counts as an animal.
+
+`pi_card_mask()` exposes which captured physical cards currently count as pi under the same Gukjin option. Exact pi-steal selection/transfer behavior is still deferred until it is sourced rather than guessed.
 
 ## Pinned special situations relevant to RESOLVE
 
@@ -48,7 +83,7 @@ The deterministic CPU/CUDA resolver now implements card movement for the first e
 - sweep detection after the complete turn is resolved
 - explicit same-month floor choice when exactly two matching floor cards exist
 
-`ResolveResult` reports capture/event metadata but does not yet transfer pi between players. Pi transfer requires the exact card-category table so the engine can select a legal pi card rather than moving an arbitrary captured card.
+`ResolveResult` reports capture/event metadata but does not yet transfer pi between players. The card metadata layer can now identify pi cards and values; the remaining missing fact is the exact Hangame transfer-selection policy when multiple eligible pi cards exist.
 
 When a two-card floor choice is required and the caller did not provide a valid `ResolveChoices` entry, the resolver returns `kChoiceRequired` without changing the game state. Invalid choices likewise leave the state unchanged.
 
@@ -70,10 +105,9 @@ The official guide describes 2-pi and 3-pi bonus cards and special replacement/r
 ## Not implemented yet
 
 - Last-card ppuk/jjok exception transition
-- Pi transfer and exact pi-card selection
+- Exact pi-steal card selection/transfer policy
 - Bomb/grenade action encoding and bomb-card credits
-- Captured-card category/scoring metadata
-- Go/Stop and scoring state
+- Go/Stop decision state and final score multipliers
 - Missions and economy/betting effects
 - Bonus cards
 
