@@ -100,7 +100,8 @@ def main() -> None:
     config["checkpoint_dir"] = str(args.checkpoint_dir)
 
     total_games = 0
-    total_transitions = 0
+    total_generated_transitions = 0
+    total_retained_transitions = 0
     for iteration in range(1, args.iterations + 1):
         seed_offset = args.seed + (iteration - 1) * args.selfplay_batch
 
@@ -115,6 +116,7 @@ def main() -> None:
             temperature=args.temperature,
             reward_scale=args.reward_scale,
             use_amp=use_amp,
+            max_transitions=replay.capacity,
         )
         replay.add(batch)
         torch.cuda.synchronize()
@@ -138,11 +140,14 @@ def main() -> None:
         train_seconds = time.perf_counter() - train_start
 
         total_games += batch.games
-        total_transitions += batch.transitions
+        total_generated_transitions += batch.generated_transitions
+        total_retained_transitions += batch.transitions
         games_per_s = batch.games / collect_seconds
-        transitions_per_s = batch.transitions / collect_seconds
+        transitions_per_s = batch.generated_transitions / collect_seconds
         print(
-            f"iter={iteration} games={batch.games} transitions={batch.transitions} "
+            f"iter={iteration} games={batch.games} "
+            f"transitions={batch.generated_transitions} retained={batch.transitions} "
+            f"dropped={batch.dropped_transitions} "
             f"terminal={batch.terminal} nagari={batch.nagari} "
             f"decision_steps={batch.decision_steps} replay={replay.size} "
             f"selfplay_s={collect_seconds:.4f} games_per_s={games_per_s:.1f} "
@@ -171,7 +176,8 @@ def main() -> None:
 
     print(
         f"training PASS iterations={args.iterations} total_games={total_games} "
-        f"total_transitions={total_transitions} replay={replay.size}"
+        f"total_transitions={total_generated_transitions} "
+        f"retained_transitions={total_retained_transitions} replay={replay.size}"
     )
 
 

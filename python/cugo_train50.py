@@ -48,6 +48,7 @@ class SelfPlayBatch:
     actions: torch.Tensor
     value_targets: torch.Tensor
     games: int
+    generated_transitions: int
     terminal: int
     nagari: int
     decision_steps: int
@@ -56,6 +57,10 @@ class SelfPlayBatch:
     @property
     def transitions(self) -> int:
         return int(self.actions.numel())
+
+    @property
+    def dropped_transitions(self) -> int:
+        return self.generated_transitions - self.transitions
 
 
 class GpuReplayBuffer:
@@ -175,9 +180,12 @@ def collect_selfplay(
     temperature: float,
     reward_scale: float,
     use_amp: bool,
+    max_transitions: int | None = None,
 ) -> SelfPlayBatch:
     if reward_scale <= 0.0:
         raise ValueError("reward_scale must be positive")
+    if max_transitions is not None and max_transitions <= 0:
+        raise ValueError("max_transitions must be positive when provided")
 
     device = torch.device("cuda")
     seeds, first = make_seeds(batch, seed_offset, device)
@@ -190,11 +198,9 @@ def collect_selfplay(
     action_chunks: list[torch.Tensor] = []
     player_chunks: list[torch.Tensor] = []
     env_chunks: list[torch.Tensor] = []
+    retained_rows = 0
+    generated_transitions = 0
 
-    # Keep correctness diagnostics GPU-resident and use the data-dependent
-    # active compaction as the single normal host synchronization per decision.
-    # This avoids running the MLP for environments that have already finished
-    # and avoids retaining full [steps, batch, ...] trajectory tensors.
     observe_bad = torch.zeros((), dtype=torch.int64, device=device)
     legal_bad = torch.zeros((), dtype=torch.int64, device=device)
     step_bad = torch.zeros((), dtype=torch.int64, device=device)
@@ -214,16 +220,14 @@ def collect_selfplay(
             observe_bad.add_((active & ~observe_ok).sum())
             legal_bad.add_((active & observe_ok & ~has_legal).sum())
 
-            # CUDA nonzero has a data-dependent result size and therefore acts
-            # as the one per-decision host-visible synchronization.  Reuse that
-            # synchronization to drive termination instead of also calling
-            # done.all().item().
             active_ids = torch.nonzero(valid_active, as_tuple=False).squeeze(1)
-            if active_ids.numel() == 0:
+            active_count = active_ids.numel()
+            if active_count == 0:
                 completed = True
                 break
 
             decision_steps += 1
+            generated_transitions += active_count
             active_features = features.index_select(0, active_ids)
             active_legal = legal.index_select(0, active_ids)
             active_players = players.index_select(0, active_ids)
@@ -233,10 +237,6 @@ def collect_selfplay(
             ):
                 active_logits, _values = model(active_features)
 
-            # Preserve the full-row stochastic sampling shape.  Finished rows
-            # have an all-false legal mask, so zero logits are immaterial, while
-            # keeping the batch-sized multinomial path avoids changing RNG
-            # consumption solely because active inference was compacted.
             logits = torch.zeros(
                 (batch, legal.size(1)),
                 dtype=active_logits.dtype,
@@ -251,6 +251,19 @@ def collect_selfplay(
             action_chunks.append(active_actions)
             player_chunks.append(active_players)
             env_chunks.append(active_ids)
+            retained_rows += active_count
+
+            if max_transitions is not None:
+                while (
+                    len(feature_chunks) > 1
+                    and retained_rows - feature_chunks[0].size(0) >= max_transitions
+                ):
+                    retained_rows -= feature_chunks[0].size(0)
+                    del feature_chunks[0]
+                    del legal_chunks[0]
+                    del action_chunks[0]
+                    del player_chunks[0]
+                    del env_chunks[0]
 
             reward0, new_done, nagari, step_status, _committed = ext.step(states, actions)
             last_done = new_done
@@ -261,9 +274,6 @@ def collect_selfplay(
             final_reward0 = torch.where(just_finished, reward0, final_reward0)
             final_nagari |= just_finished & nagari
         else:
-            # If the final permitted decision completed every environment, the
-            # normal next-iteration compaction check did not run.  Pay one final
-            # synchronization only on this max-steps boundary.
             if last_done is not None and bool(last_done.all().item()):
                 completed = True
 
@@ -293,6 +303,14 @@ def collect_selfplay(
     players = torch.cat(player_chunks, dim=0)
     env_ids = torch.cat(env_chunks, dim=0)
 
+    if max_transitions is not None and actions.numel() > max_transitions:
+        start = actions.numel() - max_transitions
+        features = features[start:]
+        legal = legal[start:]
+        actions = actions[start:]
+        players = players[start:]
+        env_ids = env_ids[start:]
+
     reward_for_transition = final_reward0[env_ids]
     signed_reward = torch.where(
         players == 0, reward_for_transition, -reward_for_transition
@@ -307,6 +325,7 @@ def collect_selfplay(
         actions=actions,
         value_targets=value_targets,
         games=batch,
+        generated_transitions=generated_transitions,
         terminal=terminal,
         nagari=nagari_count,
         decision_steps=decision_steps,
