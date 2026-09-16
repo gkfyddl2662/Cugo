@@ -67,6 +67,30 @@ CUGO_HOST_DEVICE inline CardId pop_first_card(CardMask& mask) noexcept {
   return card;
 }
 
+CUGO_HOST_DEVICE inline CardId select_card_by_rank(CardMask mask, std::uint32_t rank) noexcept {
+  if (rank >= static_cast<std::uint32_t>(card_count(mask))) {
+    return kInvalidCard;
+  }
+
+#if defined(__CUDA_ARCH__)
+  const unsigned low = static_cast<unsigned>(mask);
+  const unsigned low_count = __popc(low);
+  if (rank < low_count) {
+    return static_cast<CardId>(__fns(low, 0u, static_cast<int>(rank) + 1));
+  }
+
+  const unsigned high = static_cast<unsigned>(mask >> 32);
+  const unsigned high_rank = rank - low_count;
+  const unsigned bit = __fns(high, 0u, static_cast<int>(high_rank) + 1);
+  return bit == 0xffffffffu ? kInvalidCard : static_cast<CardId>(bit + 32u);
+#else
+  while (rank-- != 0u) {
+    mask &= mask - 1;
+  }
+  return first_card(mask);
+#endif
+}
+
 }  // namespace cugo::core
 
 #undef CUGO_HOST_DEVICE
