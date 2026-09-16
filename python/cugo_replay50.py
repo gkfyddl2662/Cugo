@@ -80,6 +80,22 @@ class PackedGpuReplayBuffer:
     def bytes_per_transition(self) -> int:
         return self.storage_bytes // self.capacity
 
+    @staticmethod
+    def _pack_bits(source: torch.Tensor, bit_count: int) -> torch.Tensor:
+        rows = source.size(0)
+        packed_bytes = (bit_count + 7) // 8
+        packed = torch.zeros(
+            (rows, packed_bytes), dtype=torch.uint8, device=source.device
+        )
+        for bit in range(8):
+            columns = source[:, bit:bit_count:8]
+            width = columns.size(1)
+            if width == 0:
+                continue
+            encoded = columns.ne(0).to(torch.uint8).bitwise_left_shift(bit)
+            packed[:, :width].bitwise_or_(encoded)
+        return packed
+
     def _write_segment(
         self,
         dst_start: int,
@@ -104,6 +120,35 @@ class PackedGpuReplayBuffer:
             actions,
             targets,
         )
+
+    def _write_indexed(
+        self,
+        dst_index: torch.Tensor,
+        features: torch.Tensor,
+        legal: torch.Tensor,
+        actions: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> None:
+        count = int(dst_index.numel())
+        if count == 0:
+            return
+        if dst_index.dtype != torch.int64 or dst_index.device != self.device:
+            raise ValueError("dst_index must be a CUDA int64 tensor on the replay device")
+
+        packed_features = self._pack_bits(
+            features[:, :FEATURE_BINARY_COUNT], FEATURE_BINARY_COUNT
+        )
+        packed_legal = self._pack_bits(legal, ACTION_COUNT)
+        scalars = features[
+            :,
+            FEATURE_SCALAR_OFFSET : FEATURE_SCALAR_OFFSET + FEATURE_SCALAR_COUNT,
+        ].to(torch.float16)
+
+        self.feature_bits.index_copy_(0, dst_index, packed_features)
+        self.feature_scalars.index_copy_(0, dst_index, scalars)
+        self.legal_bits.index_copy_(0, dst_index, packed_legal)
+        self.actions.index_copy_(0, dst_index, actions.to(torch.uint8))
+        self.value_targets.index_copy_(0, dst_index, targets.to(torch.float32))
 
     def add(self, batch: Any) -> None:
         count = int(batch.transitions)
@@ -173,3 +218,105 @@ class PackedGpuReplayBuffer:
             index,
         )
         return features, legal, actions, targets
+
+
+class PackedGpuReservoirBuffer(PackedGpuReplayBuffer):
+    """Packed Algorithm-R reservoir for historical policy examples.
+
+    Once full, each incoming item at global stream position t draws an integer
+    uniformly from [0, t]. Items whose draw is below capacity replace that slot.
+    Batched replacement collisions are resolved by keeping the latest incoming
+    row, exactly matching sequential Algorithm-R update order for those draws.
+    """
+
+    format_name = "packed-bitplanes-cuda-v2-reservoir"
+
+    def __init__(
+        self,
+        capacity: int,
+        feature_count: int,
+        action_count: int,
+        device: torch.device,
+    ) -> None:
+        super().__init__(capacity, feature_count, action_count, device)
+        self.total_seen = 0
+        self.last_candidates = 0
+        self.last_replacements = 0
+        self.last_collisions = 0
+
+    def add(self, batch: Any) -> None:
+        count = int(batch.transitions)
+        self.last_candidates = 0
+        self.last_replacements = 0
+        self.last_collisions = 0
+        if count == 0:
+            return
+
+        features = batch.features
+        legal = batch.legal
+        actions = batch.actions
+        targets = batch.value_targets
+
+        fill = min(count, self.capacity - self.size)
+        if fill:
+            self._write_segment(
+                self.size,
+                features[:fill],
+                legal[:fill],
+                actions[:fill],
+                targets[:fill],
+            )
+            self.size += fill
+            self.total_seen += fill
+            self.position = self.size % self.capacity
+
+        remaining = count - fill
+        if remaining == 0:
+            return
+
+        src_base = fill
+        stream_positions = torch.arange(
+            remaining, dtype=torch.float64, device=self.device
+        ).add_(float(self.total_seen + 1))
+        draws = torch.floor(
+            torch.rand(remaining, dtype=torch.float64, device=self.device)
+            * stream_positions
+        ).to(torch.int64)
+        candidate_mask = draws < self.capacity
+        candidate_src = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
+        candidate_dst = draws.index_select(0, candidate_src)
+        candidate_count = int(candidate_src.numel())
+        self.last_candidates = candidate_count
+
+        if candidate_count:
+            # Sort by (destination, source-order) and keep the last source for
+            # each destination, matching sequential replacement semantics.
+            key_scale = remaining + 1
+            keys = candidate_dst.mul(key_scale).add(candidate_src)
+            order = torch.argsort(keys)
+            sorted_dst = candidate_dst.index_select(0, order)
+            sorted_src = candidate_src.index_select(0, order)
+
+            keep = torch.ones(
+                candidate_count, dtype=torch.bool, device=self.device
+            )
+            if candidate_count > 1:
+                keep[:-1] = sorted_dst[:-1] != sorted_dst[1:]
+            keep_rows = torch.nonzero(keep, as_tuple=False).squeeze(1)
+            unique_dst = sorted_dst.index_select(0, keep_rows)
+            unique_src = sorted_src.index_select(0, keep_rows).add(src_base)
+
+            self._write_indexed(
+                unique_dst,
+                features.index_select(0, unique_src),
+                legal.index_select(0, unique_src),
+                actions.index_select(0, unique_src),
+                targets.index_select(0, unique_src),
+            )
+            replacement_count = int(unique_dst.numel())
+            self.last_replacements = replacement_count
+            self.last_collisions = candidate_count - replacement_count
+
+        self.total_seen += remaining
+        self.size = min(self.capacity, self.total_seen)
+        self.position = 0 if self.size == self.capacity else self.size
