@@ -208,10 +208,10 @@ def collect_selfplay(
     model.eval()
     decision_steps = 0
     completed = False
+    first_observe = True
     with torch.inference_mode():
         for _ in range(max_steps):
-            active_count = active_ids.numel()
-            if active_count == 0:
+            if active_ids.numel() == 0:
                 completed = True
                 break
 
@@ -221,9 +221,27 @@ def collect_selfplay(
             observe_ok = status == int(ext.STATUS_OK)
             has_legal = legal.any(dim=1)
 
-            observe_bad.add_((~observe_ok).sum())
-            legal_bad.add_((observe_ok & (observed_done | ~has_legal)).sum())
+            if first_observe:
+                active = ~observed_done
+                valid_active = active & observe_ok & has_legal
+                observe_bad.add_((active & ~observe_ok).sum())
+                legal_bad.add_((active & observe_ok & ~has_legal).sum())
 
+                keep_rows = torch.nonzero(valid_active, as_tuple=False).squeeze(1)
+                active_ids = active_ids.index_select(0, keep_rows)
+                features = features.index_select(0, keep_rows)
+                legal = legal.index_select(0, keep_rows)
+                players = players.index_select(0, keep_rows)
+                first_observe = False
+
+                if active_ids.numel() == 0:
+                    completed = True
+                    break
+            else:
+                observe_bad.add_((~observe_ok).sum())
+                legal_bad.add_((observe_ok & (observed_done | ~has_legal)).sum())
+
+            active_count = active_ids.numel()
             decision_steps += 1
             generated_transitions += active_count
 
