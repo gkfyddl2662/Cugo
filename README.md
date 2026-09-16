@@ -28,8 +28,9 @@ The repository contains a deterministic CPU reference path and CUDA differential
 - host/device pi-steal count calculation and physical captured-card transfer
 - an explicit pi-transfer selection boundary instead of guessing undocumented Hangame card-priority behavior
 - transactional resolve/bonus wrappers: unresolved pi selection never partially mutates the turn state
-- fixed CPU examples plus randomized card-partition/scoring/bonus/turn/pi-transfer/Gukjin-role invariants
-- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, 50-card turns, pi transfers, and persistent Gukjin roles
+- a `GameState50` layer with 7-point Go/Stop decisions, per-player Go counts, Stop terminal state, and Go score arithmetic
+- fixed CPU examples plus randomized card-partition/scoring/bonus/turn/pi-transfer/Gukjin/game-flow invariants
+- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, 50-card turns, pi transfers, persistent Gukjin roles, and Go/Stop state
 - one-thread-per-game CUDA throughput baselines
 - CUDA Graph as the current repeated-phase scheduling baseline
 
@@ -52,6 +53,14 @@ Hangame documents Gukjin as an animal card that may instead be used as double-pi
 No extra SoA array is required: the two role bits use bits 12 and 13 of the existing `ppuk_owner1_months` 16-bit metadata word, while bits 0..11 remain the ppuk-owner month bits. `is_valid_persistent_turn_state50()` validates the packed role bits together with the existing 50-card state invariant; the legacy base validator remains unchanged for older regression code.
 
 `persistent_score_player50()` and the default pi-transfer path derive `ScoreOptions` from this persistent state. If Gukjin is currently double-pi and is physically stolen as a pi card, the role follows the card to its new owner. The new owner may later switch it back to animal through the same explicit role API.
+
+### Go/Stop game flow
+
+`GameState50` wraps the validated 50-card turn state with per-player Go counts, the base score recorded at the last Go, a pending decision actor, and a terminal winner. A player who completes a turn at 7 or more base points receives a Go/Stop decision. Stop records the winner immediately; Go records the current base score and hands play to the opponent.
+
+After a player has already called Go, Cugo opens that player's next decision only after their captured-card base score rises above the score recorded at the previous Go. This is the narrow engine interpretation of Hangame's public description that a Go player who fails to make additional points by the end produces nagari; it is kept explicit in state so the threshold can be changed without touching capture logic if a more specific provider rule is sourced.
+
+Go arithmetic follows Hangame's published formula: every Go adds one point, and starting with 3-Go each additional Go doubles the final Go-adjusted score. `go_adjusted_score50()` exposes this arithmetic separately from the still-deferred final settlement multipliers such as pi-bak, gwang-bak, meongtta, dokbak, bomb/shake, missions, and nagari carry-over.
 
 ### Pi-transfer policy boundary
 

@@ -7,6 +7,7 @@ This file records rules pinned to Hangame's public guide and explicit internal r
 - Basic rules: https://mgostop.hangame.com/guide/combine/02_01_rule.html
 - Special capture/play situations: https://mgostop.hangame.com/guide/combine/02_02_rule.html
 - Card groups, scoring groups, bonus cards, and bomb cards: https://mgostop.hangame.com/guide/combine/02_03_rule.html
+- Go multipliers, final double conditions, chongtong, three-ppuk, and nagari: https://mgostop.hangame.com/guide/combine/02_04_rule.html
 - Hangame Shin Matgo vs. Match-Go mode differences: https://mgostop.hangame.com/guide/combine/04_03_game_mode.html
 - Hangame Shin Matgo vs. Go-Stop mode differences: https://mgostop.hangame.com/guide/combine/04_05_game_mode.html
 - Legacy Hangame Shin Matgo card/art guide used to cross-check the 12 standard month groups: https://hangame-images.toastoven.net/hangame/pc/gostop/introduce/html/msduelgo/guide_msduelgo04_05.html
@@ -19,6 +20,7 @@ This file records rules pinned to Hangame's public guide and explicit internal r
 - A player first plays a hand card. If it has the same month/pattern family as a floor card, the matching cards are taken.
 - After the hand play, the top stock card is opened automatically and is resolved against the floor in the same way.
 - Reaching at least 7 points allows a Go/Stop decision.
+- Stop ends the game immediately with the stopping player as winner; Go continues the game.
 - The winner of a completed game leads the next game; the first game uses a separate first-player selection process.
 
 The older base-48 deal remains as a deterministic regression/reference fixture. New exact-Shin-Matgo work uses the 50-card deck.
@@ -75,6 +77,24 @@ Hangame explicitly documents Gukjin as an animal card that can also be used as d
 `set_persistent_gukjin_role50()` changes the interpretation only when that player physically owns Gukjin in the captured pile. `persistent_score_player50()` derives the appropriate `ScoreOptions` from the state. `is_valid_persistent_turn_state50()` masks the role bits for the legacy base-state invariant and additionally rejects a double-pi role bit when the corresponding player does not own Gukjin.
 
 If Gukjin is currently double-pi and is physically transferred by a pi-steal event, the current role follows the physical card to the new owner. This keeps physical ownership, pi eligibility, and scoring interpretation consistent. The new owner can later set the role back to animal explicitly. This is an engine-state convention; it does not claim that Hangame exposes the role-change timing as a separate UI action.
+
+## Go/Stop decision state
+
+Hangame's basic guide states that a player at 7 or more points may choose Go or Stop. Stop ends the game with that player as winner; Go continues play. Hangame's score guide states that each Go adds one point, and beginning with 3-Go every additional Go also doubles the final score again:
+
+- 1-Go: `base + 1`
+- 2-Go: `base + 2`
+- 3-Go: `(base + 3) x 2`
+- 4-Go: `(base + 4) x 4`
+- 5-Go: `(base + 5) x 8`
+
+`GameState50` stores per-player Go count, the captured-card base score at the most recent Go, a pending Go/Stop decision actor, and a terminal winner. `go_adjusted_score50()` implements only the published Go addition/multiplier arithmetic; other final multipliers are intentionally separate.
+
+The public guide's nagari description explicitly includes the case where a player called Go but failed to make additional points before the hand ended. It does not separately spell out the exact UI reopening condition for another Go/Stop prompt. Cugo therefore uses the narrow state-machine interpretation that the same player receives another decision only after their captured-card base score rises above the base score stored at their previous Go. This is an explicit engine convention derived from the guide's "additional points" wording, not a claim about undocumented UI timing. Keeping `last_go_base_score` in state makes this rule easy to adjust if a more specific Hangame source is found.
+
+`resolve_game_turn50_with_pi_transfer()` commits the underlying resolve and pi transfer first, then evaluates the completed player's base score. A floor-selection or pi-transfer selection requirement remains fully transactional and cannot open a Go/Stop decision from an uncommitted turn.
+
+Final settlement is not part of this milestone. In particular, pi-bak, gwang-bak, meongtta, dokbak, bomb/shake, missions, and nagari carry-over multipliers are not yet combined into a final payout score.
 
 ## Pinned bonus-card behavior
 
@@ -148,6 +168,14 @@ The bonus-aware `TurnState50` path implements the same current standard-card sub
 - persistent Gukjin role and state-derived scoring/pi eligibility
 - transactional pi-steal integration through `pi_transfer.h`
 
+`GameState50` adds the current game-flow layer on top of `TurnState50`:
+
+- first Go/Stop decision at 7 or more base points
+- per-player Go count and previous-Go base-score threshold
+- Stop terminal winner state
+- published Go additive points and 3-Go+ multiplier arithmetic
+- transactional decision opening only after a committed resolve/pi-transfer
+
 Both resolver paths currently implement normal unique same-month capture, unmatched floor placement, ppuk, capture of a three-card ppuk stack, jjok, ttadak, sweep detection, and explicit same-month floor choice when exactly two matching floor cards exist.
 
 The guide says ppuk and jjok have a last-card exception but does not describe the replacement transition on that page. Both resolver paths therefore return an unsupported status for those exact final-stock-flip patterns instead of guessing.
@@ -158,7 +186,8 @@ The guide says ppuk and jjok have a last-card exception but does not describe th
 - Exact Hangame automatic pi-card priority when more candidates exist than must be stolen
 - Exact Hangame UI/timing policy for changing Gukjin between animal and double-pi
 - Bomb/grenade action encoding and bomb-card credits
-- Go/Stop decision state and final score multipliers
+- Final settlement multipliers and payout composition (pi-bak, gwang-bak, meongtta, dokbak, bomb/shake, missions, nagari carry-over)
+- Chongtong and three-ppuk terminal integration into `GameState50`
 - Missions and economy/betting effects
 
 Each item should be added first to the deterministic CPU reference path, covered by fixed examples and randomized invariants, and only then mirrored into CUDA with CPU/GPU differential tests.

@@ -36,6 +36,10 @@ if(BUILD_TESTING)
   add_executable(cugo_gukjin_state_test tests/gukjin_state_test.cpp)
   target_link_libraries(cugo_gukjin_state_test PRIVATE cugo_core)
   add_test(NAME cugo_gukjin_state_test COMMAND cugo_gukjin_state_test)
+
+  add_executable(cugo_game50_test tests/game50_test.cpp)
+  target_link_libraries(cugo_game50_test PRIVATE cugo_core)
+  add_test(NAME cugo_game50_test COMMAND cugo_game50_test)
 endif()
 
 if(CUGO_ENABLE_CUDA)
@@ -83,6 +87,10 @@ if(CUGO_ENABLE_CUDA)
       target_link_libraries(cugo_cuda_gukjin_state_test PRIVATE cugo_core)
       set_target_properties(cugo_cuda_gukjin_state_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
+      add_executable(cugo_cuda_game50_test tests/cuda_game50_test.cu)
+      target_link_libraries(cugo_cuda_game50_test PRIVATE cugo_core)
+      set_target_properties(cugo_cuda_game50_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
       if(MSVC)
         target_compile_options(cugo_cuda_core_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
@@ -102,6 +110,8 @@ if(CUGO_ENABLE_CUDA)
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
         target_compile_options(cugo_cuda_gukjin_state_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        target_compile_options(cugo_cuda_game50_test PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
       endif()
 
       add_test(NAME cugo_cuda_core_test COMMAND cugo_cuda_core_test)
@@ -113,6 +123,7 @@ if(CUGO_ENABLE_CUDA)
       add_test(NAME cugo_cuda_turn50_test COMMAND cugo_cuda_turn50_test)
       add_test(NAME cugo_cuda_pi_transfer_test COMMAND cugo_cuda_pi_transfer_test)
       add_test(NAME cugo_cuda_gukjin_state_test COMMAND cugo_cuda_gukjin_state_test)
+      add_test(NAME cugo_cuda_game50_test COMMAND cugo_cuda_game50_test)
     endif()
   else()
     message(STATUS "CUDA compiler not found; CUDA validation target disabled")
