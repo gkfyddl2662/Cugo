@@ -70,7 +70,7 @@ Hangame describes two bonus cards in Shin Matgo. The printed number determines w
 - The raw 50-card deal gives each player 10 cards and exposes 8 floor cards, leaving 22 cards in stock.
 - If a bonus card is among the initial floor cards, it is automatically taken before the first player starts. `collect_initial_floor_bonuses()` moves those bonus cards to the first player's captured set. The referenced Hangame guide does not state that another floor card is dealt as a replacement, so Cugo does not invent that replacement step.
 - If a player has a bonus card in hand, they may play it like a normal hand action. Before the normal stock flip, they receive one replacement card from the stock and get another opportunity to play a hand card. `play_bonus_for_turn50()` keeps the state in `PLAY`, captures the played bonus, and inserts the replacement into the active hand.
-- In Shin Matgo, playing a bonus card also takes one opponent pi. The action returns `pi_steal_count=1`; actual card transfer is deferred until the exact multiple-pi-card selection policy is sourced.
+- In Shin Matgo, playing a bonus card also takes one opponent pi.
 - If a bonus appears while flipping the stock, the player flips again. `draw_for_turn50()` consumes consecutive stock bonuses until it reaches a standard card and stores those bonuses in `pending_bonus_mask`.
 - If the eventual standard flip does not create ppuk, the pending stock bonuses are captured by the active player in the same resolve transaction.
 - If the eventual standard flip creates ppuk, Hangame says the bonus card(s) must be placed on the floor together with the ppuk cards. `TurnState50` moves the pending bonuses onto the floor and associates each physical bonus with that ppuk month.
@@ -101,6 +101,24 @@ Choice/error resolution remains transactional: if a two-card floor selection is 
 - Grenade / two-card bomb: two same-month hand cards can be used against the two same-month floor cards. Hangame's guide states that this steals pi but does not get the bomb score multiplier.
 - Jjok: a hand play with no floor match followed by a same-month stock draw captures the pair and steals one opponent pi, except on the last card.
 
+## Pi-steal transfer boundary
+
+The Hangame guide pins the number of opponent pi cards taken by the events above, and the Shin Matgo mode guide confirms that playing a bonus card also takes an opponent pi. The public guide does not specify the physical-card priority when the victim owns more eligible pi cards than must be transferred (for example, several plain pi plus double/bonus pi).
+
+Cugo therefore does not silently encode an undocumented automatic priority. `pi_transfer.h` separates the pinned steal count from the provider-specific selection policy:
+
+- `resolve_pi_steal_card_count()` converts resolver event metadata into the number of physical pi cards to take.
+- `apply_pi_steal50()` moves physical cards between captured piles.
+- If the victim has no more eligible physical pi cards than requested, every available pi card is transferred automatically.
+- If the victim has more candidates than requested, the caller must provide a `PiTransferSelection` mask containing exactly the requested number of eligible physical cards.
+- Missing selection returns `kSelectionRequired`; an illegal mask returns `kInvalidSelection`.
+- `resolve_turn50_with_pi_transfer()` and `play_bonus_for_turn50_with_pi_transfer()` are transactional wrappers. Selection-required/invalid transfer leaves the entire resolve or hand-bonus action unchanged.
+- A transferred double-pi or 3-pi bonus retains the full scoring value of that physical card. Gukjin is eligible only when the caller's current `ScoreOptions` treats it as double-pi.
+
+This selection mask is an environment-policy input, not a documented Shin Matgo player action. Once Hangame's exact automatic priority is sourced or measured, that policy can supply the mask without changing the state representation.
+
+Non-authoritative general Go-Stop references commonly state that if only a double-pi remains it is handed over as the physical card. That behavior is representable by this transfer engine, but it is not used to invent Hangame's unresolved priority when multiple cards are available.
+
 ## Resolver paths
 
 The older `TurnState48` deterministic CPU/CUDA resolver remains a standard-card regression/performance fixture.
@@ -114,6 +132,7 @@ The bonus-aware `TurnState50` path implements the same current standard-card sub
 - pending bonus placement/association on ppuk
 - later ppuk capture including associated bonus cards
 - 50-card state partition and ppuk-bonus association invariants
+- transactional pi-steal integration through `pi_transfer.h`
 
 Both resolver paths currently implement normal unique same-month capture, unmatched floor placement, ppuk, capture of a three-card ppuk stack, jjok, ttadak, sweep detection, and explicit same-month floor choice when exactly two matching floor cards exist.
 
@@ -122,7 +141,7 @@ The guide says ppuk and jjok have a last-card exception but does not describe th
 ## Not implemented yet
 
 - Last-card ppuk/jjok exception transition
-- Exact pi-steal card selection/transfer policy
+- Exact Hangame automatic pi-card priority when more candidates exist than must be stolen
 - Bomb/grenade action encoding and bomb-card credits
 - Go/Stop decision state and final score multipliers
 - Missions and economy/betting effects

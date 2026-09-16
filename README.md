@@ -16,17 +16,18 @@ The repository contains a deterministic CPU reference path and CUDA differential
 - deterministic base-48 and raw 50-card deal primitives
 - raw 50-card layout: 10 cards per player, 8 initial floor cards, 22-card stock
 - initial-floor bonus collection before the first player's turn
-- hand-bonus replacement draws plus a Shin Matgo pi-steal event count
+- hand-bonus replacement draws plus Shin Matgo pi-steal integration
 - stock bonus chaining until a standard card is flipped
 - a bonus-aware `TurnState50` with `PLAY -> DRAW -> RESOLVE`
 - pending stock bonuses kept transactional until the standard-card resolve is known
 - per-bonus ppuk association metadata so floor bonuses stay attached to the ppuk month that owns them
 - ppuk creation with pending bonuses and later capture of the ppuk plus its associated bonus cards
 - normal unique capture, ppuk, jjok, ttadak, sweep detection, and ppuk ownership/capture metadata
-- explicit resolve choices for ambiguous two-card same-month floor selections
-- transactional resolve behavior: choice/error statuses never partially mutate state
-- fixed CPU examples plus randomized card-partition/scoring/bonus/turn invariants
-- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, and 50-card bonus-aware turns
+- host/device pi-steal count calculation and physical captured-card transfer
+- an explicit pi-transfer selection boundary instead of guessing undocumented Hangame card-priority behavior
+- transactional resolve/bonus wrappers: unresolved pi selection never partially mutates the turn state
+- fixed CPU examples plus randomized card-partition/scoring/bonus/turn/pi-transfer invariants
+- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, 50-card turns, and pi transfers
 - one-thread-per-game CUDA throughput baselines
 - CUDA Graph as the current repeated-phase scheduling baseline
 
@@ -38,9 +39,17 @@ Hangame's official guide states that a stock-flipped bonus grants another flip a
 
 If ppuk is created, each pending bonus is moved onto the floor and associated with that ppuk month through compact 12-bit metadata. When the three-card ppuk stack is later captured, its associated bonus card(s) are captured in the same transaction and the association metadata is cleared. This also allows more than one ppuk stack to exist without losing which stack owns a physical bonus card.
 
-Playing a bonus card from hand remains a `PLAY`-phase action: the card is captured, one replacement card is drawn from stock, and the player receives another play opportunity. The action reports `pi_steal_count=1` for Shin Matgo, but physical opponent-pi transfer is still deferred until the exact selection policy for multiple eligible pi cards is pinned down.
+Playing a bonus card from hand remains a `PLAY`-phase action: the card is captured, one replacement card is drawn from stock, and the player receives another play opportunity. `play_bonus_for_turn50_with_pi_transfer()` can also apply the resulting one-card pi steal transactionally.
 
 The older `TurnState48` engine remains intact as a regression/performance reference while the 50-card path is brought to full rule parity.
+
+### Pi-transfer policy boundary
+
+Hangame's public guide pins the steal counts: opponent ppuk, jjok, ttadak, sweep, bomb, grenade, and a played Shin Matgo bonus steal one opponent pi card; capturing one's own ppuk steals two. The guide does not specify the physical-card priority when the victim owns more eligible pi cards than must be transferred.
+
+`pi_transfer.h` therefore separates rule-visible steal count from provider-specific card selection. If the victim has no more eligible physical pi cards than the requested count, all available cards move automatically. If there are extra candidates, the caller must provide an explicit `PiTransferSelection` mask. Missing/invalid selection leaves the complete resolve or hand-bonus action unchanged. A selected double-pi or 3-pi bonus card carries its full pi value with the physical card.
+
+This selection is an environment-policy boundary, not a new player decision. Once Hangame's exact automatic priority is pinned, the policy can be encoded without changing the resolver or transfer representation.
 
 ### Measured RTX 5080 baseline
 

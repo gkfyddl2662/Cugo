@@ -28,6 +28,10 @@ if(BUILD_TESTING)
   add_executable(cugo_turn50_test tests/turn50_test.cpp)
   target_link_libraries(cugo_turn50_test PRIVATE cugo_core)
   add_test(NAME cugo_turn50_test COMMAND cugo_turn50_test)
+
+  add_executable(cugo_pi_transfer_test tests/pi_transfer_test.cpp)
+  target_link_libraries(cugo_pi_transfer_test PRIVATE cugo_core)
+  add_test(NAME cugo_pi_transfer_test COMMAND cugo_pi_transfer_test)
 endif()
 
 if(CUGO_ENABLE_CUDA)
@@ -67,6 +71,10 @@ if(CUGO_ENABLE_CUDA)
       target_link_libraries(cugo_cuda_turn50_test PRIVATE cugo_core)
       set_target_properties(cugo_cuda_turn50_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
+      add_executable(cugo_cuda_pi_transfer_test tests/cuda_pi_transfer_test.cu)
+      target_link_libraries(cugo_cuda_pi_transfer_test PRIVATE cugo_core)
+      set_target_properties(cugo_cuda_pi_transfer_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
       if(MSVC)
         target_compile_options(cugo_cuda_core_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
@@ -82,6 +90,8 @@ if(CUGO_ENABLE_CUDA)
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
         target_compile_options(cugo_cuda_turn50_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        target_compile_options(cugo_cuda_pi_transfer_test PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
       endif()
 
       add_test(NAME cugo_cuda_core_test COMMAND cugo_cuda_core_test)
@@ -91,6 +101,7 @@ if(CUGO_ENABLE_CUDA)
       add_test(NAME cugo_cuda_state_test COMMAND cugo_cuda_state_test)
       add_test(NAME cugo_cuda_turn_test COMMAND cugo_cuda_turn_test)
       add_test(NAME cugo_cuda_turn50_test COMMAND cugo_cuda_turn50_test)
+      add_test(NAME cugo_cuda_pi_transfer_test COMMAND cugo_cuda_pi_transfer_test)
     endif()
   else()
     message(STATUS "CUDA compiler not found; CUDA validation target disabled")
