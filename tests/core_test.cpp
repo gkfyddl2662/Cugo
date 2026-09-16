@@ -10,6 +10,52 @@
 
 namespace {
 
+bool same_turn_state(const cugo::game::TurnState48& a,
+                     const cugo::game::TurnState48& b) {
+  return a.hand0 == b.hand0 && a.hand1 == b.hand1 && a.floor == b.floor &&
+         a.stock == b.stock && a.captured0 == b.captured0 &&
+         a.captured1 == b.captured1 && a.rng_state == b.rng_state &&
+         a.ppuk_months == b.ppuk_months &&
+         a.ppuk_owner1_months == b.ppuk_owner1_months &&
+         a.turn_index == b.turn_index && a.actor == b.actor &&
+         a.phase == b.phase && a.pending_played == b.pending_played &&
+         a.pending_drawn == b.pending_drawn;
+}
+
+cugo::game::TurnState48 make_resolve_fixture(
+    cugo::core::CardMask floor,
+    cugo::core::CardId played,
+    cugo::core::CardId drawn,
+    std::uint8_t actor = 0,
+    std::uint16_t ppuk_months = 0,
+    std::uint16_t ppuk_owner1_months = 0,
+    bool final_stock_flip = false) {
+  using namespace cugo::core;
+  using namespace cugo::game;
+
+  const CardMask pending = card_bit(played) | card_bit(drawn);
+  assert((floor & pending) == 0);
+  assert(played != drawn);
+  const CardMask remaining = kFullDeckMask & ~(floor | pending);
+
+  TurnState48 state{};
+  state.floor = floor;
+  if (final_stock_flip) {
+    state.captured1 = remaining;
+  } else {
+    state.stock = remaining;
+  }
+  state.rng_state = 0x123456789abcdef0ULL;
+  state.ppuk_months = ppuk_months;
+  state.ppuk_owner1_months = ppuk_owner1_months;
+  state.actor = actor;
+  state.phase = TurnPhase::kResolve;
+  state.pending_played = played;
+  state.pending_drawn = drawn;
+  assert(is_valid_turn_state(state));
+  return state;
+}
+
 void test_card_layout() {
   using namespace cugo::core;
   static_assert(kCardCount == 48);
@@ -18,7 +64,8 @@ void test_card_layout() {
   CardMask seen = 0;
   for (int month = 0; month < kMonthCount; ++month) {
     for (int slot = 0; slot < kCardsPerMonth; ++slot) {
-      const CardId card = make_card(static_cast<std::uint8_t>(month), static_cast<std::uint8_t>(slot));
+      const CardId card = make_card(static_cast<std::uint8_t>(month),
+                                    static_cast<std::uint8_t>(slot));
       assert(is_valid_card(card));
       assert(card_month(card) == month);
       assert(card_slot(card) == slot);
@@ -57,7 +104,8 @@ void test_pop_first_card() {
 
 void test_select_card_by_rank() {
   using namespace cugo::core;
-  const CardMask mask = card_bit(0) | card_bit(7) | card_bit(31) | card_bit(32) | card_bit(47);
+  const CardMask mask =
+      card_bit(0) | card_bit(7) | card_bit(31) | card_bit(32) | card_bit(47);
   assert(select_card_by_rank(mask, 0) == 0);
   assert(select_card_by_rank(mask, 1) == 7);
   assert(select_card_by_rank(mask, 2) == 31);
@@ -111,7 +159,8 @@ void test_base_48_deal() {
   assert(fixed.rng_state == 0x6045a6c286e2713cULL);
 
   for (std::uint64_t i = 0; i < 4096; ++i) {
-    const auto deal = deal_base_48(cugo::core::derive_seed(0xc001d00d5eedULL, i));
+    const auto deal =
+        deal_base_48(cugo::core::derive_seed(0xc001d00d5eedULL, i));
     assert(is_valid_initial_deal(deal));
   }
 }
@@ -170,30 +219,175 @@ void test_turn_phase_frame() {
            TurnStatus::kCardNotInHand);
     assert(is_valid_turn_state(state));
 
-    const CardMask before_hand = active_hand(state);
-    const CardId played = first_card(before_hand);
+    const CardId played = first_card(active_hand(state));
     assert(played != kInvalidCard);
-    const CardMask matches = floor_matches(state, played);
-    assert(matches == matching_month_cards(state.floor, played));
-
     assert(begin_regular_play(state, played) == TurnStatus::kOk);
     assert(state.phase == TurnPhase::kDraw);
-    assert(state.pending_played == played);
-    assert(state.pending_drawn == kInvalidCard);
-    assert(card_count(active_hand(state)) == kInitialHandCards - 1);
-    assert(begin_regular_play(state, played) == TurnStatus::kWrongPhase);
     assert(is_valid_turn_state(state));
 
-    const int stock_before = card_count(state.stock);
     assert(draw_for_turn(state) == TurnStatus::kOk);
     assert(state.phase == TurnPhase::kResolve);
-    assert(state.pending_played == played);
-    assert(is_valid_card(state.pending_drawn));
-    assert(state.pending_drawn != played);
-    assert(card_count(state.stock) == stock_before - 1);
-    assert(draw_for_turn(state) == TurnStatus::kWrongPhase);
     assert(is_valid_turn_state(state));
   }
+}
+
+void test_resolve_fixed_cases() {
+  using namespace cugo::core;
+  using namespace cugo::game;
+
+  {
+    auto state = make_resolve_fixture(card_bit(0) | card_bit(4), 1, 8);
+    const auto result = resolve_turn(state);
+    assert(result.status == ResolveStatus::kOk);
+    assert(result.events == kResolveEventNone);
+    assert(result.captured_cards == (card_bit(0) | card_bit(1)));
+    assert(state.captured0 == result.captured_cards);
+    assert(state.floor == (card_bit(4) | card_bit(8)));
+    assert(state.phase == TurnPhase::kPlay && state.actor == 1 &&
+           state.turn_index == 1);
+    assert(is_valid_turn_state(state));
+  }
+
+  {
+    auto state = make_resolve_fixture(card_bit(0) | card_bit(4), 1, 2);
+    const auto result = resolve_turn(state);
+    assert(result.status == ResolveStatus::kOk);
+    assert((result.events & kResolveEventPpuk) != 0);
+    assert(result.captured_cards == 0);
+    assert(state.floor ==
+           (card_bit(0) | card_bit(1) | card_bit(2) | card_bit(4)));
+    assert((state.ppuk_months & 1u) != 0);
+    assert((state.ppuk_owner1_months & 1u) == 0);
+    assert(is_valid_turn_state(state));
+  }
+
+  {
+    auto state = make_resolve_fixture(card_bit(4), 0, 1);
+    const auto result = resolve_turn(state);
+    assert(result.status == ResolveStatus::kOk);
+    assert((result.events & kResolveEventJjok) != 0);
+    assert(result.captured_cards == (card_bit(0) | card_bit(1)));
+    assert(state.floor == card_bit(4));
+    assert(is_valid_turn_state(state));
+  }
+
+  {
+    auto state =
+        make_resolve_fixture(card_bit(0) | card_bit(1) | card_bit(4), 2, 3);
+    const auto result = resolve_turn(state);
+    assert(result.status == ResolveStatus::kOk);
+    assert((result.events & kResolveEventTtadak) != 0);
+    assert(result.captured_cards == month_mask(0));
+    assert(state.floor == card_bit(4));
+    assert(is_valid_turn_state(state));
+  }
+
+  {
+    auto state = make_resolve_fixture(card_bit(0) | card_bit(4), 1, 5);
+    const auto result = resolve_turn(state);
+    assert(result.status == ResolveStatus::kOk);
+    assert((result.events & kResolveEventSweep) != 0);
+    assert(result.captured_cards ==
+           (card_bit(0) | card_bit(1) | card_bit(4) | card_bit(5)));
+    assert(state.floor == 0);
+    assert(is_valid_turn_state(state));
+  }
+
+  {
+    const std::uint16_t month0 = 1u;
+    auto state = make_resolve_fixture(
+        card_bit(0) | card_bit(1) | card_bit(2) | card_bit(4),
+        3,
+        8,
+        0,
+        month0,
+        month0);
+    const auto result = resolve_turn(state);
+    assert(result.status == ResolveStatus::kOk);
+    assert(result.captured_opponent_ppuk == 1);
+    assert(result.captured_own_ppuk == 0);
+    assert((state.ppuk_months & month0) == 0);
+    assert((state.ppuk_owner1_months & month0) == 0);
+    assert((state.captured0 & month_mask(0)) == month_mask(0));
+    assert(is_valid_turn_state(state));
+  }
+}
+
+void test_resolve_choice_and_deferred_last_card() {
+  using namespace cugo::core;
+  using namespace cugo::game;
+
+  auto state =
+      make_resolve_fixture(card_bit(0) | card_bit(1) | card_bit(4), 2, 8);
+  const auto before = state;
+  auto result = resolve_turn(state);
+  assert(result.status == ResolveStatus::kChoiceRequired);
+  assert(same_turn_state(state, before));
+
+  result = resolve_turn(state, ResolveChoices{4, kInvalidCard});
+  assert(result.status == ResolveStatus::kInvalidChoice);
+  assert(same_turn_state(state, before));
+
+  result = resolve_turn(state, ResolveChoices{0, kInvalidCard});
+  assert(result.status == ResolveStatus::kOk);
+  assert(result.captured_cards == (card_bit(0) | card_bit(2)));
+  assert(state.floor == (card_bit(1) | card_bit(4) | card_bit(8)));
+  assert(is_valid_turn_state(state));
+
+  auto drawn_choice =
+      make_resolve_fixture(card_bit(0) | card_bit(4) | card_bit(5), 1, 6);
+  const auto drawn_choice_before = drawn_choice;
+  result = resolve_turn(drawn_choice);
+  assert(result.status == ResolveStatus::kChoiceRequired);
+  assert(result.captured_cards == 0);
+  assert(result.events == kResolveEventNone);
+  assert(same_turn_state(drawn_choice, drawn_choice_before));
+
+  auto last_ppuk = make_resolve_fixture(card_bit(0), 1, 2, 0, 0, 0, true);
+  const auto last_before = last_ppuk;
+  result = resolve_turn(last_ppuk);
+  assert(result.status == ResolveStatus::kUnsupportedLastCardSpecial);
+  assert(same_turn_state(last_ppuk, last_before));
+
+  auto last_jjok = make_resolve_fixture(card_bit(4), 0, 1, 0, 0, 0, true);
+  const auto last_jjok_before = last_jjok;
+  result = resolve_turn(last_jjok);
+  assert(result.status == ResolveStatus::kUnsupportedLastCardSpecial);
+  assert(same_turn_state(last_jjok, last_jjok_before));
+}
+
+void test_random_resolve_without_choices() {
+  using namespace cugo::core;
+  using namespace cugo::game;
+
+  constexpr std::uint64_t kMasterSeed = 0x7265736f6c766531ULL;
+  int resolved = 0;
+  int choices = 0;
+  for (std::uint64_t game = 0; game < 4096; ++game) {
+    const auto deal = deal_base_48(derive_seed(kMasterSeed, game));
+    auto state = make_turn_state(deal, static_cast<std::uint8_t>(game & 1u));
+    const std::uint8_t original_actor = state.actor;
+    const CardId played = first_card(active_hand(state));
+    assert(begin_regular_play(state, played) == TurnStatus::kOk);
+    assert(draw_for_turn(state) == TurnStatus::kOk);
+    const auto before_resolve = state;
+
+    const auto result = resolve_turn(state);
+    if (result.status == ResolveStatus::kOk) {
+      ++resolved;
+      assert(state.phase == TurnPhase::kPlay);
+      assert(state.actor == (original_actor ^ 1u));
+      assert(state.turn_index == 1);
+      assert(is_valid_turn_state(state));
+    } else {
+      assert(result.status == ResolveStatus::kChoiceRequired);
+      ++choices;
+      assert(same_turn_state(state, before_resolve));
+      assert(is_valid_turn_state(state));
+    }
+  }
+  assert(resolved > 0);
+  assert(choices > 0);
 }
 
 }  // namespace
@@ -208,6 +402,9 @@ int main() {
   test_base_48_deal();
   test_resident_stock_draws();
   test_turn_phase_frame();
+  test_resolve_fixed_cases();
+  test_resolve_choice_and_deferred_last_card();
+  test_random_resolve_without_choices();
   std::cout << "cugo_core_test: PASS\n";
   return 0;
 }

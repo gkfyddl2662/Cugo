@@ -12,6 +12,8 @@
 
 namespace {
 
+using cugo::game::ResolveResult;
+using cugo::game::ResolveStatus;
 using cugo::game::TurnState48;
 using cugo::game::TurnStateSoA48;
 
@@ -19,6 +21,14 @@ constexpr int kThreads = 256;
 constexpr int kU64Fields = 7;
 constexpr int kU16Fields = 3;
 constexpr int kU8Fields = 4;
+
+struct ResolveSnapshot {
+  std::uint64_t captured_cards;
+  std::uint8_t status;
+  std::uint8_t events;
+  std::uint8_t captured_own_ppuk;
+  std::uint8_t captured_opponent_ppuk;
+};
 
 TurnStateSoA48 make_view(std::uint64_t* u64,
                          std::uint16_t* u16,
@@ -71,9 +81,11 @@ __global__ void regular_play_kernel(TurnStateSoA48 states,
   }
 
   auto state = cugo::game::load_turn_state(states, static_cast<std::size_t>(game));
-  const cugo::core::CardId card = cugo::core::first_card(cugo::game::active_hand(state));
+  const cugo::core::CardId card =
+      cugo::core::first_card(cugo::game::active_hand(state));
   if (card == cugo::core::kInvalidCard ||
-      cugo::game::begin_regular_play(state, card) != cugo::game::TurnStatus::kOk ||
+      cugo::game::begin_regular_play(state, card) !=
+          cugo::game::TurnStatus::kOk ||
       !cugo::game::is_valid_turn_state(state)) {
     errors[game] = 2;
   }
@@ -96,6 +108,41 @@ __global__ void draw_phase_kernel(TurnStateSoA48 states,
   cugo::game::store_turn_state(states, static_cast<std::size_t>(game), state);
 }
 
+__global__ void resolve_phase_kernel(TurnStateSoA48 states,
+                                     ResolveSnapshot* results,
+                                     std::uint8_t* errors,
+                                     int games) {
+  const int game = blockIdx.x * blockDim.x + threadIdx.x;
+  if (game >= games) {
+    return;
+  }
+
+  auto state = cugo::game::load_turn_state(states, static_cast<std::size_t>(game));
+  const ResolveResult result = cugo::game::resolve_turn(state);
+  if (result.status == ResolveStatus::kOk) {
+    if (!cugo::game::is_valid_turn_state(state) ||
+        state.phase != cugo::game::TurnPhase::kPlay) {
+      errors[game] = 4;
+    }
+  } else if (result.status == ResolveStatus::kChoiceRequired) {
+    if (!cugo::game::is_valid_turn_state(state) ||
+        state.phase != cugo::game::TurnPhase::kResolve) {
+      errors[game] = 5;
+    }
+  } else {
+    errors[game] = 6;
+  }
+
+  results[game] = ResolveSnapshot{
+      result.captured_cards,
+      static_cast<std::uint8_t>(result.status),
+      result.events,
+      result.captured_own_ppuk,
+      result.captured_opponent_ppuk,
+  };
+  cugo::game::store_turn_state(states, static_cast<std::size_t>(game), state);
+}
+
 bool check_cuda(cudaError_t status, const char* what) {
   if (status == cudaSuccess) {
     return true;
@@ -115,6 +162,14 @@ bool same_state(const TurnState48& gpu, const TurnState48& cpu) {
          gpu.pending_drawn == cpu.pending_drawn;
 }
 
+bool same_result(const ResolveSnapshot& gpu, const ResolveResult& cpu) {
+  return gpu.captured_cards == cpu.captured_cards &&
+         gpu.status == static_cast<std::uint8_t>(cpu.status) &&
+         gpu.events == cpu.events &&
+         gpu.captured_own_ppuk == cpu.captured_own_ppuk &&
+         gpu.captured_opponent_ppuk == cpu.captured_opponent_ppuk;
+}
+
 void print_state(const char* name, const TurnState48& state) {
   std::cerr << name << " hand0=0x" << std::hex << state.hand0
             << " hand1=0x" << state.hand1 << " floor=0x" << state.floor
@@ -122,7 +177,8 @@ void print_state(const char* name, const TurnState48& state) {
             << " captured1=0x" << state.captured1 << " rng=0x" << state.rng_state
             << std::dec << " ppuk=" << state.ppuk_months
             << " ppuk_owner1=" << state.ppuk_owner1_months
-            << " turn=" << state.turn_index << " actor=" << static_cast<unsigned>(state.actor)
+            << " turn=" << state.turn_index
+            << " actor=" << static_cast<unsigned>(state.actor)
             << " phase=" << static_cast<unsigned>(state.phase)
             << " played=" << static_cast<unsigned>(state.pending_played)
             << " drawn=" << static_cast<unsigned>(state.pending_drawn) << '\n';
@@ -140,22 +196,30 @@ int main() {
   std::uint16_t* device_u16 = nullptr;
   std::uint8_t* device_u8 = nullptr;
   std::uint8_t* device_errors = nullptr;
+  ResolveSnapshot* device_results = nullptr;
 
   auto cleanup = [&]() {
     cudaFree(device_u64);
     cudaFree(device_u16);
     cudaFree(device_u8);
     cudaFree(device_errors);
+    cudaFree(device_results);
   };
 
-  if (!check_cuda(cudaMalloc(&device_u64, games * kU64Fields * sizeof(std::uint64_t)),
+  if (!check_cuda(cudaMalloc(&device_u64,
+                             games * kU64Fields * sizeof(std::uint64_t)),
                   "cudaMalloc(u64)") ||
-      !check_cuda(cudaMalloc(&device_u16, games * kU16Fields * sizeof(std::uint16_t)),
+      !check_cuda(cudaMalloc(&device_u16,
+                             games * kU16Fields * sizeof(std::uint16_t)),
                   "cudaMalloc(u16)") ||
-      !check_cuda(cudaMalloc(&device_u8, games * kU8Fields * sizeof(std::uint8_t)),
+      !check_cuda(cudaMalloc(&device_u8,
+                             games * kU8Fields * sizeof(std::uint8_t)),
                   "cudaMalloc(u8)") ||
       !check_cuda(cudaMalloc(&device_errors, games * sizeof(std::uint8_t)),
                   "cudaMalloc(errors)") ||
+      !check_cuda(cudaMalloc(&device_results,
+                             games * sizeof(ResolveSnapshot)),
+                  "cudaMalloc(results)") ||
       !check_cuda(cudaMemset(device_errors, 0, games * sizeof(std::uint8_t)),
                   "cudaMemset(errors)")) {
     cleanup();
@@ -164,9 +228,12 @@ int main() {
 
   const TurnStateSoA48 device_states =
       make_view(device_u64, device_u16, device_u8, games);
-  init_turn_kernel<<<blocks, kThreads>>>(device_states, device_errors, kGames, kMasterSeed);
+  init_turn_kernel<<<blocks, kThreads>>>(
+      device_states, device_errors, kGames, kMasterSeed);
   regular_play_kernel<<<blocks, kThreads>>>(device_states, device_errors, kGames);
   draw_phase_kernel<<<blocks, kThreads>>>(device_states, device_errors, kGames);
+  resolve_phase_kernel<<<blocks, kThreads>>>(
+      device_states, device_results, device_errors, kGames);
 
   if (!check_cuda(cudaGetLastError(), "turn phase launch") ||
       !check_cuda(cudaDeviceSynchronize(), "turn phase synchronize")) {
@@ -178,23 +245,33 @@ int main() {
   std::vector<std::uint16_t> host_u16(games * kU16Fields);
   std::vector<std::uint8_t> host_u8(games * kU8Fields);
   std::vector<std::uint8_t> host_errors(games);
+  std::vector<ResolveSnapshot> host_results(games);
 
-  if (!check_cuda(cudaMemcpy(host_u64.data(), device_u64,
+  if (!check_cuda(cudaMemcpy(host_u64.data(),
+                             device_u64,
                              host_u64.size() * sizeof(std::uint64_t),
                              cudaMemcpyDeviceToHost),
                   "cudaMemcpy(u64)") ||
-      !check_cuda(cudaMemcpy(host_u16.data(), device_u16,
+      !check_cuda(cudaMemcpy(host_u16.data(),
+                             device_u16,
                              host_u16.size() * sizeof(std::uint16_t),
                              cudaMemcpyDeviceToHost),
                   "cudaMemcpy(u16)") ||
-      !check_cuda(cudaMemcpy(host_u8.data(), device_u8,
+      !check_cuda(cudaMemcpy(host_u8.data(),
+                             device_u8,
                              host_u8.size() * sizeof(std::uint8_t),
                              cudaMemcpyDeviceToHost),
                   "cudaMemcpy(u8)") ||
-      !check_cuda(cudaMemcpy(host_errors.data(), device_errors,
+      !check_cuda(cudaMemcpy(host_errors.data(),
+                             device_errors,
                              host_errors.size() * sizeof(std::uint8_t),
                              cudaMemcpyDeviceToHost),
-                  "cudaMemcpy(errors)")) {
+                  "cudaMemcpy(errors)") ||
+      !check_cuda(cudaMemcpy(host_results.data(),
+                             device_results,
+                             host_results.size() * sizeof(ResolveSnapshot),
+                             cudaMemcpyDeviceToHost),
+                  "cudaMemcpy(results)")) {
     cleanup();
     return 1;
   }
@@ -203,6 +280,8 @@ int main() {
   const TurnStateSoA48 gpu_view =
       make_view(host_u64.data(), host_u16.data(), host_u8.data(), games);
 
+  int resolved = 0;
+  int choice_required = 0;
   for (int game = 0; game < kGames; ++game) {
     if (host_errors[game] != 0) {
       std::cerr << "GPU invariant/transition error at game " << game
@@ -217,24 +296,44 @@ int main() {
         deal, static_cast<std::uint8_t>(game & 1));
     const cugo::core::CardId played =
         cugo::core::first_card(cugo::game::active_hand(cpu));
-    if (cugo::game::begin_regular_play(cpu, played) != cugo::game::TurnStatus::kOk ||
-        cugo::game::draw_for_turn(cpu) != cugo::game::TurnStatus::kOk ||
-        !cugo::game::is_valid_turn_state(cpu)) {
-      std::cerr << "CPU transition failure at game " << game << '\n';
+    if (cugo::game::begin_regular_play(cpu, played) !=
+            cugo::game::TurnStatus::kOk ||
+        cugo::game::draw_for_turn(cpu) != cugo::game::TurnStatus::kOk) {
+      std::cerr << "CPU pre-resolve transition failure at game " << game << '\n';
       return 3;
+    }
+
+    const ResolveResult cpu_result = cugo::game::resolve_turn(cpu);
+    if (cpu_result.status == ResolveStatus::kOk) {
+      ++resolved;
+    } else if (cpu_result.status == ResolveStatus::kChoiceRequired) {
+      ++choice_required;
+    } else {
+      std::cerr << "Unexpected CPU resolve status at game " << game
+                << " status=" << static_cast<unsigned>(cpu_result.status) << '\n';
+      return 4;
     }
 
     const TurnState48 gpu =
         cugo::game::load_turn_state(gpu_view, static_cast<std::size_t>(game));
-    if (!same_state(gpu, cpu) || !cugo::game::is_valid_turn_state(gpu)) {
-      std::cerr << "CPU/GPU turn state mismatch at game " << game << '\n';
+    if (!same_state(gpu, cpu) ||
+        !same_result(host_results[game], cpu_result) ||
+        !cugo::game::is_valid_turn_state(gpu)) {
+      std::cerr << "CPU/GPU turn resolve mismatch at game " << game << '\n';
       print_state("gpu", gpu);
       print_state("cpu", cpu);
-      return 4;
+      return 5;
     }
   }
 
+  if (resolved == 0 || choice_required == 0) {
+    std::cerr << "Resolve coverage missing: resolved=" << resolved
+              << " choice_required=" << choice_required << '\n';
+    return 6;
+  }
+
   std::cout << "cugo_cuda_turn_test: PASS (" << kGames
-            << " games INIT -> PLAY -> DRAW -> RESOLVE)\n";
+            << " games PLAY -> DRAW -> RESOLVE; resolved=" << resolved
+            << " choice_required=" << choice_required << ")\n";
   return 0;
 }
