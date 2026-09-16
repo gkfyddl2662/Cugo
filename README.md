@@ -17,32 +17,36 @@ The repository contains a deterministic CPU reference path and CUDA differential
 - raw 50-card layout: 10 cards per player, 8 initial floor cards, 22-card stock
 - initial-floor bonus collection before the first player's turn
 - hand-bonus replacement draws plus a Shin Matgo pi-steal event count
-- stock bonus chaining that keeps flipped bonus cards pending until the eventual standard-card resolve
-- field-major SoA resident state for the current base-48 turn engine
-- `PLAY -> DRAW -> RESOLVE` turn phases
+- stock bonus chaining until a standard card is flipped
+- a bonus-aware `TurnState50` with `PLAY -> DRAW -> RESOLVE`
+- pending stock bonuses kept transactional until the standard-card resolve is known
+- per-bonus ppuk association metadata so floor bonuses stay attached to the ppuk month that owns them
+- ppuk creation with pending bonuses and later capture of the ppuk plus its associated bonus cards
 - normal unique capture, ppuk, jjok, ttadak, sweep detection, and ppuk ownership/capture metadata
-- explicit `ResolveChoices` for ambiguous two-card same-month floor selections
+- explicit resolve choices for ambiguous two-card same-month floor selections
 - transactional resolve behavior: choice/error statuses never partially mutate state
-- fixed CPU examples plus randomized card-partition/scoring/bonus invariants
-- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, stock transitions, and turn resolves
+- fixed CPU examples plus randomized card-partition/scoring/bonus/turn invariants
+- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, and 50-card bonus-aware turns
 - one-thread-per-game CUDA throughput baselines
 - CUDA Graph as the current repeated-phase scheduling baseline
 
-The 50-card work deliberately keeps bonus cards as physical cards in the same 64-bit mask rather than widening the state representation. `kFullDeckMask` remains the legacy 48-standard-card mask for base-48 regression tests; new exact-Shin-Matgo work uses `kShinMatgoDeckMask`.
+The 50-card path keeps all physical cards in the same 64-bit mask. `kFullDeckMask` remains the legacy 48-standard-card mask for regression tests; exact Shin Matgo work uses `kShinMatgoDeckMask`.
 
-### Bonus-rule integration boundary
+### Bonus-aware turn integration
 
-Hangame's official guide states that two bonus cards are used in Shin Matgo, they count as 2-pi and 3-pi, an initial floor bonus is automatically taken before the first player starts, a hand bonus gives a replacement card before the stock flip and another play opportunity, and a stock-flipped bonus grants another flip. If a ppuk occurs after bonus flips, those bonus cards must be placed on the floor with the ppuk cards.
+Hangame's official guide states that a stock-flipped bonus grants another flip and, if the eventual standard flip creates ppuk, the bonus card(s) go to the floor with that ppuk. `TurnState50` therefore carries a `pending_bonus_mask` during `RESOLVE` instead of capturing stock bonuses immediately.
 
-The current bonus primitives implement the physical 50-card deck, scoring, raw deal, initial-floor collection, hand replacement, and stock bonus chain. The stock-flip helper returns `pending_bonus_mask` instead of prematurely adding those cards to captured cards. This is intentional: the next resolver milestone must associate pending bonus cards with a specific ppuk stack so they can later be captured with that stack without ambiguity.
+If ppuk is created, each pending bonus is moved onto the floor and associated with that ppuk month through compact 12-bit metadata. When the three-card ppuk stack is later captured, its associated bonus card(s) are captured in the same transaction and the association metadata is cleared. This also allows more than one ppuk stack to exist without losing which stack owns a physical bonus card.
 
-The official mode guide also states that playing a bonus card in Shin Matgo takes one opponent pi. The current hand-bonus primitive returns `pi_steal_count=1`; physical pi transfer is still deferred until the exact selection policy for multiple eligible opponent pi cards is pinned down.
+Playing a bonus card from hand remains a `PLAY`-phase action: the card is captured, one replacement card is drawn from stock, and the player receives another play opportunity. The action reports `pi_steal_count=1` for Shin Matgo, but physical opponent-pi transfer is still deferred until the exact selection policy for multiple eligible pi cards is pinned down.
+
+The older `TurnState48` engine remains intact as a regression/performance reference while the 50-card path is brought to full rule parity.
 
 ### Measured RTX 5080 baseline
 
 The measured deal and draw kernels use zero local memory and reach 100% theoretical occupancy. Longer block-size measurements showed 256 and 512 threads/block effectively tied, so 256 remains the working default for the light phases.
 
-The capture resolver currently uses 72 registers/thread and zero local memory. Across three 1,048,576-game x 256-iteration measurements, 512 threads/block was consistently the fastest tested resolver configuration despite 33.3% theoretical occupancy, reaching roughly 7.5-7.9 billion resolve attempts/s. Phase-specific block sizes are therefore allowed; 512 is the current `RESOLVE` performance baseline while 256 remains the light-phase baseline.
+The base-48 capture resolver currently uses 72 registers/thread and zero local memory. Across three 1,048,576-game x 256-iteration measurements, 512 threads/block was consistently the fastest tested resolver configuration despite 33.3% theoretical occupancy, reaching roughly 7.5-7.9 billion resolve attempts/s. Phase-specific block sizes are therefore allowed; 512 is the current `RESOLVE` performance baseline while 256 remains the light-phase baseline.
 
 For the 21-node initialization + 20-draw sequence, CUDA Graph replay improved measured end-to-end wall time by about 1.11x-1.14x across three runs and reduced host submission time by roughly 65x-70x. CUDA Graph is therefore the current repeated-phase scheduling baseline; it can still be replaced later if real gameplay divergence makes another scheduler measurably better.
 
@@ -76,4 +80,4 @@ The deal benchmark generates 1,048,576 independent base-48 deals per launch, swe
 
 The resident-state benchmark keeps 1,048,576 game states in field-major SoA memory. It measures the 20 stock-draw kernels over a long window and compares manual host submission against CUDA Graph replay for the full 21-node initialization + 20-draw sequence. Graph setup cost is reported separately from replay.
 
-The turn-resolve benchmark prepares 1,048,576 deterministic first-turn states, times only the hot `load SoA -> resolve_turn -> status write -> store SoA` path, and sweeps 128/256/512 threads per block over 256 timed launches. It reports registers/thread, local bytes/thread, theoretical occupancy, games/s, average kernel time, and the resolved/choice-required status mix. Correctness-only invariant checks are deliberately excluded from the timed resolver kernel.
+The base-48 turn-resolve benchmark prepares 1,048,576 deterministic first-turn states, times only the hot `load SoA -> resolve_turn -> status write -> store SoA` path, and sweeps 128/256/512 threads per block over 256 timed launches. It reports registers/thread, local bytes/thread, theoretical occupancy, games/s, average kernel time, and the resolved/choice-required status mix. Correctness-only invariant checks are deliberately excluded from the timed resolver kernel.

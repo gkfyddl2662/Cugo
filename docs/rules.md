@@ -69,12 +69,25 @@ Hangame describes two bonus cards in Shin Matgo. The printed number determines w
 
 - The raw 50-card deal gives each player 10 cards and exposes 8 floor cards, leaving 22 cards in stock.
 - If a bonus card is among the initial floor cards, it is automatically taken before the first player starts. `collect_initial_floor_bonuses()` moves those bonus cards to the first player's captured set. The referenced Hangame guide does not state that another floor card is dealt as a replacement, so Cugo does not invent that replacement step.
-- If a player has a bonus card in hand, they may play it like a normal hand action. Before the normal stock flip, they receive one replacement card from the stock and get another opportunity to play a hand card. `play_hand_bonus()` performs this transaction and keeps hand size unchanged until that follow-up play.
-- In Shin Matgo, playing a bonus card also takes one opponent pi. The primitive returns `pi_steal_count=1`; actual card transfer is deferred until the exact multiple-pi-card selection policy is sourced.
-- If a bonus appears while flipping the stock, the player flips again. `draw_stock_with_bonus_chain()` therefore consumes consecutive bonus cards until it reaches a standard card and returns the encountered bonus cards as `pending_bonus_mask`.
-- If that eventual standard flip produces ppuk, Hangame says the bonus card(s) must be placed on the floor together with the ppuk cards. Pending stock bonuses therefore must not be committed to captured cards before RESOLVE.
+- If a player has a bonus card in hand, they may play it like a normal hand action. Before the normal stock flip, they receive one replacement card from the stock and get another opportunity to play a hand card. `play_bonus_for_turn50()` keeps the state in `PLAY`, captures the played bonus, and inserts the replacement into the active hand.
+- In Shin Matgo, playing a bonus card also takes one opponent pi. The action returns `pi_steal_count=1`; actual card transfer is deferred until the exact multiple-pi-card selection policy is sourced.
+- If a bonus appears while flipping the stock, the player flips again. `draw_for_turn50()` consumes consecutive stock bonuses until it reaches a standard card and stores those bonuses in `pending_bonus_mask`.
+- If the eventual standard flip does not create ppuk, the pending stock bonuses are captured by the active player in the same resolve transaction.
+- If the eventual standard flip creates ppuk, Hangame says the bonus card(s) must be placed on the floor together with the ppuk cards. `TurnState50` moves the pending bonuses onto the floor and associates each physical bonus with that ppuk month.
+- When that ppuk stack is later captured, its associated bonus card(s) are captured with the standard ppuk cards and the association is cleared.
 
-The main `TurnState48` resolver has not yet been widened to the 50-card bonus-aware turn state. The next resolver milestone must add explicit association between pending/floor bonus cards and the ppuk month that owns them; a plain floor bitmask is insufficient if more than one ppuk stack exists.
+### Ppuk-bonus association representation
+
+A plain floor bitmask cannot say which ppuk owns a floor bonus when more than one ppuk stack exists. `TurnState50` therefore stores:
+
+- `ppuk_months`: one bit per ppuk month.
+- `ppuk_owner1_months`: owner bit for those ppuk months.
+- `bonus2_ppuk_months`: zero or one month bit identifying the ppuk that owns physical bonus ID 48.
+- `bonus3_ppuk_months`: zero or one month bit identifying the ppuk that owns physical bonus ID 49.
+
+A bonus may be on the floor only if its association map identifies an existing ppuk month. Each marked ppuk month must contain exactly three standard cards on the floor. The complete 50 physical cards must remain a disjoint partition across hands, floor, stock, captured piles, pending played/drawn cards, and `pending_bonus_mask`.
+
+Choice/error resolution remains transactional: if a two-card floor selection is needed, `resolve_turn50()` leaves the complete state and pending bonus chain unchanged until a valid choice is supplied.
 
 ## Pinned special situations relevant to RESOLVE
 
@@ -88,26 +101,26 @@ The main `TurnState48` resolver has not yet been widened to the 50-card bonus-aw
 - Grenade / two-card bomb: two same-month hand cards can be used against the two same-month floor cards. Hangame's guide states that this steals pi but does not get the bomb score multiplier.
 - Jjok: a hand play with no floor match followed by a same-month stock draw captures the pair and steals one opponent pi, except on the last card.
 
-## Current base-48 resolver behavior
+## Resolver paths
 
-The deterministic CPU/CUDA resolver currently implements card movement for this standard-card subset:
+The older `TurnState48` deterministic CPU/CUDA resolver remains a standard-card regression/performance fixture.
 
-- normal unique same-month capture
-- unmatched cards remaining on the floor
-- ppuk creation and ppuk owner metadata
-- capture of a three-card ppuk stack, with own/opponent ppuk capture counts returned as side-effect metadata
-- jjok card movement
-- ttadak card movement
-- sweep detection after the complete turn is resolved
-- explicit same-month floor choice when exactly two matching floor cards exist
+The bonus-aware `TurnState50` path implements the same current standard-card subset plus:
 
-When a two-card floor choice is required and the caller did not provide a valid `ResolveChoices` entry, the resolver returns `kChoiceRequired` without changing the game state. Invalid choices likewise leave the state unchanged.
+- initial-floor bonus collection
+- hand-bonus replacement action
+- stock bonus chains
+- pending bonus capture on ordinary resolve
+- pending bonus placement/association on ppuk
+- later ppuk capture including associated bonus cards
+- 50-card state partition and ppuk-bonus association invariants
 
-The guide says ppuk and jjok have a last-card exception but does not describe the replacement transition on that page. The engine therefore returns `kUnsupportedLastCardSpecial` for those two final-stock-flip patterns instead of guessing.
+Both resolver paths currently implement normal unique same-month capture, unmatched floor placement, ppuk, capture of a three-card ppuk stack, jjok, ttadak, sweep detection, and explicit same-month floor choice when exactly two matching floor cards exist.
+
+The guide says ppuk and jjok have a last-card exception but does not describe the replacement transition on that page. Both resolver paths therefore return an unsupported status for those exact final-stock-flip patterns instead of guessing.
 
 ## Not implemented yet
 
-- 50-card bonus-aware `TurnState` integration and ppuk-bonus stack association
 - Last-card ppuk/jjok exception transition
 - Exact pi-steal card selection/transfer policy
 - Bomb/grenade action encoding and bomb-card credits
