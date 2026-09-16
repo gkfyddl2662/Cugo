@@ -11,7 +11,7 @@ The repository contains a deterministic CPU reference path and CUDA differential
 - separate standard-deck and 50-card Shin Matgo masks inside one `uint64_t`
 - a fixed engine slot convention for the 48 standard hwatu identities
 - bright/animal/ribbon/pi metadata, including godori and ribbon-set masks
-- fixed double-pi cards, 2-pi/3-pi bonus scoring, and optional Gukjin animal -> double-pi conversion
+- fixed double-pi cards, 2-pi/3-pi bonus scoring, and Gukjin animal/double-pi interpretation
 - host/device base scoring for bright, animal, ribbon, and pi groups
 - deterministic base-48 and raw 50-card deal primitives
 - raw 50-card layout: 10 cards per player, 8 initial floor cards, 22-card stock
@@ -23,11 +23,13 @@ The repository contains a deterministic CPU reference path and CUDA differential
 - per-bonus ppuk association metadata so floor bonuses stay attached to the ppuk month that owns them
 - ppuk creation with pending bonuses and later capture of the ppuk plus its associated bonus cards
 - normal unique capture, ppuk, jjok, ttadak, sweep detection, and ppuk ownership/capture metadata
+- persistent per-player Gukjin animal/double-pi role stored inside existing packed turn metadata
+- state-derived scoring and pi eligibility for Gukjin, including role-preserving physical transfer
 - host/device pi-steal count calculation and physical captured-card transfer
 - an explicit pi-transfer selection boundary instead of guessing undocumented Hangame card-priority behavior
 - transactional resolve/bonus wrappers: unresolved pi selection never partially mutates the turn state
-- fixed CPU examples plus randomized card-partition/scoring/bonus/turn/pi-transfer invariants
-- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, 50-card turns, and pi transfers
+- fixed CPU examples plus randomized card-partition/scoring/bonus/turn/pi-transfer/Gukjin-role invariants
+- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, 50-card turns, pi transfers, and persistent Gukjin roles
 - one-thread-per-game CUDA throughput baselines
 - CUDA Graph as the current repeated-phase scheduling baseline
 
@@ -42,6 +44,14 @@ If ppuk is created, each pending bonus is moved onto the floor and associated wi
 Playing a bonus card from hand remains a `PLAY`-phase action: the card is captured, one replacement card is drawn from stock, and the player receives another play opportunity. `play_bonus_for_turn50_with_pi_transfer()` can also apply the resulting one-card pi steal transactionally.
 
 The older `TurnState48` engine remains intact as a regression/performance reference while the 50-card path is brought to full rule parity.
+
+### Persistent Gukjin role
+
+Hangame documents Gukjin as an animal card that may instead be used as double-pi, but the public guide does not pin a mandatory conversion moment. Cugo therefore stores the current interpretation explicitly per player and exposes `set_persistent_gukjin_role50()` instead of guessing a hidden automatic timing rule.
+
+No extra SoA array is required: the two role bits use bits 12 and 13 of the existing `ppuk_owner1_months` 16-bit metadata word, while bits 0..11 remain the ppuk-owner month bits. `is_valid_persistent_turn_state50()` validates the packed role bits together with the existing 50-card state invariant; the legacy base validator remains unchanged for older regression code.
+
+`persistent_score_player50()` and the default pi-transfer path derive `ScoreOptions` from this persistent state. If Gukjin is currently double-pi and is physically stolen as a pi card, the role follows the card to its new owner. The new owner may later switch it back to animal through the same explicit role API.
 
 ### Pi-transfer policy boundary
 

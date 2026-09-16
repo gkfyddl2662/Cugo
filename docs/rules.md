@@ -58,10 +58,23 @@ IDs `50..63` remain available for future nonstandard physical/synthetic cards if
 - Brights: 3 brights = 3 points, but a 3-bright set containing the rain bright = 2; 4 brights = 4; all 5 = 15.
 - Animals: 5 cards = 1 point and each additional animal adds 1. Godori (months 2, 4, 8) adds 5 points. Seven or more animals sets the meongtta multiplier flag; the final multiplier itself is not applied in the base score.
 - Ribbons: 5 cards = 1 point and each additional ribbon adds 1. Hongdan (1,2,3), chodan (4,5,7), and cheongdan (6,9,10) each add 3 points. The month-12 ribbon belongs to none of those sets.
-- Pi: 10 pi units = 1 point and each additional unit adds 1. Plain pi contributes 1 unit. The fixed month-11/month-12 double-pi cards contribute 2. Gukjin contributes 2 only when `ScoreOptions::gukjin_as_double_pi` is true, in which case it no longer counts as an animal.
+- Pi: 10 pi units = 1 point and each additional unit adds 1. Plain pi contributes 1 unit. The fixed month-11/month-12 double-pi cards contribute 2. Gukjin contributes 2 only when its current role is double-pi, in which case it no longer counts as an animal.
 - The bonus cards contribute 2 and 3 pi units respectively.
 
-`pi_card_mask()` exposes which captured physical cards currently count as pi under the same Gukjin option.
+Hangame explicitly documents Gukjin as an animal card that can also be used as double-pi. The public guide does not specify a mandatory conversion moment. Cugo therefore exposes the role as explicit state rather than inventing an automatic conversion rule.
+
+### Persistent Gukjin role representation
+
+`TurnState50` stores one current role bit per player. To avoid adding another SoA field, these two flags are packed into the unused high bits of the existing `ppuk_owner1_months` word:
+
+- bits `0..11`: existing ppuk-owner-by-month metadata
+- bit `12`: player 0 currently treats captured Gukjin as double-pi
+- bit `13`: player 1 currently treats captured Gukjin as double-pi
+- bits `14..15`: reserved
+
+`set_persistent_gukjin_role50()` changes the interpretation only when that player physically owns Gukjin in the captured pile. `persistent_score_player50()` derives the appropriate `ScoreOptions` from the state. `is_valid_persistent_turn_state50()` masks the role bits for the legacy base-state invariant and additionally rejects a double-pi role bit when the corresponding player does not own Gukjin.
+
+If Gukjin is currently double-pi and is physically transferred by a pi-steal event, the current role follows the physical card to the new owner. This keeps physical ownership, pi eligibility, and scoring interpretation consistent. The new owner can later set the role back to animal explicitly. This is an engine-state convention; it does not claim that Hangame exposes the role-change timing as a separate UI action.
 
 ## Pinned bonus-card behavior
 
@@ -81,7 +94,7 @@ Hangame describes two bonus cards in Shin Matgo. The printed number determines w
 A plain floor bitmask cannot say which ppuk owns a floor bonus when more than one ppuk stack exists. `TurnState50` therefore stores:
 
 - `ppuk_months`: one bit per ppuk month.
-- `ppuk_owner1_months`: owner bit for those ppuk months.
+- low 12 bits of `ppuk_owner1_months`: owner bit for those ppuk months.
 - `bonus2_ppuk_months`: zero or one month bit identifying the ppuk that owns physical bonus ID 48.
 - `bonus3_ppuk_months`: zero or one month bit identifying the ppuk that owns physical bonus ID 49.
 
@@ -103,21 +116,21 @@ Choice/error resolution remains transactional: if a two-card floor selection is 
 
 ## Pi-steal transfer boundary
 
-The Hangame guide pins the number of opponent pi cards taken by the events above, and the Shin Matgo mode guide confirms that playing a bonus card also takes an opponent pi. The public guide does not specify the physical-card priority when the victim owns more eligible pi cards than must be transferred (for example, several plain pi plus double/bonus pi).
+The Hangame guide pins the number of opponent pi cards taken by the events above, and the Shin Matgo mode guide confirms that playing a bonus card also takes an opponent pi. The public guide does not specify the physical-card priority when the victim owns more eligible pi cards than must be transferred.
 
 Cugo therefore does not silently encode an undocumented automatic priority. `pi_transfer.h` separates the pinned steal count from the provider-specific selection policy:
 
 - `resolve_pi_steal_card_count()` converts resolver event metadata into the number of physical pi cards to take.
-- `apply_pi_steal50()` moves physical cards between captured piles.
+- `apply_pi_steal50()` moves physical cards between captured piles and, by default, derives the victim's Gukjin interpretation from `TurnState50`.
 - If the victim has no more eligible physical pi cards than requested, every available pi card is transferred automatically.
 - If the victim has more candidates than requested, the caller must provide a `PiTransferSelection` mask containing exactly the requested number of eligible physical cards.
 - Missing selection returns `kSelectionRequired`; an illegal mask returns `kInvalidSelection`.
 - `resolve_turn50_with_pi_transfer()` and `play_bonus_for_turn50_with_pi_transfer()` are transactional wrappers. Selection-required/invalid transfer leaves the entire resolve or hand-bonus action unchanged.
-- A transferred double-pi or 3-pi bonus retains the full scoring value of that physical card. Gukjin is eligible only when the caller's current `ScoreOptions` treats it as double-pi.
+- A transferred double-pi or 3-pi bonus retains the full scoring value of that physical card. Gukjin is eligible only when the victim's persistent role marks it as double-pi.
+
+Legacy overloads that accept an explicit `ScoreOptions` remain available for low-level differential/regression tests, but the normal 50-card state path uses the persistent player role.
 
 This selection mask is an environment-policy input, not a documented Shin Matgo player action. Once Hangame's exact automatic priority is sourced or measured, that policy can supply the mask without changing the state representation.
-
-Non-authoritative general Go-Stop references commonly state that if only a double-pi remains it is handed over as the physical card. That behavior is representable by this transfer engine, but it is not used to invent Hangame's unresolved priority when multiple cards are available.
 
 ## Resolver paths
 
@@ -132,6 +145,7 @@ The bonus-aware `TurnState50` path implements the same current standard-card sub
 - pending bonus placement/association on ppuk
 - later ppuk capture including associated bonus cards
 - 50-card state partition and ppuk-bonus association invariants
+- persistent Gukjin role and state-derived scoring/pi eligibility
 - transactional pi-steal integration through `pi_transfer.h`
 
 Both resolver paths currently implement normal unique same-month capture, unmatched floor placement, ppuk, capture of a three-card ppuk stack, jjok, ttadak, sweep detection, and explicit same-month floor choice when exactly two matching floor cards exist.
@@ -142,6 +156,7 @@ The guide says ppuk and jjok have a last-card exception but does not describe th
 
 - Last-card ppuk/jjok exception transition
 - Exact Hangame automatic pi-card priority when more candidates exist than must be stolen
+- Exact Hangame UI/timing policy for changing Gukjin between animal and double-pi
 - Bomb/grenade action encoding and bomb-card credits
 - Go/Stop decision state and final score multipliers
 - Missions and economy/betting effects
