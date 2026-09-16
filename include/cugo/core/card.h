@@ -40,6 +40,14 @@ CUGO_HOST_DEVICE constexpr CardMask card_bit(CardId card) noexcept {
   return CardMask{1} << card;
 }
 
+CUGO_HOST_DEVICE constexpr CardMask month_mask(std::uint8_t month) noexcept {
+  return CardMask{0xf} << (static_cast<unsigned>(month) * kCardsPerMonth);
+}
+
+CUGO_HOST_DEVICE constexpr CardMask matching_month_cards(CardMask cards, CardId card) noexcept {
+  return cards & month_mask(card_month(card));
+}
+
 CUGO_HOST_DEVICE inline int card_count(CardMask mask) noexcept {
 #if defined(__CUDA_ARCH__)
   return __popcll(mask);

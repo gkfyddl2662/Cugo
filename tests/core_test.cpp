@@ -6,6 +6,7 @@
 #include "cugo/core/rng.h"
 #include "cugo/game/deal.h"
 #include "cugo/game/state.h"
+#include "cugo/game/turn.h"
 
 namespace {
 
@@ -26,6 +27,22 @@ void test_card_layout() {
   }
   assert(seen == kFullDeckMask);
   assert(card_count(seen) == kCardCount);
+}
+
+void test_month_masks() {
+  using namespace cugo::core;
+  CardMask all = 0;
+  for (std::uint8_t month = 0; month < kMonthCount; ++month) {
+    const CardMask mask = month_mask(month);
+    assert(card_count(mask) == kCardsPerMonth);
+    assert((all & mask) == 0);
+    all |= mask;
+    for (std::uint8_t slot = 0; slot < kCardsPerMonth; ++slot) {
+      const CardId card = make_card(month, slot);
+      assert(matching_month_cards(kFullDeckMask, card) == mask);
+    }
+  }
+  assert(all == kFullDeckMask);
 }
 
 void test_pop_first_card() {
@@ -129,16 +146,68 @@ void test_resident_stock_draws() {
   }
 }
 
+void test_turn_phase_frame() {
+  using namespace cugo::core;
+  using namespace cugo::game;
+
+  constexpr std::uint64_t kMasterSeed = 0x7475726e5f303031ULL;
+  for (std::uint64_t game = 0; game < 4096; ++game) {
+    const auto deal = deal_base_48(derive_seed(kMasterSeed, game));
+    const std::uint8_t actor = static_cast<std::uint8_t>(game & 1u);
+    auto state = make_turn_state(deal, actor);
+    assert(is_valid_turn_state(state));
+    assert(state.phase == TurnPhase::kPlay);
+    assert(state.actor == actor);
+    assert(state.captured0 == 0);
+    assert(state.captured1 == 0);
+    assert(state.ppuk_months == 0);
+    assert(state.ppuk_owner1_months == 0);
+
+    assert(begin_regular_play(state, kInvalidCard) == TurnStatus::kInvalidCard);
+    assert(draw_for_turn(state) == TurnStatus::kWrongPhase);
+    const CardMask other_hand = actor == 0 ? state.hand1 : state.hand0;
+    assert(begin_regular_play(state, first_card(other_hand)) ==
+           TurnStatus::kCardNotInHand);
+    assert(is_valid_turn_state(state));
+
+    const CardMask before_hand = active_hand(state);
+    const CardId played = first_card(before_hand);
+    assert(played != kInvalidCard);
+    const CardMask matches = floor_matches(state, played);
+    assert(matches == matching_month_cards(state.floor, played));
+
+    assert(begin_regular_play(state, played) == TurnStatus::kOk);
+    assert(state.phase == TurnPhase::kDraw);
+    assert(state.pending_played == played);
+    assert(state.pending_drawn == kInvalidCard);
+    assert(card_count(active_hand(state)) == kInitialHandCards - 1);
+    assert(begin_regular_play(state, played) == TurnStatus::kWrongPhase);
+    assert(is_valid_turn_state(state));
+
+    const int stock_before = card_count(state.stock);
+    assert(draw_for_turn(state) == TurnStatus::kOk);
+    assert(state.phase == TurnPhase::kResolve);
+    assert(state.pending_played == played);
+    assert(is_valid_card(state.pending_drawn));
+    assert(state.pending_drawn != played);
+    assert(card_count(state.stock) == stock_before - 1);
+    assert(draw_for_turn(state) == TurnStatus::kWrongPhase);
+    assert(is_valid_turn_state(state));
+  }
+}
+
 }  // namespace
 
 int main() {
   test_card_layout();
+  test_month_masks();
   test_pop_first_card();
   test_select_card_by_rank();
   test_rng_determinism();
   test_uniform_bounded();
   test_base_48_deal();
   test_resident_stock_draws();
+  test_turn_phase_frame();
   std::cout << "cugo_core_test: PASS\n";
   return 0;
 }
