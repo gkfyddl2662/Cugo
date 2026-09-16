@@ -5,6 +5,7 @@
 #include "cugo/core/card.h"
 #include "cugo/core/rng.h"
 #include "cugo/game/deal.h"
+#include "cugo/game/state.h"
 
 namespace {
 
@@ -98,6 +99,36 @@ void test_base_48_deal() {
   }
 }
 
+void test_resident_stock_draws() {
+  using namespace cugo::core;
+  using namespace cugo::game;
+
+  constexpr std::uint64_t kMasterSeed = 0x73746174655f3031ULL;
+  for (std::uint64_t game = 0; game < 4096; ++game) {
+    const auto seed = derive_seed(kMasterSeed, game);
+    const auto deal = deal_base_48(seed);
+    auto state = make_resident_state(deal);
+    const CardMask initial_stock = deal.stock;
+    CardMask drawn = 0;
+
+    for (int step = 0; step < kBaseStockCards; ++step) {
+      const int before = card_count(state.stock);
+      const CardId card = draw_stock_card(state);
+      assert(card != kInvalidCard);
+      assert((initial_stock & card_bit(card)) != 0);
+      assert((drawn & card_bit(card)) == 0);
+      drawn |= card_bit(card);
+      assert(card_count(state.stock) == before - 1);
+    }
+
+    assert(state.stock == 0);
+    assert(drawn == initial_stock);
+    const std::uint64_t rng_before = state.rng_state;
+    assert(draw_stock_card(state) == kInvalidCard);
+    assert(state.rng_state == rng_before);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -107,6 +138,7 @@ int main() {
   test_rng_determinism();
   test_uniform_bounded();
   test_base_48_deal();
+  test_resident_stock_draws();
   std::cout << "cugo_core_test: PASS\n";
   return 0;
 }

@@ -35,15 +35,22 @@ if(CUGO_ENABLE_CUDA)
       target_link_libraries(cugo_cuda_deal_test PRIVATE cugo_core)
       set_target_properties(cugo_cuda_deal_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
+      add_executable(cugo_cuda_state_test tests/cuda_state_test.cu)
+      target_link_libraries(cugo_cuda_state_test PRIVATE cugo_core)
+      set_target_properties(cugo_cuda_state_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
       if(MSVC)
         target_compile_options(cugo_cuda_core_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
         target_compile_options(cugo_cuda_deal_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        target_compile_options(cugo_cuda_state_test PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
       endif()
 
       add_test(NAME cugo_cuda_core_test COMMAND cugo_cuda_core_test)
       add_test(NAME cugo_cuda_deal_test COMMAND cugo_cuda_deal_test)
+      add_test(NAME cugo_cuda_state_test COMMAND cugo_cuda_state_test)
     endif()
   else()
     message(STATUS "CUDA compiler not found; CUDA validation target disabled")
