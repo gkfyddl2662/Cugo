@@ -2,8 +2,11 @@
 /out/
 /.vs/
 /.vscode/
+/.venv-torch/
 CMakeUserPresets.json
 *.user
 *.suo
 *.ncu-rep
 *.nsys-rep
+__pycache__/
+*.pyc
