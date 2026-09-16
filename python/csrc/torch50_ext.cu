@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
 #include <cuda_runtime.h>
@@ -115,7 +115,7 @@ torch::Tensor cugo_torch50_create_cuda(torch::Tensor seeds,
   TORCH_CHECK(seeds.device() == first_players.device(),
               "seeds and first_players must be on the same CUDA device");
 
-  const at::cuda::CUDAGuard guard(seeds.device());
+  const c10::cuda::CUDAGuard guard(seeds.device());
   const std::int64_t count = seeds.numel();
   auto states = torch::empty(
       {count, static_cast<std::int64_t>(sizeof(TorchEnv50))},
@@ -134,7 +134,7 @@ torch::Tensor cugo_torch50_create_cuda(torch::Tensor seeds,
 
 std::vector<torch::Tensor> cugo_torch50_observe_cuda(torch::Tensor states) {
   check_states(states);
-  const at::cuda::CUDAGuard guard(states.device());
+  const c10::cuda::CUDAGuard guard(states.device());
   const std::int64_t count = states.size(0);
 
   auto features = torch::empty(
@@ -172,7 +172,7 @@ std::vector<torch::Tensor> cugo_torch50_step_cuda(torch::Tensor states,
   TORCH_CHECK(states.device() == actions.device(),
               "states and actions must be on the same CUDA device");
 
-  const at::cuda::CUDAGuard guard(states.device());
+  const c10::cuda::CUDAGuard guard(states.device());
   const std::int64_t count = states.size(0);
   auto rewards = torch::empty(
       {count}, torch::TensorOptions().device(states.device()).dtype(at::kFloat));
