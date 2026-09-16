@@ -4,6 +4,8 @@ from typing import Any
 
 import torch
 
+from cugo_replay50_ext import load_extension
+
 
 FEATURE_COUNT = 496
 FEATURE_BINARY_COUNT = 453
@@ -13,11 +15,10 @@ FEATURE_PADDING_COUNT = 17
 ACTION_COUNT = 177
 FEATURE_PACK_BYTES = (FEATURE_BINARY_COUNT + 7) // 8
 LEGAL_PACK_BYTES = (ACTION_COUNT + 7) // 8
-PACK_CHUNK_ROWS = 262144
 
 
 class PackedGpuReplayBuffer:
-    format_name = "packed-bitplanes-v1"
+    format_name = "packed-bitplanes-cuda-v2"
 
     def __init__(
         self,
@@ -41,6 +42,12 @@ class PackedGpuReplayBuffer:
         self.feature_count = int(feature_count)
         self.action_count = int(action_count)
         self.device = device
+        self._ext = load_extension(verbose=False)
+
+        if int(self._ext.FEATURE_COUNT) != FEATURE_COUNT:
+            raise RuntimeError("replay CUDA extension feature contract mismatch")
+        if int(self._ext.ACTION_COUNT) != ACTION_COUNT:
+            raise RuntimeError("replay CUDA extension action contract mismatch")
 
         self.feature_bits = torch.empty(
             (capacity, FEATURE_PACK_BYTES), dtype=torch.uint8, device=device
@@ -73,37 +80,6 @@ class PackedGpuReplayBuffer:
     def bytes_per_transition(self) -> int:
         return self.storage_bytes // self.capacity
 
-    @staticmethod
-    def _pack_bits(source: torch.Tensor, bit_count: int) -> torch.Tensor:
-        rows = source.size(0)
-        packed_bytes = (bit_count + 7) // 8
-        packed = torch.zeros(
-            (rows, packed_bytes), dtype=torch.uint8, device=source.device
-        )
-        for bit in range(8):
-            columns = source[:, bit:bit_count:8]
-            width = columns.size(1)
-            if width == 0:
-                continue
-            encoded = columns.ne(0).to(torch.uint8).bitwise_left_shift(bit)
-            packed[:, :width].bitwise_or_(encoded)
-        return packed
-
-    @staticmethod
-    def _unpack_bits(
-        packed: torch.Tensor,
-        bit_count: int,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        shifts = torch.arange(8, dtype=torch.uint8, device=packed.device)
-        unpacked = (
-            packed.unsqueeze(-1)
-            .bitwise_right_shift(shifts)
-            .bitwise_and(1)
-            .reshape(packed.size(0), -1)[:, :bit_count]
-        )
-        return unpacked.to(dtype)
-
     def _write_segment(
         self,
         dst_start: int,
@@ -116,34 +92,18 @@ class PackedGpuReplayBuffer:
         if count == 0:
             return
 
-        for src_start in range(0, count, PACK_CHUNK_ROWS):
-            rows = min(PACK_CHUNK_ROWS, count - src_start)
-            src_end = src_start + rows
-            dst_chunk_start = dst_start + src_start
-            dst_chunk_end = dst_chunk_start + rows
-
-            feature_chunk = features[src_start:src_end]
-            legal_chunk = legal[src_start:src_end]
-
-            self.feature_bits[dst_chunk_start:dst_chunk_end].copy_(
-                self._pack_bits(feature_chunk[:, :FEATURE_BINARY_COUNT], FEATURE_BINARY_COUNT)
-            )
-            self.feature_scalars[dst_chunk_start:dst_chunk_end].copy_(
-                feature_chunk[
-                    :,
-                    FEATURE_SCALAR_OFFSET : FEATURE_SCALAR_OFFSET
-                    + FEATURE_SCALAR_COUNT,
-                ]
-            )
-            self.legal_bits[dst_chunk_start:dst_chunk_end].copy_(
-                self._pack_bits(legal_chunk, ACTION_COUNT)
-            )
-            self.actions[dst_chunk_start:dst_chunk_end].copy_(
-                actions[src_start:src_end]
-            )
-            self.value_targets[dst_chunk_start:dst_chunk_end].copy_(
-                targets[src_start:src_end]
-            )
+        self._ext.pack_into(
+            self.feature_bits,
+            self.feature_scalars,
+            self.legal_bits,
+            self.actions,
+            self.value_targets,
+            int(dst_start),
+            features,
+            legal,
+            actions,
+            targets,
+        )
 
     def add(self, batch: Any) -> None:
         count = int(batch.transitions)
@@ -204,27 +164,12 @@ class PackedGpuReplayBuffer:
             device=self.device,
         )
 
-        packed_features = self.feature_bits.index_select(0, index)
-        features = torch.zeros(
-            (batch_size, FEATURE_COUNT), dtype=torch.float16, device=self.device
+        features, legal, actions, targets = self._ext.gather_unpack(
+            self.feature_bits,
+            self.feature_scalars,
+            self.legal_bits,
+            self.actions,
+            self.value_targets,
+            index,
         )
-        features[:, :FEATURE_BINARY_COUNT].copy_(
-            self._unpack_bits(
-                packed_features,
-                FEATURE_BINARY_COUNT,
-                torch.float16,
-            )
-        )
-        features[
-            :,
-            FEATURE_SCALAR_OFFSET : FEATURE_SCALAR_OFFSET + FEATURE_SCALAR_COUNT,
-        ].copy_(self.feature_scalars.index_select(0, index))
-
-        legal = self._unpack_bits(
-            self.legal_bits.index_select(0, index),
-            ACTION_COUNT,
-            torch.bool,
-        )
-        actions = self.actions.index_select(0, index).to(torch.int64)
-        targets = self.value_targets.index_select(0, index)
         return features, legal, actions, targets
