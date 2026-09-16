@@ -155,6 +155,111 @@ class GpuReplayBuffer:
         )
 
 
+class _BoundedTrajectoryBuffer:
+    def __init__(
+        self,
+        capacity: int,
+        feature_count: int,
+        action_count: int,
+        device: torch.device,
+    ) -> None:
+        self.capacity = int(capacity)
+        self.features = torch.empty(
+            (capacity, feature_count), dtype=torch.float16, device=device
+        )
+        self.legal = torch.empty(
+            (capacity, action_count), dtype=torch.bool, device=device
+        )
+        self.actions = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.players = torch.empty(capacity, dtype=torch.uint8, device=device)
+        self.env_ids = torch.empty(capacity, dtype=torch.int64, device=device)
+        self.position = 0
+        self.size = 0
+
+    def append(
+        self,
+        features: torch.Tensor,
+        legal: torch.Tensor,
+        actions: torch.Tensor,
+        players: torch.Tensor,
+        env_ids: torch.Tensor,
+    ) -> None:
+        count = int(actions.numel())
+        if count == 0:
+            return
+
+        if count >= self.capacity:
+            start = count - self.capacity
+            self.features.copy_(features[start:])
+            self.legal.copy_(legal[start:])
+            self.actions.copy_(actions[start:])
+            self.players.copy_(players[start:])
+            self.env_ids.copy_(env_ids[start:])
+            self.position = 0
+            self.size = self.capacity
+            return
+
+        first = min(count, self.capacity - self.position)
+        second = count - first
+        end = self.position + first
+
+        self.features[self.position:end].copy_(features[:first])
+        self.legal[self.position:end].copy_(legal[:first])
+        self.actions[self.position:end].copy_(actions[:first])
+        self.players[self.position:end].copy_(players[:first])
+        self.env_ids[self.position:end].copy_(env_ids[:first])
+
+        if second:
+            self.features[:second].copy_(features[first:])
+            self.legal[:second].copy_(legal[first:])
+            self.actions[:second].copy_(actions[first:])
+            self.players[:second].copy_(players[first:])
+            self.env_ids[:second].copy_(env_ids[first:])
+
+        self.position = (self.position + count) % self.capacity
+        self.size = min(self.capacity, self.size + count)
+
+    def finish(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if self.size == 0:
+            raise RuntimeError("self-play produced no training transitions")
+
+        if self.size < self.capacity:
+            end = self.size
+            return (
+                self.features[:end],
+                self.legal[:end],
+                self.actions[:end],
+                self.players[:end],
+                self.env_ids[:end],
+            )
+
+        if self.position == 0:
+            return (
+                self.features,
+                self.legal,
+                self.actions,
+                self.players,
+                self.env_ids,
+            )
+
+        position = self.position
+        return (
+            torch.cat((self.features[position:], self.features[:position]), dim=0),
+            torch.cat((self.legal[position:], self.legal[:position]), dim=0),
+            torch.cat((self.actions[position:], self.actions[:position]), dim=0),
+            torch.cat((self.players[position:], self.players[:position]), dim=0),
+            torch.cat((self.env_ids[position:], self.env_ids[:position]), dim=0),
+        )
+
+
 def _sample_actions(
     logits: torch.Tensor,
     legal: torch.Tensor,
@@ -193,12 +298,21 @@ def collect_selfplay(
     final_nagari = torch.zeros(batch, dtype=torch.bool, device=device)
     active_ids = torch.arange(batch, dtype=torch.int64, device=device)
 
+    trajectory = (
+        _BoundedTrajectoryBuffer(
+            max_transitions,
+            int(ext.FEATURE_COUNT),
+            int(ext.ACTION_COUNT),
+            device,
+        )
+        if max_transitions is not None
+        else None
+    )
     feature_chunks: list[torch.Tensor] = []
     legal_chunks: list[torch.Tensor] = []
     action_chunks: list[torch.Tensor] = []
     player_chunks: list[torch.Tensor] = []
     env_chunks: list[torch.Tensor] = []
-    retained_rows = 0
     generated_transitions = 0
 
     observe_bad = torch.zeros((), dtype=torch.int64, device=device)
@@ -252,24 +366,14 @@ def collect_selfplay(
 
             active_actions = _sample_actions(active_logits, legal, temperature)
 
-            feature_chunks.append(features.to(torch.float16))
-            legal_chunks.append(legal)
-            action_chunks.append(active_actions)
-            player_chunks.append(players)
-            env_chunks.append(active_ids)
-            retained_rows += active_count
-
-            if max_transitions is not None:
-                while (
-                    len(feature_chunks) > 1
-                    and retained_rows - feature_chunks[0].size(0) >= max_transitions
-                ):
-                    retained_rows -= feature_chunks[0].size(0)
-                    del feature_chunks[0]
-                    del legal_chunks[0]
-                    del action_chunks[0]
-                    del player_chunks[0]
-                    del env_chunks[0]
+            if trajectory is not None:
+                trajectory.append(features, legal, active_actions, players, active_ids)
+            else:
+                feature_chunks.append(features.to(torch.float16))
+                legal_chunks.append(legal)
+                action_chunks.append(active_actions)
+                player_chunks.append(players)
+                env_chunks.append(active_ids)
 
             reward0, new_done, nagari, step_status, _committed = ext.step_indexed(
                 states, active_ids, active_actions
@@ -310,22 +414,16 @@ def collect_selfplay(
     if not completed:
         raise RuntimeError(f"not all games finished within {max_steps} decision steps")
 
-    if not feature_chunks:
-        raise RuntimeError("self-play produced no training transitions")
-
-    features = torch.cat(feature_chunks, dim=0)
-    legal = torch.cat(legal_chunks, dim=0)
-    actions = torch.cat(action_chunks, dim=0)
-    players = torch.cat(player_chunks, dim=0)
-    env_ids = torch.cat(env_chunks, dim=0)
-
-    if max_transitions is not None and actions.numel() > max_transitions:
-        start = actions.numel() - max_transitions
-        features = features[start:]
-        legal = legal[start:]
-        actions = actions[start:]
-        players = players[start:]
-        env_ids = env_ids[start:]
+    if trajectory is not None:
+        features, legal, actions, players, env_ids = trajectory.finish()
+    else:
+        if not feature_chunks:
+            raise RuntimeError("self-play produced no training transitions")
+        features = torch.cat(feature_chunks, dim=0)
+        legal = torch.cat(legal_chunks, dim=0)
+        actions = torch.cat(action_chunks, dim=0)
+        players = torch.cat(player_chunks, dim=0)
+        env_ids = torch.cat(env_chunks, dim=0)
 
     reward_for_transition = final_reward0[env_ids]
     signed_reward = torch.where(

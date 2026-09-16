@@ -110,6 +110,7 @@ def main() -> None:
         seed_offset = args.seed + (iteration - 1) * args.selfplay_batch
 
         torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
         collect_start = time.perf_counter()
         batch = collect_selfplay(
             ext=ext,
@@ -125,6 +126,8 @@ def main() -> None:
         replay.add(batch)
         torch.cuda.synchronize()
         collect_seconds = time.perf_counter() - collect_start
+        collect_peak_alloc_mib = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+        collect_peak_reserved_mib = torch.cuda.max_memory_reserved() / (1024.0 * 1024.0)
 
         torch.cuda.synchronize()
         train_start = time.perf_counter()
@@ -159,6 +162,8 @@ def main() -> None:
             f"replay_fill_pct={replay_fill_pct:.2f} "
             f"selfplay_s={collect_seconds:.4f} games_per_s={games_per_s:.1f} "
             f"transitions_per_s={transitions_per_s:.1f} "
+            f"peak_alloc_mib={collect_peak_alloc_mib:.1f} "
+            f"peak_reserved_mib={collect_peak_reserved_mib:.1f} "
             f"mean_abs_reward0={batch.mean_abs_reward0:.4f}"
         )
         print(
@@ -180,6 +185,8 @@ def main() -> None:
                 config,
             )
             print(f"checkpoint={checkpoint}")
+
+        del batch
 
     overall_retention_pct = (
         100.0 * total_retained_transitions / total_generated_transitions
