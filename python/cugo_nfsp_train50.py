@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from cugo_nfsp50 import AveragePolicyNet
 from cugo_train50 import PolicyValueNet
 
+@dataclass
 class AverageTrainSummary:
     loss: float
     entropy: float
