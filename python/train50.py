@@ -6,9 +6,9 @@ from pathlib import Path
 
 import torch
 
+from cugo_replay50 import PackedGpuReplayBuffer
 from cugo_torch50_ext import load_extension
 from cugo_train50 import (
-    GpuReplayBuffer,
     PolicyValueNet,
     collect_selfplay,
     save_checkpoint,
@@ -82,7 +82,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    replay = GpuReplayBuffer(
+    replay = PackedGpuReplayBuffer(
         args.replay_capacity,
         feature_count,
         action_count,
@@ -93,7 +93,9 @@ def main() -> None:
     replay_mib = replay.storage_bytes / (1024.0 * 1024.0)
     print(
         f"network hidden={args.hidden} params={params} "
-        f"replay_capacity={args.replay_capacity} replay_storage_mib={replay_mib:.1f}"
+        f"replay_capacity={args.replay_capacity} replay_storage_mib={replay_mib:.1f} "
+        f"replay_format={replay.format_name} "
+        f"replay_bytes_per_transition={replay.bytes_per_transition}"
     )
     print(
         "objective=monte_carlo_actor_critic "
@@ -102,6 +104,7 @@ def main() -> None:
 
     config = vars(args).copy()
     config["checkpoint_dir"] = str(args.checkpoint_dir)
+    config["replay_format"] = replay.format_name
 
     total_games = 0
     total_generated_transitions = 0
