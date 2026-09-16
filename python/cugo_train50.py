@@ -189,13 +189,12 @@ def collect_selfplay(
     legal_chunks: list[torch.Tensor] = []
     action_chunks: list[torch.Tensor] = []
     player_chunks: list[torch.Tensor] = []
-    active_chunks: list[torch.Tensor] = []
+    env_chunks: list[torch.Tensor] = []
 
-    # Keep hot-path correctness checks on the GPU.  Pulling scalar `.item()`
-    # values back to the host several times per decision serializes the CUDA
-    # stream and dominates small/medium self-play batches.  We only need one
-    # host-visible condition per decision to terminate the Python loop; status
-    # diagnostics are accumulated and transferred once after the rollout.
+    # Keep correctness diagnostics GPU-resident and use the data-dependent
+    # active compaction as the single normal host synchronization per decision.
+    # This avoids running the MLP for environments that have already finished
+    # and avoids retaining full [steps, batch, ...] trajectory tensors.
     observe_bad = torch.zeros((), dtype=torch.int64, device=device)
     legal_bad = torch.zeros((), dtype=torch.int64, device=device)
     step_bad = torch.zeros((), dtype=torch.int64, device=device)
@@ -203,8 +202,9 @@ def collect_selfplay(
     model.eval()
     decision_steps = 0
     completed = False
+    last_done: torch.Tensor | None = None
     with torch.inference_mode():
-        for decision_steps in range(1, max_steps + 1):
+        for _ in range(max_steps):
             features, legal, players, observed_done, status = ext.observe(states)
             active = ~observed_done
             observe_ok = status == int(ext.STATUS_OK)
@@ -214,35 +214,58 @@ def collect_selfplay(
             observe_bad.add_((active & ~observe_ok).sum())
             legal_bad.add_((active & observe_ok & ~has_legal).sum())
 
+            # CUDA nonzero has a data-dependent result size and therefore acts
+            # as the one per-decision host-visible synchronization.  Reuse that
+            # synchronization to drive termination instead of also calling
+            # done.all().item().
+            active_ids = torch.nonzero(valid_active, as_tuple=False).squeeze(1)
+            if active_ids.numel() == 0:
+                completed = True
+                break
+
+            decision_steps += 1
+            active_features = features.index_select(0, active_ids)
+            active_legal = legal.index_select(0, active_ids)
+            active_players = players.index_select(0, active_ids)
+
             with torch.autocast(
                 device_type="cuda", dtype=torch.float16, enabled=use_amp
             ):
-                logits, _values = model(features)
-            actions = _masked_actions(logits, legal, valid_active, temperature)
+                active_logits, _values = model(active_features)
 
-            # Retain full fixed-size CUDA chunks and compact once at the end.
-            # torch.nonzero(active) has a data-dependent output size on CUDA and
-            # can force a host synchronization every decision.
-            feature_chunks.append(features.to(torch.float16))
-            legal_chunks.append(legal)
-            action_chunks.append(actions)
-            player_chunks.append(players)
-            active_chunks.append(valid_active)
+            # Preserve the full-row stochastic sampling shape.  Finished rows
+            # have an all-false legal mask, so zero logits are immaterial, while
+            # keeping the batch-sized multinomial path avoids changing RNG
+            # consumption solely because active inference was compacted.
+            logits = torch.zeros(
+                (batch, legal.size(1)),
+                dtype=active_logits.dtype,
+                device=device,
+            )
+            logits.index_copy_(0, active_ids, active_logits)
+            actions = _masked_actions(logits, legal, valid_active, temperature)
+            active_actions = actions.index_select(0, active_ids)
+
+            feature_chunks.append(active_features.to(torch.float16))
+            legal_chunks.append(active_legal)
+            action_chunks.append(active_actions)
+            player_chunks.append(active_players)
+            env_chunks.append(active_ids)
 
             reward0, new_done, nagari, step_status, _committed = ext.step(states, actions)
+            last_done = new_done
             step_ok = step_status == int(ext.STATUS_OK)
             step_bad.add_((valid_active & ~step_ok).sum())
 
             just_finished = valid_active & step_ok & new_done
             final_reward0 = torch.where(just_finished, reward0, final_reward0)
             final_nagari |= just_finished & nagari
-
-            # This is the sole required host synchronization inside the normal
-            # decision loop.  Finished environments are safe to keep in the
-            # batched extension; torch_step50 reports kGameFinished for them.
-            if bool(new_done.all().item()):
+        else:
+            # If the final permitted decision completed every environment, the
+            # normal next-iteration compaction check did not run.  Pay one final
+            # synchronization only on this max-steps boundary.
+            if last_done is not None and bool(last_done.all().item()):
                 completed = True
-                break
 
     error_counts = torch.stack((observe_bad, legal_bad, step_bad)).tolist()
     observe_bad_count, legal_bad_count, step_bad_count = map(int, error_counts)
@@ -264,16 +287,11 @@ def collect_selfplay(
     if not feature_chunks:
         raise RuntimeError("self-play produced no training transitions")
 
-    active_mask = torch.cat(active_chunks, dim=0)
-    features = torch.cat(feature_chunks, dim=0)[active_mask]
-    legal = torch.cat(legal_chunks, dim=0)[active_mask]
-    actions = torch.cat(action_chunks, dim=0)[active_mask]
-    players = torch.cat(player_chunks, dim=0)[active_mask]
-
-    # Each compacted row corresponds to the environment index within its source
-    # decision chunk.  Recover that index without storing a per-step nonzero().
-    env_ids = torch.arange(batch, dtype=torch.int64, device=device).repeat(decision_steps)
-    env_ids = env_ids[active_mask]
+    features = torch.cat(feature_chunks, dim=0)
+    legal = torch.cat(legal_chunks, dim=0)
+    actions = torch.cat(action_chunks, dim=0)
+    players = torch.cat(player_chunks, dim=0)
+    env_ids = torch.cat(env_chunks, dim=0)
 
     reward_for_transition = final_reward0[env_ids]
     signed_reward = torch.where(
