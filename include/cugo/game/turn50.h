@@ -366,21 +366,32 @@ CUGO_HOST_DEVICE inline Resolve50Result resolve_turn50(
 
   if (same_month && played_match_count == 1) {
     if (final_stock_flip) {
-      result.status = Resolve50Status::kUnsupportedLastCardSpecial;
-      return result;
-    }
-
-    next.floor |= core::card_bit(played) | core::card_bit(drawn) |
-                  next.pending_bonus_mask;
-    const std::uint16_t month_bit = card_month_bit50(played);
-    next.ppuk_months |= month_bit;
-    if (next.actor == 0) {
-      next.ppuk_owner1_months &= static_cast<std::uint16_t>(~month_bit);
+      Resolve50Status status = resolve_card_against_floor50(
+          next, played, choices.played_match, result);
+      if (status != Resolve50Status::kOk) {
+        return Resolve50Result{status, kResolve50EventNone, 0, 0, 0};
+      }
+      status = resolve_card_against_floor50(
+          next, drawn, choices.drawn_match, result);
+      if (status != Resolve50Status::kOk) {
+        return Resolve50Result{status, kResolve50EventNone, 0, 0, 0};
+      }
+      if (next.pending_bonus_mask != 0) {
+        capture_cards50(next, next.pending_bonus_mask, result);
+      }
     } else {
-      next.ppuk_owner1_months |= month_bit;
+      next.floor |= core::card_bit(played) | core::card_bit(drawn) |
+                    next.pending_bonus_mask;
+      const std::uint16_t month_bit = card_month_bit50(played);
+      next.ppuk_months |= month_bit;
+      if (next.actor == 0) {
+        next.ppuk_owner1_months &= static_cast<std::uint16_t>(~month_bit);
+      } else {
+        next.ppuk_owner1_months |= month_bit;
+      }
+      attach_pending_bonuses_to_ppuk(next, month_bit);
+      result.events |= kResolve50EventPpuk;
     }
-    attach_pending_bonuses_to_ppuk(next, month_bit);
-    result.events |= kResolve50EventPpuk;
   } else if (same_month && played_match_count == 2) {
     next.floor &= ~played_matches;
     capture_cards50(next,
@@ -389,16 +400,13 @@ CUGO_HOST_DEVICE inline Resolve50Result resolve_turn50(
                     result);
     result.events |= kResolve50EventTtadak;
   } else if (same_month && played_match_count == 0) {
-    if (final_stock_flip) {
-      result.status = Resolve50Status::kUnsupportedLastCardSpecial;
-      return result;
-    }
-
     capture_cards50(next,
                     core::card_bit(played) | core::card_bit(drawn) |
                         next.pending_bonus_mask,
                     result);
-    result.events |= kResolve50EventJjok;
+    if (!final_stock_flip) {
+      result.events |= kResolve50EventJjok;
+    }
   } else {
     Resolve50Status status = resolve_card_against_floor50(
         next, played, choices.played_match, result);
