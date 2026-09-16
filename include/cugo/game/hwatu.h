@@ -15,8 +15,6 @@ namespace cugo::game {
 using core::CardId;
 using core::CardMask;
 
-// Engine-stable slot convention for the 48 standard Korean hwatu cards.
-// Slots are internal identities; they do not encode deal order.
 inline constexpr CardMask kBrightMask =
     core::card_bit(core::make_card(0, 0)) |
     core::card_bit(core::make_card(2, 0)) |
@@ -91,7 +89,7 @@ inline constexpr CardMask kCheongdanMask =
 inline constexpr CardMask kPrimaryClassMask =
     kBrightMask | kAnimalMask | kRibbonMask | kPlainPiMask | kFixedDoublePiMask;
 
-static_assert(kPrimaryClassMask == core::kFullDeckMask);
+static_assert(kPrimaryClassMask == core::kStandardDeckMask);
 static_assert((kBrightMask & kAnimalMask) == 0);
 static_assert((kBrightMask & kRibbonMask) == 0);
 static_assert((kAnimalMask & kRibbonMask) == 0);
@@ -133,7 +131,7 @@ CUGO_HOST_DEVICE inline std::uint8_t count_u8(CardMask cards) noexcept {
 
 CUGO_HOST_DEVICE inline CardMask pi_card_mask(
     CardMask cards, ScoreOptions options = {}) noexcept {
-  CardMask mask = cards & (kPlainPiMask | kFixedDoublePiMask);
+  CardMask mask = cards & (kPlainPiMask | kFixedDoublePiMask | core::kBonusCardMask);
   if (options.gukjin_as_double_pi) {
     mask |= cards & core::card_bit(kGukjin);
   }
@@ -144,19 +142,19 @@ CUGO_HOST_DEVICE inline std::uint8_t pi_units(CardMask cards,
                                               ScoreOptions options = {}) noexcept {
   unsigned units = static_cast<unsigned>(core::card_count(cards & kPlainPiMask));
   units += 2u * static_cast<unsigned>(core::card_count(cards & kFixedDoublePiMask));
+  if ((cards & core::card_bit(core::kBonusTwoPi)) != 0) units += 2u;
+  if ((cards & core::card_bit(core::kBonusThreePi)) != 0) units += 3u;
   if (options.gukjin_as_double_pi && (cards & core::card_bit(kGukjin)) != 0) {
     units += 2u;
   }
   return static_cast<std::uint8_t>(units);
 }
 
-CUGO_HOST_DEVICE inline ScoreBreakdown score_captured(CardMask cards,
-                                                       ScoreOptions options = {}) noexcept {
+CUGO_HOST_DEVICE inline ScoreBreakdown score_captured(
+    CardMask cards, ScoreOptions options = {}) noexcept {
   const std::uint8_t bright_count = count_u8(cards & kBrightMask);
   CardMask animals = cards & kAnimalMask;
-  if (options.gukjin_as_double_pi) {
-    animals &= ~core::card_bit(kGukjin);
-  }
+  if (options.gukjin_as_double_pi) animals &= ~core::card_bit(kGukjin);
   const std::uint8_t animal_count = count_u8(animals);
   const std::uint8_t ribbon_count = count_u8(cards & kRibbonMask);
   const std::uint8_t pi_count = pi_units(cards, options);
@@ -176,9 +174,7 @@ CUGO_HOST_DEVICE inline ScoreBreakdown score_captured(CardMask cards,
     flags |= kScoreFlagGodori;
     animal_points = static_cast<std::uint8_t>(animal_points + 5u);
   }
-  if (animal_count >= 7) {
-    flags |= kScoreFlagMeongtta;
-  }
+  if (animal_count >= 7) flags |= kScoreFlagMeongtta;
 
   std::uint8_t ribbon_points = ribbon_count >= 5 ? ribbon_count - 4 : 0;
   if (contains_all(cards, kHongdanMask)) {

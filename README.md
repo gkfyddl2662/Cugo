@@ -4,28 +4,39 @@ High-performance tabula-rasa self-play research project for Korean Go-Stop / Shi
 
 ## Current milestone
 
-The repository contains a deterministic base-48 reference engine and CUDA differential path with:
+The repository contains a deterministic CPU reference path and CUDA differential path with:
 
-- 48 standard cards packed into a 64-bit mask (`0..47`)
-- month/slot extraction and 4-bit month masks
+- 48 standard cards packed into IDs `0..47`
+- Shin Matgo bonus cards at IDs `48` (2-pi) and `49` (3-pi)
+- separate standard-deck and 50-card Shin Matgo masks inside one `uint64_t`
 - a fixed engine slot convention for the 48 standard hwatu identities
 - bright/animal/ribbon/pi metadata, including godori and ribbon-set masks
-- fixed double-pi cards and optional Gukjin animal -> double-pi conversion
+- fixed double-pi cards, 2-pi/3-pi bonus scoring, and optional Gukjin animal -> double-pi conversion
 - host/device base scoring for bright, animal, ribbon, and pi groups
-- host/device bit operations and deterministic RNG
-- base-48 initial deal: 10 cards per player, 8 floor cards, 20-card stock
-- field-major SoA resident state
+- deterministic base-48 and raw 50-card deal primitives
+- raw 50-card layout: 10 cards per player, 8 initial floor cards, 22-card stock
+- initial-floor bonus collection before the first player's turn
+- hand-bonus replacement draws plus a Shin Matgo pi-steal event count
+- stock bonus chaining that keeps flipped bonus cards pending until the eventual standard-card resolve
+- field-major SoA resident state for the current base-48 turn engine
 - `PLAY -> DRAW -> RESOLVE` turn phases
-- pending played/drawn cards so special capture rules can inspect the complete turn before mutating the floor
 - normal unique capture, ppuk, jjok, ttadak, sweep detection, and ppuk ownership/capture metadata
 - explicit `ResolveChoices` for ambiguous two-card same-month floor selections
 - transactional resolve behavior: choice/error statuses never partially mutate state
-- fixed CPU examples plus randomized card-partition/scoring invariants
-- CUDA CPU/GPU differential validation over 65,536 deals, score masks, stock transitions, and turn resolves
+- fixed CPU examples plus randomized card-partition/scoring/bonus invariants
+- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, stock transitions, and turn resolves
 - one-thread-per-game CUDA throughput baselines
 - CUDA Graph as the current repeated-phase scheduling baseline
 
-The stock is represented as a remaining-card bitmask plus RNG state instead of a pre-shuffled per-game array. This keeps the resident hot state compact and avoids storing a per-game stock array.
+The 50-card work deliberately keeps bonus cards as physical cards in the same 64-bit mask rather than widening the state representation. `kFullDeckMask` remains the legacy 48-standard-card mask for base-48 regression tests; new exact-Shin-Matgo work uses `kShinMatgoDeckMask`.
+
+### Bonus-rule integration boundary
+
+Hangame's official guide states that two bonus cards are used in Shin Matgo, they count as 2-pi and 3-pi, an initial floor bonus is automatically taken before the first player starts, a hand bonus gives a replacement card before the stock flip and another play opportunity, and a stock-flipped bonus grants another flip. If a ppuk occurs after bonus flips, those bonus cards must be placed on the floor with the ppuk cards.
+
+The current bonus primitives implement the physical 50-card deck, scoring, raw deal, initial-floor collection, hand replacement, and stock bonus chain. The stock-flip helper returns `pending_bonus_mask` instead of prematurely adding those cards to captured cards. This is intentional: the next resolver milestone must associate pending bonus cards with a specific ppuk stack so they can later be captured with that stack without ambiguity.
+
+The official mode guide also states that playing a bonus card in Shin Matgo takes one opponent pi. The current hand-bonus primitive returns `pi_steal_count=1`; physical pi transfer is still deferred until the exact selection policy for multiple eligible opponent pi cards is pinned down.
 
 ### Measured RTX 5080 baseline
 
@@ -38,12 +49,6 @@ For the 21-node initialization + 20-draw sequence, CUDA Graph replay improved me
 ### Rule correctness boundary
 
 Hangame's official guide is the source of truth. The pinned facts, implemented subset, internal card-ID convention, and intentionally deferred behavior are documented in `docs/rules.md`.
-
-The complete mobile Shin Matgo ruleset uses 50 cards. The current engine deliberately models only the 48 standard cards, so bonus-card IDs and their rule effects still need to be added later.
-
-The guide explicitly marks ppuk and jjok as having a last-card exception, but the current referenced page does not specify the replacement transition. Those exact final-stock-flip patterns return an unsupported status instead of silently applying a generic Go-Stop convention.
-
-Pi stealing is not applied yet. The engine can now identify legal pi/double-pi cards and compute pi units, but the exact Hangame transfer-selection behavior is still deliberately deferred rather than guessed.
 
 ## Build and test
 
