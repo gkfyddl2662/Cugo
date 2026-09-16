@@ -16,14 +16,18 @@ from cugo_train50 import (
 )
 
 
+DEFAULT_SELFPLAY_BATCH = 131072
+DEFAULT_REPLAY_CAPACITY = 1 << 22
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="GPU-resident Shin Matgo self-play training baseline"
     )
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--selfplay-batch", type=int, default=4096)
+    parser.add_argument("--selfplay-batch", type=int, default=DEFAULT_SELFPLAY_BATCH)
     parser.add_argument("--hidden", type=int, default=256)
-    parser.add_argument("--replay-capacity", type=int, default=262144)
+    parser.add_argument("--replay-capacity", type=int, default=DEFAULT_REPLAY_CAPACITY)
     parser.add_argument("--train-batch", type=int, default=4096)
     parser.add_argument("--updates-per-iter", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=128)
@@ -144,12 +148,15 @@ def main() -> None:
         total_retained_transitions += batch.transitions
         games_per_s = batch.games / collect_seconds
         transitions_per_s = batch.generated_transitions / collect_seconds
+        retention_pct = 100.0 * batch.transitions / batch.generated_transitions
+        replay_fill_pct = 100.0 * replay.size / replay.capacity
         print(
             f"iter={iteration} games={batch.games} "
             f"transitions={batch.generated_transitions} retained={batch.transitions} "
-            f"dropped={batch.dropped_transitions} "
+            f"dropped={batch.dropped_transitions} retention_pct={retention_pct:.2f} "
             f"terminal={batch.terminal} nagari={batch.nagari} "
             f"decision_steps={batch.decision_steps} replay={replay.size} "
+            f"replay_fill_pct={replay_fill_pct:.2f} "
             f"selfplay_s={collect_seconds:.4f} games_per_s={games_per_s:.1f} "
             f"transitions_per_s={transitions_per_s:.1f} "
             f"mean_abs_reward0={batch.mean_abs_reward0:.4f}"
@@ -174,10 +181,14 @@ def main() -> None:
             )
             print(f"checkpoint={checkpoint}")
 
+    overall_retention_pct = (
+        100.0 * total_retained_transitions / total_generated_transitions
+    )
     print(
         f"training PASS iterations={args.iterations} total_games={total_games} "
         f"total_transitions={total_generated_transitions} "
-        f"retained_transitions={total_retained_transitions} replay={replay.size}"
+        f"retained_transitions={total_retained_transitions} "
+        f"retention_pct={overall_retention_pct:.2f} replay={replay.size}"
     )
 
 
