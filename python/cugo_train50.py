@@ -189,56 +189,91 @@ def collect_selfplay(
     legal_chunks: list[torch.Tensor] = []
     action_chunks: list[torch.Tensor] = []
     player_chunks: list[torch.Tensor] = []
-    env_chunks: list[torch.Tensor] = []
+    active_chunks: list[torch.Tensor] = []
+
+    # Keep hot-path correctness checks on the GPU.  Pulling scalar `.item()`
+    # values back to the host several times per decision serializes the CUDA
+    # stream and dominates small/medium self-play batches.  We only need one
+    # host-visible condition per decision to terminate the Python loop; status
+    # diagnostics are accumulated and transferred once after the rollout.
+    observe_bad = torch.zeros((), dtype=torch.int64, device=device)
+    legal_bad = torch.zeros((), dtype=torch.int64, device=device)
+    step_bad = torch.zeros((), dtype=torch.int64, device=device)
 
     model.eval()
     decision_steps = 0
+    completed = False
     with torch.inference_mode():
         for decision_steps in range(1, max_steps + 1):
             features, legal, players, observed_done, status = ext.observe(states)
             active = ~observed_done
-            if not bool(active.any().item()):
-                break
-            if bool((status[active] != int(ext.STATUS_OK)).any().item()):
-                bad = int((status[active] != int(ext.STATUS_OK)).sum().item())
-                raise RuntimeError(f"observe returned non-OK status for {bad} active environments")
-            if bool((legal[active].sum(dim=1) == 0).any().item()):
-                raise RuntimeError("an active environment has no legal actions")
+            observe_ok = status == int(ext.STATUS_OK)
+            has_legal = legal.any(dim=1)
+            valid_active = active & observe_ok & has_legal
+
+            observe_bad.add_((active & ~observe_ok).sum())
+            legal_bad.add_((active & observe_ok & ~has_legal).sum())
 
             with torch.autocast(
                 device_type="cuda", dtype=torch.float16, enabled=use_amp
             ):
                 logits, _values = model(features)
-            actions = _masked_actions(logits, legal, active, temperature)
+            actions = _masked_actions(logits, legal, valid_active, temperature)
 
-            active_ids = torch.nonzero(active, as_tuple=False).squeeze(1)
-            feature_chunks.append(features[active_ids].to(torch.float16))
-            legal_chunks.append(legal[active_ids])
-            action_chunks.append(actions[active_ids])
-            player_chunks.append(players[active_ids])
-            env_chunks.append(active_ids)
+            # Retain full fixed-size CUDA chunks and compact once at the end.
+            # torch.nonzero(active) has a data-dependent output size on CUDA and
+            # can force a host synchronization every decision.
+            feature_chunks.append(features.to(torch.float16))
+            legal_chunks.append(legal)
+            action_chunks.append(actions)
+            player_chunks.append(players)
+            active_chunks.append(valid_active)
 
             reward0, new_done, nagari, step_status, _committed = ext.step(states, actions)
-            if bool((step_status[active] != int(ext.STATUS_OK)).any().item()):
-                bad = int((step_status[active] != int(ext.STATUS_OK)).sum().item())
-                raise RuntimeError(f"step returned non-OK status for {bad} active environments")
+            step_ok = step_status == int(ext.STATUS_OK)
+            step_bad.add_((valid_active & ~step_ok).sum())
 
-            just_finished = active & new_done
+            just_finished = valid_active & step_ok & new_done
             final_reward0 = torch.where(just_finished, reward0, final_reward0)
             final_nagari |= just_finished & nagari
+
+            # This is the sole required host synchronization inside the normal
+            # decision loop.  Finished environments are safe to keep in the
+            # batched extension; torch_step50 reports kGameFinished for them.
             if bool(new_done.all().item()):
+                completed = True
                 break
-        else:
-            raise RuntimeError(f"not all games finished within {max_steps} decision steps")
+
+    error_counts = torch.stack((observe_bad, legal_bad, step_bad)).tolist()
+    observe_bad_count, legal_bad_count, step_bad_count = map(int, error_counts)
+    if observe_bad_count:
+        raise RuntimeError(
+            f"observe returned non-OK status for {observe_bad_count} active environment-visits"
+        )
+    if legal_bad_count:
+        raise RuntimeError(
+            f"an active environment had no legal actions on {legal_bad_count} visits"
+        )
+    if step_bad_count:
+        raise RuntimeError(
+            f"step returned non-OK status for {step_bad_count} active environment-visits"
+        )
+    if not completed:
+        raise RuntimeError(f"not all games finished within {max_steps} decision steps")
 
     if not feature_chunks:
         raise RuntimeError("self-play produced no training transitions")
 
-    features = torch.cat(feature_chunks, dim=0)
-    legal = torch.cat(legal_chunks, dim=0)
-    actions = torch.cat(action_chunks, dim=0)
-    players = torch.cat(player_chunks, dim=0)
-    env_ids = torch.cat(env_chunks, dim=0)
+    active_mask = torch.cat(active_chunks, dim=0)
+    features = torch.cat(feature_chunks, dim=0)[active_mask]
+    legal = torch.cat(legal_chunks, dim=0)[active_mask]
+    actions = torch.cat(action_chunks, dim=0)[active_mask]
+    players = torch.cat(player_chunks, dim=0)[active_mask]
+
+    # Each compacted row corresponds to the environment index within its source
+    # decision chunk.  Recover that index without storing a per-step nonzero().
+    env_ids = torch.arange(batch, dtype=torch.int64, device=device).repeat(decision_steps)
+    env_ids = env_ids[active_mask]
 
     reward_for_transition = final_reward0[env_ids]
     signed_reward = torch.where(
@@ -286,11 +321,7 @@ def train_from_replay(
     if updates <= 0:
         return TrainSummary(0.0, 0.0, 0.0, 0.0, 0.0, 0)
 
-    total_loss = 0.0
-    total_policy = 0.0
-    total_value = 0.0
-    total_entropy = 0.0
-    total_advantage = 0.0
+    metric_sums = torch.zeros(5, dtype=torch.float32, device=replay.device)
 
     model.train()
     for _ in range(updates):
@@ -321,19 +352,25 @@ def train_from_replay(
         scaler.step(optimizer)
         scaler.update()
 
-        total_loss += float(loss.detach().item())
-        total_policy += float(policy_loss.detach().item())
-        total_value += float(value_loss.detach().item())
-        total_entropy += float(entropy.detach().item())
-        total_advantage += float(advantage.detach().abs().mean().item())
+        metric_sums.add_(
+            torch.stack(
+                (
+                    loss.detach(),
+                    policy_loss.detach(),
+                    value_loss.detach(),
+                    entropy.detach(),
+                    advantage.detach().abs().mean(),
+                )
+            )
+        )
 
-    inv = 1.0 / updates
+    mean_metrics = (metric_sums / updates).tolist()
     return TrainSummary(
-        loss=total_loss * inv,
-        policy_loss=total_policy * inv,
-        value_loss=total_value * inv,
-        entropy=total_entropy * inv,
-        mean_abs_advantage=total_advantage * inv,
+        loss=float(mean_metrics[0]),
+        policy_loss=float(mean_metrics[1]),
+        value_loss=float(mean_metrics[2]),
+        entropy=float(mean_metrics[3]),
+        mean_abs_advantage=float(mean_metrics[4]),
         updates=updates,
     )
 
