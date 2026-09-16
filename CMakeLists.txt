@@ -64,6 +64,10 @@ if(BUILD_TESTING)
   add_executable(cugo_policy50_test tests/policy50_test.cpp)
   target_link_libraries(cugo_policy50_test PRIVATE cugo_core)
   add_test(NAME cugo_policy50_test COMMAND cugo_policy50_test)
+
+  add_executable(cugo_postchance50_test tests/postchance50_test.cpp)
+  target_link_libraries(cugo_postchance50_test PRIVATE cugo_core)
+  add_test(NAME cugo_postchance50_test COMMAND cugo_postchance50_test)
 endif()
 
 if(CUGO_ENABLE_CUDA)
@@ -147,6 +151,10 @@ if(CUGO_ENABLE_CUDA)
       target_link_libraries(cugo_cuda_policy50_bench PRIVATE cugo_core)
       set_target_properties(cugo_cuda_policy50_bench PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 
+      add_executable(cugo_cuda_postchance50_test tests/cuda_postchance50_test.cu)
+      target_link_libraries(cugo_cuda_postchance50_test PRIVATE cugo_core)
+      set_target_properties(cugo_cuda_postchance50_test PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+
       if(MSVC)
         target_compile_options(cugo_cuda_core_test PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
@@ -184,6 +192,8 @@ if(CUGO_ENABLE_CUDA)
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
         target_compile_options(cugo_cuda_policy50_bench PRIVATE
           $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+        target_compile_options(cugo_cuda_postchance50_test PRIVATE
+          $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
       endif()
 
       add_test(NAME cugo_cuda_core_test COMMAND cugo_cuda_core_test)
@@ -202,6 +212,7 @@ if(CUGO_ENABLE_CUDA)
       add_test(NAME cugo_cuda_settlement50_test COMMAND cugo_cuda_settlement50_test)
       add_test(NAME cugo_cuda_rollout50_test COMMAND cugo_cuda_rollout50_test)
       add_test(NAME cugo_cuda_policy50_test COMMAND cugo_cuda_policy50_test)
+      add_test(NAME cugo_cuda_postchance50_test COMMAND cugo_cuda_postchance50_test)
     endif()
   else()
     message(STATUS "CUDA compiler not found; CUDA validation target disabled")
