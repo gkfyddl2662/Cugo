@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
+#include <string_view>
 #include <vector>
 
 #include "cugo/core/card.h"
@@ -143,6 +145,20 @@ __global__ void resolve_phase_kernel(TurnStateSoA48 states,
   cugo::game::store_turn_state(states, static_cast<std::size_t>(game), state);
 }
 
+__global__ void resolve_benchmark_kernel(TurnStateSoA48 states,
+                                         std::uint8_t* statuses,
+                                         int games) {
+  const int game = blockIdx.x * blockDim.x + threadIdx.x;
+  if (game >= games) {
+    return;
+  }
+
+  auto state = cugo::game::load_turn_state(states, static_cast<std::size_t>(game));
+  const ResolveResult result = cugo::game::resolve_turn(state);
+  statuses[game] = static_cast<std::uint8_t>(result.status);
+  cugo::game::store_turn_state(states, static_cast<std::size_t>(game), state);
+}
+
 bool check_cuda(cudaError_t status, const char* what) {
   if (status == cudaSuccess) {
     return true;
@@ -184,9 +200,7 @@ void print_state(const char* name, const TurnState48& state) {
             << " drawn=" << static_cast<unsigned>(state.pending_drawn) << '\n';
 }
 
-}  // namespace
-
-int main() {
+int run_differential() {
   constexpr int kGames = 1 << 16;
   constexpr std::uint64_t kMasterSeed = 0x7475726e5f677075ULL;
   const int blocks = (kGames + kThreads - 1) / kThreads;
@@ -336,4 +350,229 @@ int main() {
             << " games PLAY -> DRAW -> RESOLVE; resolved=" << resolved
             << " choice_required=" << choice_required << ")\n";
   return 0;
+}
+
+int run_benchmark() {
+  constexpr int kGames = 1 << 20;
+  constexpr int kWarmups = 8;
+  constexpr int kIterations = 256;
+  constexpr std::uint64_t kMasterSeed = 0x7265736f6c76655fULL;
+  constexpr int kBlockSizes[] = {128, 256, 512};
+  const std::size_t games = static_cast<std::size_t>(kGames);
+
+  int device_id = 0;
+  cudaDeviceProp properties{};
+  cudaFuncAttributes attributes{};
+  if (!check_cuda(cudaGetDevice(&device_id), "cudaGetDevice") ||
+      !check_cuda(cudaGetDeviceProperties(&properties, device_id),
+                  "cudaGetDeviceProperties") ||
+      !check_cuda(cudaFuncGetAttributes(&attributes, resolve_benchmark_kernel),
+                  "cudaFuncGetAttributes(resolve_benchmark_kernel)")) {
+    return 1;
+  }
+
+  std::uint64_t* device_u64 = nullptr;
+  std::uint16_t* device_u16 = nullptr;
+  std::uint8_t* device_u8 = nullptr;
+  std::uint8_t* device_errors = nullptr;
+  std::uint8_t* device_statuses = nullptr;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+
+  auto cleanup = [&]() {
+    if (start != nullptr) {
+      cudaEventDestroy(start);
+    }
+    if (stop != nullptr) {
+      cudaEventDestroy(stop);
+    }
+    cudaFree(device_u64);
+    cudaFree(device_u16);
+    cudaFree(device_u8);
+    cudaFree(device_errors);
+    cudaFree(device_statuses);
+  };
+
+  if (!check_cuda(cudaMalloc(&device_u64,
+                             games * kU64Fields * sizeof(std::uint64_t)),
+                  "cudaMalloc(u64)") ||
+      !check_cuda(cudaMalloc(&device_u16,
+                             games * kU16Fields * sizeof(std::uint16_t)),
+                  "cudaMalloc(u16)") ||
+      !check_cuda(cudaMalloc(&device_u8,
+                             games * kU8Fields * sizeof(std::uint8_t)),
+                  "cudaMalloc(u8)") ||
+      !check_cuda(cudaMalloc(&device_errors, games * sizeof(std::uint8_t)),
+                  "cudaMalloc(errors)") ||
+      !check_cuda(cudaMalloc(&device_statuses, games * sizeof(std::uint8_t)),
+                  "cudaMalloc(statuses)") ||
+      !check_cuda(cudaEventCreate(&start), "cudaEventCreate(start)") ||
+      !check_cuda(cudaEventCreate(&stop), "cudaEventCreate(stop)")) {
+    cleanup();
+    return 1;
+  }
+
+  const TurnStateSoA48 device_states =
+      make_view(device_u64, device_u16, device_u8, games);
+  std::vector<std::uint8_t> host_errors(games);
+  std::vector<std::uint8_t> host_statuses(games);
+
+  std::cout << "device=" << properties.name
+            << " sms=" << properties.multiProcessorCount
+            << " max_threads_per_sm=" << properties.maxThreadsPerMultiProcessor
+            << '\n';
+  std::cout << "resolve_kernel registers/thread=" << attributes.numRegs
+            << " local_bytes/thread=" << attributes.localSizeBytes
+            << " static_shared_bytes/block=" << attributes.sharedSizeBytes << '\n';
+  std::cout << "benchmark_games=" << kGames
+            << " benchmark_warmups=" << kWarmups
+            << " benchmark_iterations=" << kIterations << '\n';
+
+  for (const int threads : kBlockSizes) {
+    const int blocks = (kGames + threads - 1) / threads;
+    if (!check_cuda(cudaMemset(device_errors, 0, games * sizeof(std::uint8_t)),
+                    "cudaMemset(errors)")) {
+      cleanup();
+      return 1;
+    }
+
+    for (int warmup = 0; warmup < kWarmups; ++warmup) {
+      const std::uint64_t seed =
+          kMasterSeed + static_cast<std::uint64_t>(warmup) *
+                            0x9e3779b97f4a7c15ULL;
+      init_turn_kernel<<<blocks, threads>>>(
+          device_states, device_errors, kGames, seed);
+      regular_play_kernel<<<blocks, threads>>>(device_states, device_errors, kGames);
+      draw_phase_kernel<<<blocks, threads>>>(device_states, device_errors, kGames);
+      resolve_benchmark_kernel<<<blocks, threads>>>(
+          device_states, device_statuses, kGames);
+    }
+    if (!check_cuda(cudaGetLastError(), "resolve benchmark warmup launch") ||
+        !check_cuda(cudaDeviceSynchronize(),
+                    "resolve benchmark warmup synchronize")) {
+      cleanup();
+      return 1;
+    }
+
+    double elapsed_ms = 0.0;
+    for (int iteration = 0; iteration < kIterations; ++iteration) {
+      const std::uint64_t seed =
+          kMasterSeed +
+          static_cast<std::uint64_t>(iteration + kWarmups) *
+              0x9e3779b97f4a7c15ULL;
+      init_turn_kernel<<<blocks, threads>>>(
+          device_states, device_errors, kGames, seed);
+      regular_play_kernel<<<blocks, threads>>>(device_states, device_errors, kGames);
+      draw_phase_kernel<<<blocks, threads>>>(device_states, device_errors, kGames);
+
+      if (!check_cuda(cudaEventRecord(start), "cudaEventRecord(start)")) {
+        cleanup();
+        return 1;
+      }
+      resolve_benchmark_kernel<<<blocks, threads>>>(
+          device_states, device_statuses, kGames);
+      if (!check_cuda(cudaGetLastError(), "resolve benchmark launch") ||
+          !check_cuda(cudaEventRecord(stop), "cudaEventRecord(stop)") ||
+          !check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize(stop)")) {
+        cleanup();
+        return 1;
+      }
+
+      float iteration_ms = 0.0f;
+      if (!check_cuda(cudaEventElapsedTime(&iteration_ms, start, stop),
+                      "cudaEventElapsedTime")) {
+        cleanup();
+        return 1;
+      }
+      elapsed_ms += iteration_ms;
+    }
+
+    if (!check_cuda(cudaMemcpy(host_errors.data(),
+                               device_errors,
+                               games * sizeof(std::uint8_t),
+                               cudaMemcpyDeviceToHost),
+                    "cudaMemcpy(errors)") ||
+        !check_cuda(cudaMemcpy(host_statuses.data(),
+                               device_statuses,
+                               games * sizeof(std::uint8_t),
+                               cudaMemcpyDeviceToHost),
+                    "cudaMemcpy(statuses)")) {
+      cleanup();
+      return 1;
+    }
+
+    std::size_t resolved = 0;
+    std::size_t choice_required = 0;
+    std::size_t other = 0;
+    for (std::size_t game = 0; game < games; ++game) {
+      if (host_errors[game] != 0) {
+        std::cerr << "Benchmark preparation error at game " << game
+                  << " code=" << static_cast<unsigned>(host_errors[game]) << '\n';
+        cleanup();
+        return 2;
+      }
+
+      const auto status = static_cast<ResolveStatus>(host_statuses[game]);
+      if (status == ResolveStatus::kOk) {
+        ++resolved;
+      } else if (status == ResolveStatus::kChoiceRequired) {
+        ++choice_required;
+      } else {
+        ++other;
+      }
+    }
+
+    if (resolved == 0 || choice_required == 0 || other != 0) {
+      std::cerr << "Benchmark status coverage invalid: resolved=" << resolved
+                << " choice_required=" << choice_required
+                << " other=" << other << '\n';
+      cleanup();
+      return 3;
+    }
+
+    int active_blocks_per_sm = 0;
+    if (!check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                        &active_blocks_per_sm,
+                        resolve_benchmark_kernel,
+                        threads,
+                        0),
+                    "cudaOccupancyMaxActiveBlocksPerMultiprocessor")) {
+      cleanup();
+      return 1;
+    }
+
+    const double seconds = elapsed_ms / 1000.0;
+    const double total_games = static_cast<double>(kGames) * kIterations;
+    const double games_per_second = total_games / seconds;
+    const double average_kernel_us = elapsed_ms * 1000.0 / kIterations;
+    const double occupancy =
+        static_cast<double>(active_blocks_per_sm * threads) /
+        static_cast<double>(properties.maxThreadsPerMultiProcessor);
+
+    std::cout << std::fixed << std::setprecision(2)
+              << "threads=" << threads
+              << " elapsed_ms=" << elapsed_ms
+              << " avg_kernel_us=" << average_kernel_us
+              << " games/s=" << games_per_second
+              << " theoretical_occupancy=" << occupancy * 100.0 << "%"
+              << " resolved=" << resolved
+              << " choice_required=" << choice_required
+              << " other=" << other << '\n';
+  }
+
+  cleanup();
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view{argv[1]} == "--benchmark") {
+    return run_benchmark();
+  }
+  if (argc != 1) {
+    std::cerr << "usage: cugo_cuda_turn_test [--benchmark]\n";
+    return 64;
+  }
+  return run_differential();
 }
