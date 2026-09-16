@@ -11,10 +11,10 @@ Each iteration stays on CUDA:
 3. `PolicyValueNet` produces policy logits and a scalar value for active rows.
 4. A masked stochastic policy selects one legal unified action per active row.
 5. `ext.step_indexed()` mutates only those active environment states on the current PyTorch CUDA stream.
-6. Active decisions are appended to a GPU trajectory.
+6. Active decisions are appended to a bounded GPU trajectory buffer for the current rollout.
 7. After each game finishes, its player-0 settlement reward is projected into the perspective of the player who made each recorded decision.
-8. The resulting `(features, legal, action, value_target)` rows enter a fixed-size GPU ring replay buffer.
-9. AdamW updates the policy/value network with CUDA AMP.
+8. The resulting `(features, legal, action, value_target)` rows are CUDA-packed into a separate fixed-size GPU ring replay buffer.
+9. Replay sampling uses a fused CUDA gather/unpack kernel and AdamW updates the policy/value network with CUDA AMP.
 
 There is no environment-state PCIe round trip in this loop.
 
@@ -24,20 +24,33 @@ The engine returns terminal reward from player 0's perspective. Torch50 features
 
 Targets are divided by `--reward-scale` (default `32`) before training. This keeps large Shin Matgo settlement multipliers from immediately dominating the first optimizer experiments while preserving sign and relative magnitude.
 
-## Replay storage
+## Trajectory and replay storage
 
-`GpuReplayBuffer` stores:
+Trajectory retention and replay history are separate capacities.
+
+The per-iteration trajectory keeps the current rollout in the training contract used by the network:
 
 - features as FP16 `[capacity, 496]`,
 - legal masks as bool `[capacity, 177]`,
-- selected actions as int64,
-- value targets as FP32.
+- actions and environment IDs as int64,
+- decision players as uint8.
 
-The RTX 5080 / 16 GiB baseline defaults to 4,194,304 transitions, which uses about 4.6 GiB of tensor storage. The default self-play batch is 131,072 games. In the measured baseline this produces roughly 2.5-2.9 million transitions per iteration, so the complete rollout fits in replay and the ring retains part of earlier iterations instead of learning only from the tail of the newest rollout.
+The RTX 5080 default trajectory capacity is 4,194,304 transitions, about 4,744 MiB of tensor storage. The measured 131,072-game self-play batch produces roughly 2.5-2.9 million transitions, so the complete rollout fits without tail truncation. If `--trajectory-capacity` is omitted it resolves to `min(4,194,304, replay_capacity)`, which keeps small-memory validation commands small. It can also be set explicitly.
 
-Each training iteration logs `retention_pct` and `replay_fill_pct`. `retention_pct=100` means every generated transition entered replay. If policy behavior changes enough that retention drops below 100%, increase replay capacity, reduce `--selfplay-batch`, or implement a bounded unbiased retention policy rather than relying on tail truncation.
+`PackedGpuReplayBuffer` stores each historical transition in 137 bytes:
 
-For smaller GPUs, override `--replay-capacity` and `--selfplay-batch` explicitly.
+- the first 453 binary feature planes packed into 57 bytes,
+- 26 scalar features as FP16 (52 bytes),
+- the 17 fixed zero-padding features omitted,
+- the 177-way legal mask packed into 23 bytes,
+- selected action as uint8,
+- value target as FP32.
+
+Packing on add and indexed gather/unpack on sample are fused CUDA kernels. The RTX 5080 default replay capacity is 16,777,216 transitions, about 2,192 MiB. At the measured 2.5-2.9 million transitions per iteration this holds roughly five to six recent full rollouts while the transient trajectory remains capped at 4,194,304.
+
+Each training iteration logs `retention_pct`, `replay_admission_pct`, and `replay_fill_pct`. `retention_pct=100` means the trajectory retained every generated transition. `replay_admission_pct=100` means every trajectory row was admitted by the replay add operation. With the tuned defaults both should remain 100%. If trajectory retention drops, increase `--trajectory-capacity` or reduce `--selfplay-batch`. If replay admission drops, increase `--replay-capacity` or reduce the trajectory capacity.
+
+For smaller GPUs, override `--replay-capacity`, `--trajectory-capacity`, and `--selfplay-batch` explicitly.
 
 ## Baseline objective
 
@@ -55,7 +68,7 @@ This is **not** intended as the final tabula-rasa algorithm. Its job is to valid
 Small validation run with reduced GPU memory use:
 
 ```powershell
-.\.venv-torch\Scripts\python.exe python\train50.py --iterations 1 --selfplay-batch 4096 --replay-capacity 131072 --updates-per-iter 2 --train-batch 4096
+.\.venv-torch\Scripts\python.exe python\train50.py --iterations 1 --selfplay-batch 4096 --trajectory-capacity 131072 --replay-capacity 131072 --updates-per-iter 2 --train-batch 4096
 ```
 
 RTX 5080 baseline using the tuned defaults:

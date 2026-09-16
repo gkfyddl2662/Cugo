@@ -17,7 +17,8 @@ from cugo_train50 import (
 
 
 DEFAULT_SELFPLAY_BATCH = 131072
-DEFAULT_REPLAY_CAPACITY = 1 << 22
+DEFAULT_TRAJECTORY_CAPACITY = 1 << 22
+DEFAULT_REPLAY_CAPACITY = 1 << 24
 
 
 def main() -> None:
@@ -28,6 +29,15 @@ def main() -> None:
     parser.add_argument("--selfplay-batch", type=int, default=DEFAULT_SELFPLAY_BATCH)
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--replay-capacity", type=int, default=DEFAULT_REPLAY_CAPACITY)
+    parser.add_argument(
+        "--trajectory-capacity",
+        type=int,
+        default=None,
+        help=(
+            "maximum transitions retained from one self-play rollout; "
+            "defaults to min(4194304, replay capacity)"
+        ),
+    )
     parser.add_argument("--train-batch", type=int, default=4096)
     parser.add_argument("--updates-per-iter", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=128)
@@ -55,8 +65,16 @@ def main() -> None:
         raise SystemExit("batch sizes must be positive")
     if args.replay_capacity <= 0:
         raise SystemExit("--replay-capacity must be positive")
+    if args.trajectory_capacity is not None and args.trajectory_capacity <= 0:
+        raise SystemExit("--trajectory-capacity must be positive")
     if not torch.cuda.is_available():
         raise SystemExit("PyTorch CUDA is unavailable")
+
+    trajectory_capacity = (
+        args.trajectory_capacity
+        if args.trajectory_capacity is not None
+        else min(DEFAULT_TRAJECTORY_CAPACITY, args.replay_capacity)
+    )
 
     use_amp = not args.no_amp
     torch.manual_seed(args.seed)
@@ -91,8 +109,14 @@ def main() -> None:
 
     params = sum(p.numel() for p in model.parameters())
     replay_mib = replay.storage_bytes / (1024.0 * 1024.0)
+    trajectory_bytes_per_transition = feature_count * 2 + action_count + 8 + 1 + 8
+    trajectory_mib = (
+        trajectory_capacity * trajectory_bytes_per_transition / (1024.0 * 1024.0)
+    )
     print(
         f"network hidden={args.hidden} params={params} "
+        f"trajectory_capacity={trajectory_capacity} "
+        f"trajectory_storage_mib={trajectory_mib:.1f} "
         f"replay_capacity={args.replay_capacity} replay_storage_mib={replay_mib:.1f} "
         f"replay_format={replay.format_name} "
         f"replay_bytes_per_transition={replay.bytes_per_transition}"
@@ -104,11 +128,13 @@ def main() -> None:
 
     config = vars(args).copy()
     config["checkpoint_dir"] = str(args.checkpoint_dir)
+    config["trajectory_capacity"] = trajectory_capacity
     config["replay_format"] = replay.format_name
 
     total_games = 0
     total_generated_transitions = 0
     total_retained_transitions = 0
+    total_replay_admitted_transitions = 0
     for iteration in range(1, args.iterations + 1):
         seed_offset = args.seed + (iteration - 1) * args.selfplay_batch
 
@@ -124,8 +150,9 @@ def main() -> None:
             temperature=args.temperature,
             reward_scale=args.reward_scale,
             use_amp=use_amp,
-            max_transitions=replay.capacity,
+            max_transitions=trajectory_capacity,
         )
+        replay_admitted = min(batch.transitions, replay.capacity)
         replay.add(batch)
         torch.cuda.synchronize()
         collect_seconds = time.perf_counter() - collect_start
@@ -152,14 +179,18 @@ def main() -> None:
         total_games += batch.games
         total_generated_transitions += batch.generated_transitions
         total_retained_transitions += batch.transitions
+        total_replay_admitted_transitions += replay_admitted
         games_per_s = batch.games / collect_seconds
         transitions_per_s = batch.generated_transitions / collect_seconds
         retention_pct = 100.0 * batch.transitions / batch.generated_transitions
+        replay_admission_pct = 100.0 * replay_admitted / batch.generated_transitions
         replay_fill_pct = 100.0 * replay.size / replay.capacity
         print(
             f"iter={iteration} games={batch.games} "
             f"transitions={batch.generated_transitions} retained={batch.transitions} "
             f"dropped={batch.dropped_transitions} retention_pct={retention_pct:.2f} "
+            f"replay_admitted={replay_admitted} "
+            f"replay_admission_pct={replay_admission_pct:.2f} "
             f"terminal={batch.terminal} nagari={batch.nagari} "
             f"decision_steps={batch.decision_steps} replay={replay.size} "
             f"replay_fill_pct={replay_fill_pct:.2f} "
@@ -194,11 +225,17 @@ def main() -> None:
     overall_retention_pct = (
         100.0 * total_retained_transitions / total_generated_transitions
     )
+    overall_replay_admission_pct = (
+        100.0 * total_replay_admitted_transitions / total_generated_transitions
+    )
     print(
         f"training PASS iterations={args.iterations} total_games={total_games} "
         f"total_transitions={total_generated_transitions} "
         f"retained_transitions={total_retained_transitions} "
-        f"retention_pct={overall_retention_pct:.2f} replay={replay.size}"
+        f"retention_pct={overall_retention_pct:.2f} "
+        f"replay_admitted_transitions={total_replay_admitted_transitions} "
+        f"replay_admission_pct={overall_replay_admission_pct:.2f} "
+        f"replay={replay.size}"
     )
 
 
