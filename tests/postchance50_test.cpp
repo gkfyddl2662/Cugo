@@ -7,6 +7,7 @@
 namespace {
 
 using namespace cugo::game;
+namespace core = cugo::core;
 
 void require(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
