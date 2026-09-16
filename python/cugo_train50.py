@@ -155,10 +155,9 @@ class GpuReplayBuffer:
         )
 
 
-def _masked_actions(
+def _sample_actions(
     logits: torch.Tensor,
     legal: torch.Tensor,
-    active: torch.Tensor,
     temperature: float,
 ) -> torch.Tensor:
     logits32 = logits.float()
@@ -168,7 +167,7 @@ def _masked_actions(
     else:
         probabilities = torch.softmax(masked / temperature, dim=1)
         actions = torch.multinomial(probabilities, num_samples=1).squeeze(1)
-    return torch.where(active, actions, torch.zeros_like(actions)).to(torch.int64)
+    return actions.to(torch.int64)
 
 
 def collect_selfplay(
@@ -237,14 +236,19 @@ def collect_selfplay(
             ):
                 active_logits, _values = model(active_features)
 
-            logits = torch.zeros(
-                (batch, legal.size(1)),
-                dtype=active_logits.dtype,
-                device=device,
+            # Sample only active rows.  The previous implementation scattered
+            # active logits back into a full [batch, actions] tensor and ran
+            # softmax/multinomial for already-finished environments as well.
+            # Restricting sampling to active rows preserves each active row's
+            # categorical policy while removing tail work and the full-logit
+            # allocation.  Stochastic RNG consumption intentionally changes.
+            active_actions = _sample_actions(
+                active_logits,
+                active_legal,
+                temperature,
             )
-            logits.index_copy_(0, active_ids, active_logits)
-            actions = _masked_actions(logits, legal, valid_active, temperature)
-            active_actions = actions.index_select(0, active_ids)
+            actions = torch.zeros(batch, dtype=torch.int64, device=device)
+            actions.index_copy_(0, active_ids, active_actions)
 
             feature_chunks.append(active_features.to(torch.float16))
             legal_chunks.append(active_legal)
