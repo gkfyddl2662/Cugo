@@ -93,8 +93,21 @@ def _ensure_windows_build_env() -> None:
                 "Install the Visual Studio C++ x64 build tools."
             )
 
+        # Keep cmd.exe metacharacters as separate argv entries.  Passing the
+        # whole `call \"...\" && set` expression as one argv item makes
+        # Python's Windows list2cmdline escape the inner quotes as `\\\"`,
+        # which cmd.exe then treats as literal characters around the batch path.
         result = subprocess.run(
-            ["cmd.exe", "/d", "/s", "/c", f'call "{vcvars64}" >nul && set'],
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "call",
+                str(vcvars64),
+                ">nul",
+                "&&",
+                "set",
+            ],
             capture_output=True,
             text=True,
             errors="replace",
