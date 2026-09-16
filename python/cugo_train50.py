@@ -191,6 +191,7 @@ def collect_selfplay(
     states = ext.create(seeds, first)
     final_reward0 = torch.zeros(batch, dtype=torch.float32, device=device)
     final_nagari = torch.zeros(batch, dtype=torch.bool, device=device)
+    active_ids = torch.arange(batch, dtype=torch.int64, device=device)
 
     feature_chunks: list[torch.Tensor] = []
     legal_chunks: list[torch.Tensor] = []
@@ -207,53 +208,36 @@ def collect_selfplay(
     model.eval()
     decision_steps = 0
     completed = False
-    last_done: torch.Tensor | None = None
     with torch.inference_mode():
         for _ in range(max_steps):
-            features, legal, players, observed_done, status = ext.observe(states)
-            active = ~observed_done
-            observe_ok = status == int(ext.STATUS_OK)
-            has_legal = legal.any(dim=1)
-            valid_active = active & observe_ok & has_legal
-
-            observe_bad.add_((active & ~observe_ok).sum())
-            legal_bad.add_((active & observe_ok & ~has_legal).sum())
-
-            active_ids = torch.nonzero(valid_active, as_tuple=False).squeeze(1)
             active_count = active_ids.numel()
             if active_count == 0:
                 completed = True
                 break
 
+            features, legal, players, observed_done, status = ext.observe_indexed(
+                states, active_ids
+            )
+            observe_ok = status == int(ext.STATUS_OK)
+            has_legal = legal.any(dim=1)
+
+            observe_bad.add_((~observe_ok).sum())
+            legal_bad.add_((observe_ok & (observed_done | ~has_legal)).sum())
+
             decision_steps += 1
             generated_transitions += active_count
-            active_features = features.index_select(0, active_ids)
-            active_legal = legal.index_select(0, active_ids)
-            active_players = players.index_select(0, active_ids)
 
             with torch.autocast(
                 device_type="cuda", dtype=torch.float16, enabled=use_amp
             ):
-                active_logits, _values = model(active_features)
+                active_logits, _values = model(features)
 
-            # Sample only active rows.  The previous implementation scattered
-            # active logits back into a full [batch, actions] tensor and ran
-            # softmax/multinomial for already-finished environments as well.
-            # Restricting sampling to active rows preserves each active row's
-            # categorical policy while removing tail work and the full-logit
-            # allocation.  Stochastic RNG consumption intentionally changes.
-            active_actions = _sample_actions(
-                active_logits,
-                active_legal,
-                temperature,
-            )
-            actions = torch.zeros(batch, dtype=torch.int64, device=device)
-            actions.index_copy_(0, active_ids, active_actions)
+            active_actions = _sample_actions(active_logits, legal, temperature)
 
-            feature_chunks.append(active_features.to(torch.float16))
-            legal_chunks.append(active_legal)
+            feature_chunks.append(features.to(torch.float16))
+            legal_chunks.append(legal)
             action_chunks.append(active_actions)
-            player_chunks.append(active_players)
+            player_chunks.append(players)
             env_chunks.append(active_ids)
             retained_rows += active_count
 
@@ -269,17 +253,27 @@ def collect_selfplay(
                     del player_chunks[0]
                     del env_chunks[0]
 
-            reward0, new_done, nagari, step_status, _committed = ext.step(states, actions)
-            last_done = new_done
+            reward0, new_done, nagari, step_status, _committed = ext.step_indexed(
+                states, active_ids, active_actions
+            )
             step_ok = step_status == int(ext.STATUS_OK)
-            step_bad.add_((valid_active & ~step_ok).sum())
+            step_bad.add_((~step_ok).sum())
 
-            just_finished = valid_active & step_ok & new_done
-            final_reward0 = torch.where(just_finished, reward0, final_reward0)
-            final_nagari |= just_finished & nagari
-        else:
-            if last_done is not None and bool(last_done.all().item()):
+            just_finished = step_ok & new_done
+            final_reward0.index_copy_(
+                0,
+                active_ids,
+                torch.where(just_finished, reward0, torch.zeros_like(reward0)),
+            )
+            final_nagari.index_copy_(0, active_ids, just_finished & nagari)
+
+            keep_rows = torch.nonzero(
+                step_ok & ~new_done, as_tuple=False
+            ).squeeze(1)
+            active_ids = active_ids.index_select(0, keep_rows)
+            if active_ids.numel() == 0:
                 completed = True
+                break
 
     error_counts = torch.stack((observe_bad, legal_bad, step_bad)).tolist()
     observe_bad_count, legal_bad_count, step_bad_count = map(int, error_counts)

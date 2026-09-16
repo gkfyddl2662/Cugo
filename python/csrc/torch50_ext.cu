@@ -21,6 +21,7 @@ using cugo::game::TorchStepResult50;
 static_assert(std::is_trivially_copyable_v<TorchEnv50>);
 
 constexpr int kThreads = 256;
+constexpr std::int16_t kInvalidIndexedStatus = -1;
 
 void check_cuda_1d(const torch::Tensor& tensor,
                    at::ScalarType dtype,
@@ -39,6 +40,81 @@ void check_states(const torch::Tensor& states) {
   TORCH_CHECK(states.dim() == 2, "states must have shape [N, STATE_BYTES]");
   TORCH_CHECK(states.size(1) == static_cast<std::int64_t>(sizeof(TorchEnv50)),
               "states second dimension must equal STATE_BYTES");
+}
+
+void check_same_device(const torch::Tensor& first,
+                       const torch::Tensor& second,
+                       const char* first_name,
+                       const char* second_name) {
+  TORCH_CHECK(first.device() == second.device(), first_name, " and ",
+              second_name, " must be on the same CUDA device");
+}
+
+__device__ void write_observation(const TorchEnv50& env,
+                                  float* features,
+                                  bool* legal,
+                                  std::uint8_t* player,
+                                  bool* done,
+                                  std::int16_t* status) {
+  const TorchPacket50 packet = cugo::game::make_torch_packet50(env);
+  cugo::game::encode_torch_packet50(packet, features);
+
+  for (std::uint16_t action = 0; action < cugo::game::kTorch50ActionCount;
+       ++action) {
+    legal[action] = cugo::game::has_torch_action50(packet.legal_actions, action);
+  }
+  *player = packet.decision_player;
+  *done = env.done != 0;
+  *status = static_cast<std::int16_t>(packet.status);
+}
+
+__device__ void write_invalid_observation(float* features,
+                                          bool* legal,
+                                          std::uint8_t* player,
+                                          bool* done,
+                                          std::int16_t* status) {
+  for (std::uint16_t feature = 0; feature < cugo::game::kTorch50FeatureCount;
+       ++feature) {
+    features[feature] = 0.0f;
+  }
+  for (std::uint16_t action = 0; action < cugo::game::kTorch50ActionCount;
+       ++action) {
+    legal[action] = false;
+  }
+  *player = 0;
+  *done = true;
+  *status = kInvalidIndexedStatus;
+}
+
+__device__ void write_step_result(TorchEnv50& env,
+                                  std::int64_t raw_action,
+                                  float* reward,
+                                  bool* done,
+                                  bool* nagari,
+                                  std::int16_t* status,
+                                  bool* primary_committed) {
+  const std::uint16_t action =
+      raw_action >= 0 && raw_action < cugo::game::kTorch50ActionCount
+          ? static_cast<std::uint16_t>(raw_action)
+          : cugo::game::kInvalidTorch50Action;
+  const TorchStepResult50 result = cugo::game::torch_step50(env, action);
+  *reward = static_cast<float>(result.reward0);
+  *done = result.done != 0;
+  *nagari = result.nagari != 0;
+  *status = static_cast<std::int16_t>(result.status);
+  *primary_committed = result.primary_committed != 0;
+}
+
+__device__ void write_invalid_step(float* reward,
+                                   bool* done,
+                                   bool* nagari,
+                                   std::int16_t* status,
+                                   bool* primary_committed) {
+  *reward = 0.0f;
+  *done = true;
+  *nagari = false;
+  *status = kInvalidIndexedStatus;
+  *primary_committed = false;
 }
 
 __global__ void create_kernel(TorchEnv50* envs,
@@ -64,19 +140,36 @@ __global__ void observe_kernel(const TorchEnv50* envs,
       static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
 
-  const TorchPacket50 packet = cugo::game::make_torch_packet50(envs[i]);
-  cugo::game::encode_torch_packet50(
-      packet, features + i * cugo::game::kTorch50FeatureCount);
+  write_observation(
+      envs[i], features + i * cugo::game::kTorch50FeatureCount,
+      legal + i * cugo::game::kTorch50ActionCount, players + i, done + i,
+      status + i);
+}
 
+__global__ void observe_indexed_kernel(const TorchEnv50* envs,
+                                       const std::int64_t* env_ids,
+                                       float* features,
+                                       bool* legal,
+                                       std::uint8_t* players,
+                                       bool* done,
+                                       std::int16_t* status,
+                                       std::int64_t count,
+                                       std::int64_t env_count) {
+  const std::int64_t i =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  const std::int64_t env_id = env_ids[i];
+  float* feature_row = features + i * cugo::game::kTorch50FeatureCount;
   bool* legal_row = legal + i * cugo::game::kTorch50ActionCount;
-  for (std::uint16_t action = 0; action < cugo::game::kTorch50ActionCount;
-       ++action) {
-    legal_row[action] =
-        cugo::game::has_torch_action50(packet.legal_actions, action);
+  if (env_id < 0 || env_id >= env_count) {
+    write_invalid_observation(feature_row, legal_row, players + i, done + i,
+                              status + i);
+    return;
   }
-  players[i] = packet.decision_player;
-  done[i] = envs[i].done != 0;
-  status[i] = static_cast<std::int16_t>(packet.status);
+
+  write_observation(envs[env_id], feature_row, legal_row, players + i, done + i,
+                    status + i);
 }
 
 __global__ void step_kernel(TorchEnv50* envs,
@@ -91,17 +184,66 @@ __global__ void step_kernel(TorchEnv50* envs,
       static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
 
-  const std::int64_t raw = actions[i];
-  const std::uint16_t action =
-      raw >= 0 && raw < cugo::game::kTorch50ActionCount
-          ? static_cast<std::uint16_t>(raw)
-          : cugo::game::kInvalidTorch50Action;
-  const TorchStepResult50 result = cugo::game::torch_step50(envs[i], action);
-  rewards[i] = static_cast<float>(result.reward0);
-  done[i] = result.done != 0;
-  nagari[i] = result.nagari != 0;
-  status[i] = static_cast<std::int16_t>(result.status);
-  primary_committed[i] = result.primary_committed != 0;
+  write_step_result(envs[i], actions[i], rewards + i, done + i, nagari + i,
+                    status + i, primary_committed + i);
+}
+
+__global__ void step_indexed_kernel(TorchEnv50* envs,
+                                    const std::int64_t* env_ids,
+                                    const std::int64_t* actions,
+                                    float* rewards,
+                                    bool* done,
+                                    bool* nagari,
+                                    std::int16_t* status,
+                                    bool* primary_committed,
+                                    std::int64_t count,
+                                    std::int64_t env_count) {
+  const std::int64_t i =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  const std::int64_t env_id = env_ids[i];
+  if (env_id < 0 || env_id >= env_count) {
+    write_invalid_step(rewards + i, done + i, nagari + i, status + i,
+                       primary_committed + i);
+    return;
+  }
+
+  write_step_result(envs[env_id], actions[i], rewards + i, done + i, nagari + i,
+                    status + i, primary_committed + i);
+}
+
+std::vector<torch::Tensor> allocate_observation_tensors(
+    std::int64_t count,
+    const c10::Device& device) {
+  auto features = torch::empty(
+      {count, static_cast<std::int64_t>(cugo::game::kTorch50FeatureCount)},
+      torch::TensorOptions().device(device).dtype(at::kFloat));
+  auto legal = torch::empty(
+      {count, static_cast<std::int64_t>(cugo::game::kTorch50ActionCount)},
+      torch::TensorOptions().device(device).dtype(at::kBool));
+  auto players = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kByte));
+  auto done = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kBool));
+  auto status = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kShort));
+  return {features, legal, players, done, status};
+}
+
+std::vector<torch::Tensor> allocate_step_tensors(std::int64_t count,
+                                                 const c10::Device& device) {
+  auto rewards = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kFloat));
+  auto done = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kBool));
+  auto nagari = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kBool));
+  auto status = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kShort));
+  auto committed = torch::empty(
+      {count}, torch::TensorOptions().device(device).dtype(at::kBool));
+  return {rewards, done, nagari, status, committed};
 }
 
 }  // namespace
@@ -112,8 +254,7 @@ torch::Tensor cugo_torch50_create_cuda(torch::Tensor seeds,
   check_cuda_1d(first_players, at::kLong, "first_players");
   TORCH_CHECK(seeds.numel() == first_players.numel(),
               "seeds and first_players must have the same length");
-  TORCH_CHECK(seeds.device() == first_players.device(),
-              "seeds and first_players must be on the same CUDA device");
+  check_same_device(seeds, first_players, "seeds", "first_players");
 
   const c10::cuda::CUDAGuard guard(seeds.device());
   const std::int64_t count = seeds.numel();
@@ -136,31 +277,45 @@ std::vector<torch::Tensor> cugo_torch50_observe_cuda(torch::Tensor states) {
   check_states(states);
   const c10::cuda::CUDAGuard guard(states.device());
   const std::int64_t count = states.size(0);
-
-  auto features = torch::empty(
-      {count, static_cast<std::int64_t>(cugo::game::kTorch50FeatureCount)},
-      torch::TensorOptions().device(states.device()).dtype(at::kFloat));
-  auto legal = torch::empty(
-      {count, static_cast<std::int64_t>(cugo::game::kTorch50ActionCount)},
-      torch::TensorOptions().device(states.device()).dtype(at::kBool));
-  auto players = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kByte));
-  auto done = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kBool));
-  auto status = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kShort));
+  auto outputs = allocate_observation_tensors(count, states.device());
 
   if (count != 0) {
     const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
     observe_kernel<<<blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const TorchEnv50*>(states.data_ptr<std::uint8_t>()),
-        features.data_ptr<float>(), legal.data_ptr<bool>(),
-        players.data_ptr<std::uint8_t>(), done.data_ptr<bool>(),
-        status.data_ptr<std::int16_t>(), count);
+        outputs[0].data_ptr<float>(), outputs[1].data_ptr<bool>(),
+        outputs[2].data_ptr<std::uint8_t>(), outputs[3].data_ptr<bool>(),
+        outputs[4].data_ptr<std::int16_t>(), count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
-  return {features, legal, players, done, status};
+  return outputs;
+}
+
+std::vector<torch::Tensor> cugo_torch50_observe_indexed_cuda(
+    torch::Tensor states,
+    torch::Tensor env_ids) {
+  check_states(states);
+  check_cuda_1d(env_ids, at::kLong, "env_ids");
+  check_same_device(states, env_ids, "states", "env_ids");
+
+  const c10::cuda::CUDAGuard guard(states.device());
+  const std::int64_t count = env_ids.numel();
+  auto outputs = allocate_observation_tensors(count, states.device());
+
+  if (count != 0) {
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    observe_indexed_kernel<<<blocks, kThreads, 0,
+                             at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const TorchEnv50*>(states.data_ptr<std::uint8_t>()),
+        env_ids.data_ptr<std::int64_t>(), outputs[0].data_ptr<float>(),
+        outputs[1].data_ptr<bool>(), outputs[2].data_ptr<std::uint8_t>(),
+        outputs[3].data_ptr<bool>(), outputs[4].data_ptr<std::int16_t>(), count,
+        states.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  return outputs;
 }
 
 std::vector<torch::Tensor> cugo_torch50_step_cuda(torch::Tensor states,
@@ -169,31 +324,52 @@ std::vector<torch::Tensor> cugo_torch50_step_cuda(torch::Tensor states,
   check_cuda_1d(actions, at::kLong, "actions");
   TORCH_CHECK(states.size(0) == actions.numel(),
               "states and actions must have the same batch size");
-  TORCH_CHECK(states.device() == actions.device(),
-              "states and actions must be on the same CUDA device");
+  check_same_device(states, actions, "states", "actions");
 
   const c10::cuda::CUDAGuard guard(states.device());
   const std::int64_t count = states.size(0);
-  auto rewards = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kFloat));
-  auto done = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kBool));
-  auto nagari = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kBool));
-  auto status = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kShort));
-  auto committed = torch::empty(
-      {count}, torch::TensorOptions().device(states.device()).dtype(at::kBool));
+  auto outputs = allocate_step_tensors(count, states.device());
 
   if (count != 0) {
     const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
     step_kernel<<<blocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<TorchEnv50*>(states.data_ptr<std::uint8_t>()),
-        actions.data_ptr<std::int64_t>(), rewards.data_ptr<float>(),
-        done.data_ptr<bool>(), nagari.data_ptr<bool>(),
-        status.data_ptr<std::int16_t>(), committed.data_ptr<bool>(), count);
+        actions.data_ptr<std::int64_t>(), outputs[0].data_ptr<float>(),
+        outputs[1].data_ptr<bool>(), outputs[2].data_ptr<bool>(),
+        outputs[3].data_ptr<std::int16_t>(), outputs[4].data_ptr<bool>(), count);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
-  return {rewards, done, nagari, status, committed};
+  return outputs;
+}
+
+std::vector<torch::Tensor> cugo_torch50_step_indexed_cuda(
+    torch::Tensor states,
+    torch::Tensor env_ids,
+    torch::Tensor actions) {
+  check_states(states);
+  check_cuda_1d(env_ids, at::kLong, "env_ids");
+  check_cuda_1d(actions, at::kLong, "actions");
+  TORCH_CHECK(env_ids.numel() == actions.numel(),
+              "env_ids and actions must have the same length");
+  check_same_device(states, env_ids, "states", "env_ids");
+  check_same_device(states, actions, "states", "actions");
+
+  const c10::cuda::CUDAGuard guard(states.device());
+  const std::int64_t count = env_ids.numel();
+  auto outputs = allocate_step_tensors(count, states.device());
+
+  if (count != 0) {
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    step_indexed_kernel<<<blocks, kThreads, 0,
+                          at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<TorchEnv50*>(states.data_ptr<std::uint8_t>()),
+        env_ids.data_ptr<std::int64_t>(), actions.data_ptr<std::int64_t>(),
+        outputs[0].data_ptr<float>(), outputs[1].data_ptr<bool>(),
+        outputs[2].data_ptr<bool>(), outputs[3].data_ptr<std::int16_t>(),
+        outputs[4].data_ptr<bool>(), count, states.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  return outputs;
 }
