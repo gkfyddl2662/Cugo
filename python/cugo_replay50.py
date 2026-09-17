@@ -132,7 +132,7 @@ class PackedGpuReplayBuffer:
         count = int(dst_index.numel())
         if count == 0:
             return
-        if dst_index.dtype != torch.int64 or dst_index.device != self.device:
+        if dst_index.dtype != torch.int64 or dst_index.device != self.feature_bits.device:
             raise ValueError("dst_index must be a CUDA int64 tensor on the replay device")
 
         packed_features = self._pack_bits(
