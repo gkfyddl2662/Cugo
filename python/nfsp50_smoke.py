@@ -69,8 +69,8 @@ def compare_eta1(old: baseline.SelfPlayBatch, new, temperature: float) -> None:
 
 def make_synthetic(start: int, count: int, device: torch.device):
     ids = torch.arange(start, start + count, dtype=torch.int64, device=device)
-    features = torch.zeros((count, 496), dtype=torch.float32, device=device)
-    features[:, 453] = ids.remainder(1024).to(torch.float32)
+    features = torch.zeros((count, 496), dtype=torch.float16, device=device)
+    features[:, 453] = ids.remainder(1024).to(torch.float16)
     legal = torch.zeros((count, 177), dtype=torch.bool, device=device)
     legal[:, 0] = True
     actions = ids.remainder(177)
