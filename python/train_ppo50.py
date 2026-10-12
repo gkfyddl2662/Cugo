@@ -41,6 +41,8 @@ def main() -> None:
     parser.add_argument("--entropy", type=float, default=0.05, help="entropy coef at start")
     parser.add_argument("--entropy-final", type=float, default=None, help="linear decay target")
     parser.add_argument("--value-coef", type=float, default=0.5)
+    parser.add_argument("--ema-decay", type=float, default=0.99,
+                        help="per-iteration EMA of actor weights used for eval and release")
     parser.add_argument("--gae-lambda", type=float, default=0.95, help="1.0 = Monte-Carlo advantages")
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -83,6 +85,13 @@ def main() -> None:
         payload = load_ppo(args.init, device)
         actor.load_state_dict(payload["actor"])
         critic.load_state_dict(payload["critic"])
+    # Exponential moving average of actor weights: the release/eval policy. Greedy play
+    # flips on near-tied actions, so single updates occasionally crashed raw checkpoints
+    # (e.g. -12.5 pts at one eval); averaging ~1/(1-decay) iterations smooths that out.
+    ema_actor = frozen(actor)
+    if args.init is not None and "actor_ema" in payload:
+        ema_actor.load_state_dict(payload["actor_ema"])
+    ema_params, actor_params = list(ema_actor.parameters()), list(actor.parameters())
     optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5,
                                  fused=True, capturable=True)
 
@@ -126,6 +135,8 @@ def main() -> None:
             updater = PpoUpdater(actor, critic, optimizer, storage, args.minibatch, args.clip,
                                  args.value_coef, args.grad_clip, use_graph=not args.no_graph)
         stats = updater.update(data, args.epochs, entropy_coef, args.target_kl, args.gae_lambda)
+        with torch.no_grad():
+            torch._foreach_lerp_(ema_params, actor_params, 1.0 - args.ema_decay)
         torch.cuda.synchronize()
         t2 = time.perf_counter()
         total_games += data.games
@@ -150,16 +161,19 @@ def main() -> None:
             del snapshots[:-args.pool_size]
 
         if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):
-            s = evaluate_paired(ext=ext, model_a=actor.eval(), model_b=reference, pairs=args.eval_pairs,
-                                seed_offset=EVAL_SEED_OFFSET, max_steps=128, use_amp=True)
-            print(f"iter={iteration} eval_ref_score={s.mean_pair_score_a:.4f} "
-                  f"eval_ref_ci_low={s.pair_score_ci95_low:.4f} eval_ref_ci_high={s.pair_score_ci95_high:.4f} "
-                  f"eval_ref_win_pct={100.0 * s.a_wins / max(1, s.evaluated_games):.3f}")
+            for tag, model in (("ref", ema_actor), ("raw", actor.eval())):
+                s = evaluate_paired(ext=ext, model_a=model, model_b=reference, pairs=args.eval_pairs,
+                                    seed_offset=EVAL_SEED_OFFSET, max_steps=128, use_amp=True)
+                print(f"iter={iteration} eval_{tag}_score={s.mean_pair_score_a:.4f} "
+                      f"eval_{tag}_ci_low={s.pair_score_ci95_low:.4f} "
+                      f"eval_{tag}_ci_high={s.pair_score_ci95_high:.4f} "
+                      f"eval_{tag}_win_pct={100.0 * s.a_wins / max(1, s.evaluated_games):.3f}")
 
         if args.checkpoint_every > 0 and (iteration % args.checkpoint_every == 0 or iteration == args.iterations):
             path = args.checkpoint_dir / f"iter_{iteration:06d}.pt"
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"iteration": iteration, "actor": actor.state_dict(), "critic": critic.state_dict(),
+                        "actor_ema": ema_actor.state_dict(),
                         "optimizer": optimizer.state_dict(), "config": config}, path)
             print(f"checkpoint={path}")
 

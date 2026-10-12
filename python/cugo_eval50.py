@@ -102,8 +102,9 @@ def load_policy_checkpoint(
         if state is None:
             raise ValueError(f"checkpoint {path} has no br_model")
         model = PolicyValueNet(496, 177, hidden)
-    elif policy == "ppo":
-        state = payload.get("actor")
+    elif policy in ("ppo", "ppo_raw"):
+        # "ppo" is the release policy: the weight EMA when the checkpoint has one.
+        state = payload.get("actor_ema") if policy == "ppo" and "actor_ema" in payload else payload.get("actor")
         if state is None:
             raise ValueError(f"checkpoint {path} has no actor")
         config = payload.get("config", {})
@@ -114,7 +115,7 @@ def load_policy_checkpoint(
             raise ValueError(f"checkpoint {path} has no legacy model")
         model = PolicyValueNet(496, 177, hidden)
     else:
-        raise ValueError("policy must be one of auto, average, br, legacy, ppo")
+        raise ValueError("policy must be one of auto, average, br, legacy, ppo, ppo_raw")
 
     model.load_state_dict(state, strict=True)
     model.to(device)
