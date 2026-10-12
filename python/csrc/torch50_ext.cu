@@ -117,6 +117,23 @@ __device__ void write_invalid_step(float* reward,
   *primary_committed = false;
 }
 
+__device__ void copy_state_bytes(const TorchEnv50& source,
+                                 TorchEnv50& target) {
+  const auto* source_bytes =
+      reinterpret_cast<const std::uint8_t*>(&source);
+  auto* target_bytes = reinterpret_cast<std::uint8_t*>(&target);
+  for (std::uint32_t i = 0; i < sizeof(TorchEnv50); ++i) {
+    target_bytes[i] = source_bytes[i];
+  }
+}
+
+__device__ void clear_state_bytes(TorchEnv50& target) {
+  auto* target_bytes = reinterpret_cast<std::uint8_t*>(&target);
+  for (std::uint32_t i = 0; i < sizeof(TorchEnv50); ++i) {
+    target_bytes[i] = 0;
+  }
+}
+
 __global__ void create_kernel(TorchEnv50* envs,
                               const std::int64_t* seeds,
                               const std::int64_t* first_players,
@@ -213,6 +230,51 @@ __global__ void step_indexed_kernel(TorchEnv50* envs,
                     status + i, primary_committed + i);
 }
 
+__global__ void clone_indexed_kernel(const TorchEnv50* envs,
+                                     const std::int64_t* env_ids,
+                                     TorchEnv50* children,
+                                     std::int64_t count,
+                                     std::int64_t env_count) {
+  const std::int64_t i =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  const std::int64_t env_id = env_ids[i];
+  if (env_id >= 0 && env_id < env_count) {
+    copy_state_bytes(envs[env_id], children[i]);
+  } else {
+    clear_state_bytes(children[i]);
+  }
+}
+
+__global__ void branch_indexed_kernel(const TorchEnv50* envs,
+                                      const std::int64_t* env_ids,
+                                      const std::int64_t* actions,
+                                      TorchEnv50* children,
+                                      float* rewards,
+                                      bool* done,
+                                      bool* nagari,
+                                      std::int16_t* status,
+                                      bool* primary_committed,
+                                      std::int64_t count,
+                                      std::int64_t env_count) {
+  const std::int64_t i =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  const std::int64_t env_id = env_ids[i];
+  if (env_id < 0 || env_id >= env_count) {
+    clear_state_bytes(children[i]);
+    write_invalid_step(rewards + i, done + i, nagari + i, status + i,
+                       primary_committed + i);
+    return;
+  }
+
+  copy_state_bytes(envs[env_id], children[i]);
+  write_step_result(children[i], actions[i], rewards + i, done + i, nagari + i,
+                    status + i, primary_committed + i);
+}
+
 std::vector<torch::Tensor> allocate_observation_tensors(
     std::int64_t count,
     const c10::Device& device) {
@@ -246,6 +308,12 @@ std::vector<torch::Tensor> allocate_step_tensors(std::int64_t count,
   return {rewards, done, nagari, status, committed};
 }
 
+torch::Tensor allocate_states(std::int64_t count, const c10::Device& device) {
+  return torch::empty(
+      {count, static_cast<std::int64_t>(sizeof(TorchEnv50))},
+      torch::TensorOptions().device(device).dtype(at::kByte));
+}
+
 }  // namespace
 
 torch::Tensor cugo_torch50_create_cuda(torch::Tensor seeds,
@@ -258,9 +326,7 @@ torch::Tensor cugo_torch50_create_cuda(torch::Tensor seeds,
 
   const c10::cuda::CUDAGuard guard(seeds.device());
   const std::int64_t count = seeds.numel();
-  auto states = torch::empty(
-      {count, static_cast<std::int64_t>(sizeof(TorchEnv50))},
-      torch::TensorOptions().device(seeds.device()).dtype(at::kByte));
+  auto states = allocate_states(count, seeds.device());
 
   if (count != 0) {
     const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
@@ -372,4 +438,61 @@ std::vector<torch::Tensor> cugo_torch50_step_indexed_cuda(
   }
 
   return outputs;
+}
+
+torch::Tensor cugo_torch50_clone_indexed_cuda(torch::Tensor states,
+                                               torch::Tensor env_ids) {
+  check_states(states);
+  check_cuda_1d(env_ids, at::kLong, "env_ids");
+  check_same_device(states, env_ids, "states", "env_ids");
+
+  const c10::cuda::CUDAGuard guard(states.device());
+  const std::int64_t count = env_ids.numel();
+  auto children = allocate_states(count, states.device());
+
+  if (count != 0) {
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    clone_indexed_kernel<<<blocks, kThreads, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const TorchEnv50*>(states.data_ptr<std::uint8_t>()),
+        env_ids.data_ptr<std::int64_t>(),
+        reinterpret_cast<TorchEnv50*>(children.data_ptr<std::uint8_t>()), count,
+        states.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  return children;
+}
+
+std::vector<torch::Tensor> cugo_torch50_branch_indexed_cuda(
+    torch::Tensor states,
+    torch::Tensor env_ids,
+    torch::Tensor actions) {
+  check_states(states);
+  check_cuda_1d(env_ids, at::kLong, "env_ids");
+  check_cuda_1d(actions, at::kLong, "actions");
+  TORCH_CHECK(env_ids.numel() == actions.numel(),
+              "env_ids and actions must have the same length");
+  check_same_device(states, env_ids, "states", "env_ids");
+  check_same_device(states, actions, "states", "actions");
+
+  const c10::cuda::CUDAGuard guard(states.device());
+  const std::int64_t count = env_ids.numel();
+  auto children = allocate_states(count, states.device());
+  auto outputs = allocate_step_tensors(count, states.device());
+
+  if (count != 0) {
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    branch_indexed_kernel<<<blocks, kThreads, 0,
+                            at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const TorchEnv50*>(states.data_ptr<std::uint8_t>()),
+        env_ids.data_ptr<std::int64_t>(), actions.data_ptr<std::int64_t>(),
+        reinterpret_cast<TorchEnv50*>(children.data_ptr<std::uint8_t>()),
+        outputs[0].data_ptr<float>(), outputs[1].data_ptr<bool>(),
+        outputs[2].data_ptr<bool>(), outputs[3].data_ptr<std::int16_t>(),
+        outputs[4].data_ptr<bool>(), count, states.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  return {children, outputs[0], outputs[1], outputs[2], outputs[3], outputs[4]};
 }

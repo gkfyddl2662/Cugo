@@ -17,6 +17,12 @@ std::vector<torch::Tensor> cugo_torch50_step_indexed_cuda(
     torch::Tensor states,
     torch::Tensor env_ids,
     torch::Tensor actions);
+torch::Tensor cugo_torch50_clone_indexed_cuda(torch::Tensor states,
+                                               torch::Tensor env_ids);
+std::vector<torch::Tensor> cugo_torch50_branch_indexed_cuda(
+    torch::Tensor states,
+    torch::Tensor env_ids,
+    torch::Tensor actions);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Cugo Shin Matgo CUDA batch environment";
@@ -30,6 +36,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Apply unified actions to a GPU-resident batch in place");
   m.def("step_indexed", &cugo_torch50_step_indexed_cuda,
         "Apply unified actions only to selected environment rows in place");
+  m.def("clone_indexed", &cugo_torch50_clone_indexed_cuda,
+        "Clone selected environment rows on the current CUDA stream");
+  m.def("branch_indexed", &cugo_torch50_branch_indexed_cuda,
+        "Clone selected rows and apply actions without mutating parents");
 
   m.attr("FEATURE_COUNT") = pybind11::int_(cugo::game::kTorch50FeatureCount);
   m.attr("ACTION_COUNT") = pybind11::int_(cugo::game::kTorch50ActionCount);
