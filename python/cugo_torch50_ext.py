@@ -145,7 +145,10 @@ def load_extension(*, verbose: bool = False) -> Any:
         raise RuntimeError("PyTorch CUDA is not available")
 
     _ensure_windows_build_env()
-    from torch.utils.cpp_extension import load
+    from torch.utils import cpp_extension
+
+    if os.name == "nt":
+        cpp_extension.SUBPROCESS_DECODE_ARGS = ("mbcs", "replace")
 
     repo = Path(__file__).resolve().parents[1]
     source_dir = repo / "python" / "csrc"
@@ -174,7 +177,7 @@ def load_extension(*, verbose: bool = False) -> Any:
         cxx_flags = ["-O3", "-std=c++20"]
         cuda_flags = ["-O3", "-std=c++20"]
 
-    return load(
+    return cpp_extension.load(
         name="cugo_torch50_ext_v1",
         sources=[
             str(source_dir / "torch50_ext.cpp"),
