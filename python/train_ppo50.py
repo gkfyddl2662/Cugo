@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from cugo_eval50 import evaluate_paired, load_policy_checkpoint
-from cugo_ppo50 import RolloutStorage, collect, ppo_update
+from cugo_ppo50 import PpoUpdater, RolloutStorage, collect
 from cugo_ppo_nets50 import OracleCritic, PpoActor
 from cugo_torch50_ext import load_extension
 
@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=65536, help="games per iteration")
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--blocks", type=int, default=3)
+    parser.add_argument("--norm", choices=("layer", "none"), default="none")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--minibatch", type=int, default=32768)
@@ -60,6 +61,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("build/checkpoints/ppo50"))
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--no-graph", action="store_true", help="disable CUDA-graph training step")
     parser.add_argument("--memory-fraction", type=float, default=0.85,
                         help="cap on PyTorch's share of dedicated VRAM")
     args = parser.parse_args()
@@ -71,15 +73,17 @@ def main() -> None:
     torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     ext = load_extension()
     storage = RolloutStorage(args.games * 26, device)
+    updater: PpoUpdater | None = None
 
-    actor = PpoActor(args.hidden, args.blocks).to(device)
-    critic = OracleCritic(args.hidden, args.blocks).to(device)
+    actor = PpoActor(args.hidden, args.blocks, args.norm).to(device)
+    critic = OracleCritic(args.hidden, args.blocks, args.norm).to(device)
     start_iteration = 0
     if args.init is not None:
         payload = load_ppo(args.init, device)
         actor.load_state_dict(payload["actor"])
         critic.load_state_dict(payload["critic"])
-    optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5)
+    optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5,
+                                 fused=True, capturable=True)
 
     fixed_pool = [load_policy_checkpoint(p, args.opponent_policy, device).model for p in args.opponent]
     snapshots: list[torch.nn.Module] = []
@@ -94,7 +98,7 @@ def main() -> None:
     print(f"device={torch.cuda.get_device_name(0)} capability={torch.cuda.get_device_capability(0)}")
     print(f"algorithm=ppo-oracle-critic-v1 iterations={args.iterations} games_per_iter={args.games} "
           f"exploiter={int(args.exploiter)} pool_fraction={pool_fraction:g} pool_size={args.pool_size}")
-    print(f"network hidden={args.hidden} blocks={args.blocks} actor_params={params} "
+    print(f"network hidden={args.hidden} blocks={args.blocks} norm={args.norm} actor_params={params} "
           f"critic_params={sum(p.numel() for p in critic.parameters())}")
     print(f"lr={args.lr:g} epochs={args.epochs} minibatch={args.minibatch} clip={args.clip:g} "
           f"entropy={args.entropy:g} entropy_final={args.entropy_final if args.entropy_final is not None else args.entropy:g} "
@@ -117,8 +121,10 @@ def main() -> None:
                        reward_scale=args.reward_scale, storage=storage)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        stats = ppo_update(actor, critic, optimizer, data, args.epochs, args.minibatch, args.clip,
-                           entropy_coef, args.value_coef, args.target_kl, args.grad_clip)
+        if updater is None:
+            updater = PpoUpdater(actor, critic, optimizer, storage, args.minibatch, args.clip,
+                                 args.value_coef, args.grad_clip, use_graph=not args.no_graph)
+        stats = updater.update(data, args.epochs, entropy_coef, args.target_kl)
         torch.cuda.synchronize()
         t2 = time.perf_counter()
         total_games += data.games

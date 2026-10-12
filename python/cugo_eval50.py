@@ -106,8 +106,8 @@ def load_policy_checkpoint(
         state = payload.get("actor")
         if state is None:
             raise ValueError(f"checkpoint {path} has no actor")
-        blocks = int(payload.get("config", {}).get("blocks", 3))
-        model = PpoActor(hidden, blocks)
+        config = payload.get("config", {})
+        model = PpoActor(hidden, int(config.get("blocks", 3)), config.get("norm", "layer"))
     elif policy == "legacy":
         state = payload.get("model")
         if state is None:

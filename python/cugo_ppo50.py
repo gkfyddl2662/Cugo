@@ -24,7 +24,7 @@ DECISION_OFFSET = 446
 
 @dataclass
 class Rollout:
-    features: torch.Tensor  # [N, 496] fp16
+    features: torch.Tensor  # [N, 496] bf16
     legal: torch.Tensor  # [N, 177] bool
     actions: torch.Tensor  # [N] int64
     logp: torch.Tensor  # [N] fp32, behaviour log-prob
@@ -70,7 +70,7 @@ class RolloutStorage:
         old = self.__dict__.get("tensors")
         d = self.device
         self.tensors = (
-            torch.empty((capacity, 496), dtype=torch.float16, device=d),
+            torch.empty((capacity, 496), dtype=torch.bfloat16, device=d),
             torch.empty((capacity, 177), dtype=torch.bool, device=d),
             torch.empty(capacity, dtype=torch.int64, device=d),
             torch.empty(capacity, dtype=torch.float32, device=d),
@@ -212,80 +212,126 @@ def _critic_input(features: torch.Tensor, opp_hand: torch.Tensor) -> torch.Tenso
     return torch.cat((features, card_plane(opp_hand, features.dtype)), dim=1)
 
 
-def ppo_update(
-    actor: nn.Module,
-    critic: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    data: Rollout,
-    epochs: int,
-    minibatch: int,
-    clip: float,
-    entropy_coef: float,
-    value_coef: float,
-    target_kl: float,
-    grad_clip: float,
-) -> TrainStats:
-    n = data.actions.numel()
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        critic.eval()
-        values = torch.cat([
-            critic(_critic_input(data.features[i:i + minibatch], data.opp_hand[i:i + minibatch])).float()
-            for i in range(0, n, minibatch)
-        ])
-    advantages = data.returns - values
-    explained_var = 1.0 - float((data.returns - values).var() / data.returns.var().clamp_min(1e-8))
-    gostop = data.features[:, DECISION_OFFSET + GOSTOP_KIND] > 0.5
+class PpoUpdater:
+    """PPO minibatch step, optionally captured once as a CUDA graph and replayed.
 
-    actor.train()
-    critic.train()
-    sums = torch.zeros(6, device=data.actions.device)
-    gostop_entropy = torch.zeros(2, device=data.actions.device)
-    updates = 0
-    stop = False
-    for epoch in range(epochs):
-        perm = torch.randperm(n, device=data.actions.device)
-        for i in range(0, n - minibatch + 1, minibatch):
-            idx = perm[i:i + minibatch]
-            feats = data.features[idx]
-            legal = data.legal[idx]
-            adv = advantages[idx]
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = actor(feats).float()
-                value = critic(_critic_input(feats, data.opp_hand[idx])).float()
-            log_probs = torch.log_softmax(logits.masked_fill(~legal, -1.0e30), dim=1)
-            new_logp = log_probs.gather(1, data.actions[idx].unsqueeze(1)).squeeze(1)
-            log_ratio = new_logp - data.logp[idx]
-            ratio = log_ratio.exp()
-            policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - clip, 1 + clip) * adv).mean()
-            entropy_rows = -(log_probs.exp() * log_probs).sum(dim=1)
-            entropy = entropy_rows.mean()
-            value_loss = F.smooth_l1_loss(value, data.returns[idx])
-            loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+    Per-update work is ~100 small kernels; eager launches left the GPU waiting on
+    the CPU. All step inputs live in static buffers: the rollout storage itself,
+    plus advantage/return copies and the minibatch index vector.
+    """
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_([*actor.parameters(), *critic.parameters()], grad_clip)
-            optimizer.step()
+    def __init__(self, actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer,
+                 storage: RolloutStorage, minibatch: int, clip: float, value_coef: float,
+                 grad_clip: float, use_graph: bool = True) -> None:
+        self.actor, self.critic, self.optimizer, self.storage = actor, critic, optimizer, storage
+        self.minibatch, self.clip, self.value_coef, self.grad_clip = minibatch, clip, value_coef, grad_clip
+        self.use_graph = use_graph
+        d = storage.device
+        self.params = [*actor.parameters(), *critic.parameters()]
+        self.idx = torch.zeros(minibatch, dtype=torch.int64, device=d)
+        self.entropy_coef = torch.zeros((), device=d)
+        # policy, value, entropy, kl, clipfrac, count, gostop entropy sum, gostop count
+        self.sums = torch.zeros(8, device=d)
+        self.kl = torch.zeros((), device=d)
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self._bind()
 
-            with torch.no_grad():
-                kl = ((ratio - 1) - log_ratio).mean()
-                clipfrac = ((ratio - 1).abs() > clip).float().mean()
-                sums += torch.stack((policy_loss.detach(), value_loss.detach(), entropy.detach(),
-                                     kl, clipfrac, torch.ones((), device=kl.device)))
-                g = gostop[idx]
-                gostop_entropy += torch.stack((entropy_rows[g].sum(), g.sum().float()))
-            updates += 1
-            if target_kl > 0 and updates % 8 == 0 and float(kl) > 1.5 * target_kl:
-                stop = True
+    def _bind(self) -> None:
+        self.bound = tuple(t.data_ptr() for t in self.storage.tensors)
+        self.adv = torch.zeros(self.storage.capacity, device=self.storage.device)
+        self.ret = torch.zeros(self.storage.capacity, device=self.storage.device)
+        self.graph = None
+
+    def _step(self) -> None:
+        features, legal_all, actions, logp_old, opp_hand, _, _ = self.storage.tensors
+        idx = self.idx
+        feats = features[idx]
+        legal = legal_all[idx]
+        adv = self.adv[idx]
+        ret = self.ret[idx]
+        with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+            logits = self.actor(feats).float()
+            value = self.critic(_critic_input(feats, opp_hand[idx])).float()
+        log_probs = torch.log_softmax(logits.masked_fill(~legal, -1.0e30), dim=1)
+        new_logp = log_probs.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
+        log_ratio = new_logp - logp_old[idx]
+        ratio = log_ratio.exp()
+        policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - self.clip, 1 + self.clip) * adv).mean()
+        entropy_rows = -(log_probs.exp() * log_probs).sum(dim=1)
+        entropy = entropy_rows.mean()
+        value_loss = F.smooth_l1_loss(value, ret)
+        loss = policy_loss - self.entropy_coef * entropy + self.value_coef * value_loss
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.params, self.grad_clip, foreach=True)
+        self.optimizer.step()
+        with torch.no_grad():
+            kl = ((ratio - 1) - log_ratio).mean()
+            self.kl.copy_(kl)
+            g = (feats[:, DECISION_OFFSET + GOSTOP_KIND] > 0.5).float()
+            self.sums += torch.stack((
+                policy_loss.detach(), value_loss.detach(), entropy.detach(), kl,
+                ((ratio - 1).abs() > self.clip).float().mean(), torch.ones_like(kl),
+                (entropy_rows.detach() * g).sum(), g.sum()))
+
+    def _run(self) -> None:
+        if not self.use_graph:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._step()
+            return
+        if self.graph is None:
+            saved = self.sums.clone()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):  # warm-up updates are real updates on the current minibatch
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self._step()
+            torch.cuda.current_stream().wait_stream(side)
+            self.optimizer.zero_grad(set_to_none=True)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self._step()
+            self.sums.copy_(saved)
+        self.graph.replay()
+
+    def update(self, data: Rollout, epochs: int, entropy_coef: float, target_kl: float) -> TrainStats:
+        if tuple(t.data_ptr() for t in self.storage.tensors) != self.bound:
+            self._bind()
+        n = data.actions.numel()
+        chunk = 65536
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            self.critic.eval()
+            values = torch.cat([
+                self.critic(_critic_input(data.features[i:i + chunk], data.opp_hand[i:i + chunk])).float()
+                for i in range(0, n, chunk)
+            ])
+        self.ret[:n].copy_(data.returns)
+        self.adv[:n].copy_(data.returns - values)
+        explained_var = 1.0 - float((data.returns - values).var() / data.returns.var().clamp_min(1e-8))
+
+        self.actor.train()
+        self.critic.train()
+        self.entropy_coef.fill_(entropy_coef)
+        self.sums.zero_()
+        updates = 0
+        stop = False
+        for _ in range(epochs):
+            perm = torch.randperm(n, device=self.idx.device)
+            for i in range(0, n - self.minibatch + 1, self.minibatch):
+                self.idx.copy_(perm[i:i + self.minibatch])
+                self._run()
+                updates += 1
+                if target_kl > 0 and updates % 8 == 0 and float(self.kl) > 1.5 * target_kl:
+                    stop = True
+                    break
+            if stop:
                 break
-        if stop:
-            break
 
-    s = (sums / sums[5].clamp_min(1)).tolist()
-    g_sum, g_count = gostop_entropy.tolist()
-    return TrainStats(
-        policy_loss=s[0], value_loss=s[1], entropy=s[2],
-        entropy_gostop=g_sum / g_count if g_count else float("nan"),
-        kl=s[3], clipfrac=s[4], explained_var=explained_var,
-        updates=updates, epochs=updates / max(1, n // minibatch),
-    )
+        s = self.sums.tolist()
+        count = max(1.0, s[5])
+        return TrainStats(
+            policy_loss=s[0] / count, value_loss=s[1] / count, entropy=s[2] / count,
+            entropy_gostop=s[6] / s[7] if s[7] else float("nan"),
+            kl=s[3] / count, clipfrac=s[4] / count, explained_var=explained_var,
+            updates=updates, epochs=updates / max(1, n // self.minibatch),
+        )
