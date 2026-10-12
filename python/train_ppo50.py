@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--entropy", type=float, default=0.05, help="entropy coef at start")
     parser.add_argument("--entropy-final", type=float, default=None, help="linear decay target")
     parser.add_argument("--value-coef", type=float, default=0.5)
+    parser.add_argument("--gae-lambda", type=float, default=0.95, help="1.0 = Monte-Carlo advantages")
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--reward-scale", type=float, default=32.0)
@@ -102,7 +103,7 @@ def main() -> None:
           f"critic_params={sum(p.numel() for p in critic.parameters())}")
     print(f"lr={args.lr:g} epochs={args.epochs} minibatch={args.minibatch} clip={args.clip:g} "
           f"entropy={args.entropy:g} entropy_final={args.entropy_final if args.entropy_final is not None else args.entropy:g} "
-          f"target_kl={args.target_kl:g} reward_scale={args.reward_scale:g}")
+          f"target_kl={args.target_kl:g} reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g}")
     config = vars(args) | {"algorithm": "ppo-oracle-critic-v1"}
     config = {k: (str(v) if isinstance(v, Path) or (isinstance(v, list) and v and isinstance(v[0], Path)) else v)
               for k, v in config.items()}
@@ -124,7 +125,7 @@ def main() -> None:
         if updater is None:
             updater = PpoUpdater(actor, critic, optimizer, storage, args.minibatch, args.clip,
                                  args.value_coef, args.grad_clip, use_graph=not args.no_graph)
-        stats = updater.update(data, args.epochs, entropy_coef, args.target_kl)
+        stats = updater.update(data, args.epochs, entropy_coef, args.target_kl, args.gae_lambda)
         torch.cuda.synchronize()
         t2 = time.perf_counter()
         total_games += data.games

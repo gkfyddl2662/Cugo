@@ -111,12 +111,12 @@ def collect(
     seeds, first = make_seeds(games, seed_offset, device)
     states = ext.create(seeds, first)
 
+    # One pool opponent per iteration: a forward pass per pool member every step
+    # made self-play slow down linearly as snapshots accumulated.
+    opponent_model = pool[int(torch.randint(len(pool), ()))] if pool and pool_fraction > 0.0 else None
     opponent = torch.full((games,), -1, dtype=torch.int64, device=device)
-    if pool and pool_fraction > 0.0:
-        use_pool = torch.rand(games, device=device) < pool_fraction
-        opponent = torch.where(
-            use_pool, torch.randint(len(pool), (games,), device=device), opponent
-        )
+    if opponent_model is not None:
+        opponent.masked_fill_(torch.rand(games, device=device) < pool_fraction, 0)
     learner_seat = torch.randint(2, (games,), device=device)
 
     final_reward0 = torch.zeros(games, device=device)
@@ -159,11 +159,10 @@ def collect(
             storage.append(features.index_select(0, rows), legal.index_select(0, rows),
                            a, logp, opp_hand, env_rows, seat)
 
-            other = ~learner
-            for k in range(len(pool)) if bool(other.any()) else ():
-                rows = torch.nonzero(other & (opp == k)).squeeze(1)
+            if opponent_model is not None:
+                rows = torch.nonzero(~learner).squeeze(1)
                 if rows.numel():
-                    a, _ = _act(pool[k], features.index_select(0, rows),
+                    a, _ = _act(opponent_model, features.index_select(0, rows),
                                 legal.index_select(0, rows), pool_greedy)
                     actions.index_copy_(0, rows, a)
 
@@ -294,7 +293,36 @@ class PpoUpdater:
             self.sums.copy_(saved)
         self.graph.replay()
 
-    def update(self, data: Rollout, epochs: int, entropy_coef: float, target_kl: float) -> TrainStats:
+    def _advantages(self, values: torch.Tensor, returns: torch.Tensor, lam: float) -> torch.Tensor:
+        """GAE(lambda), gamma=1, along each (game, seat) sequence of own decisions.
+
+        Rewards arrive only at the end, so delta_t = V(h_next_own) - V(h_t) and the
+        last decision bootstraps from the final score. lam=1 is the Monte-Carlo
+        advantage R - V(h_t).
+        """
+        if lam >= 1.0:
+            return returns - values
+        n = values.numel()
+        env_ids, seat = self.storage.tensors[5][:n], self.storage.tensors[6][:n]
+        order = torch.sort(env_ids * 2 + seat, stable=True).indices  # storage is step-major
+        key = (env_ids * 2 + seat)[order]
+        has_next = torch.zeros(n, dtype=torch.bool, device=values.device)
+        has_next[:-1] = key[1:] == key[:-1]
+        v = values[order]
+        delta = torch.where(has_next, v.roll(-1), returns[order]) - v
+        pos = torch.arange(n, device=values.device)
+        last = torch.where(has_next, n, pos).flip(0).cummin(0).values.flip(0)
+        to_end = last - pos
+        adv = torch.zeros_like(v)
+        for d in range(int(to_end.max()) + 1):
+            rows = torch.nonzero(to_end == d).squeeze(1)
+            adv[rows] = delta[rows] + (lam * adv[rows + 1] if d else 0.0)
+        out = torch.empty_like(adv)
+        out[order] = adv
+        return out
+
+    def update(self, data: Rollout, epochs: int, entropy_coef: float, target_kl: float,
+               gae_lambda: float = 1.0) -> TrainStats:
         if tuple(t.data_ptr() for t in self.storage.tensors) != self.bound:
             self._bind()
         n = data.actions.numel()
@@ -305,8 +333,9 @@ class PpoUpdater:
                 self.critic(_critic_input(data.features[i:i + chunk], data.opp_hand[i:i + chunk])).float()
                 for i in range(0, n, chunk)
             ])
-        self.ret[:n].copy_(data.returns)
-        self.adv[:n].copy_(data.returns - values)
+        advantages = self._advantages(values, data.returns, gae_lambda)
+        self.adv[:n].copy_(advantages)
+        self.ret[:n].copy_(advantages + values)
         explained_var = 1.0 - float((data.returns - values).var() / data.returns.var().clamp_min(1e-8))
 
         self.actor.train()
