@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cugo_ppo_nets50 import card_plane
+from cugo_ppo_nets50 import ACTIONS, FEATURES, card_plane
 from cugo_train50 import make_seeds
 
 GOSTOP_KIND = 2  # decision-kind one-hot index for Go/Stop
@@ -24,8 +24,8 @@ DECISION_OFFSET = 446
 
 @dataclass
 class Rollout:
-    features: torch.Tensor  # [N, 496] bf16
-    legal: torch.Tensor  # [N, 177] bool
+    features: torch.Tensor  # [N, FEATURES] bf16
+    legal: torch.Tensor  # [N, ACTIONS] bool
     actions: torch.Tensor  # [N] int64
     logp: torch.Tensor  # [N] fp32, behaviour log-prob
     opp_hand: torch.Tensor  # [N] int64 card mask
@@ -70,8 +70,8 @@ class RolloutStorage:
         old = self.__dict__.get("tensors")
         d = self.device
         self.tensors = (
-            torch.empty((capacity, 496), dtype=torch.bfloat16, device=d),
-            torch.empty((capacity, 177), dtype=torch.bool, device=d),
+            torch.empty((capacity, FEATURES), dtype=torch.bfloat16, device=d),
+            torch.empty((capacity, ACTIONS), dtype=torch.bool, device=d),
             torch.empty(capacity, dtype=torch.int64, device=d),
             torch.empty(capacity, dtype=torch.float32, device=d),
             torch.empty(capacity, dtype=torch.int64, device=d),

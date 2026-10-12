@@ -89,7 +89,7 @@ int main() {
   delete[] host;
   check_cuda(cudaFree(device), "cudaFree");
 
-  if (terminal + nagari != kSamples || resolve_choices == 0 || pi_choices == 0) {
+  if (terminal + nagari != kSamples || resolve_choices == 0 || pi_choices != 0) {
     std::cerr << "cugo_cuda_postchance50_test: FAIL coverage"
               << " terminal=" << terminal
               << " nagari=" << nagari

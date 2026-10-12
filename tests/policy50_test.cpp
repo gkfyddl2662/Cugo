@@ -1,3 +1,5 @@
+// Tests rely on assert(); keep it active in Release builds.
+#undef NDEBUG
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -70,6 +72,7 @@ void test_legal_actions_apply() {
 void test_rollout_policy_roundtrip() {
   std::uint64_t decisions = 0;
   std::uint64_t legal_total = 0;
+  std::uint64_t gukjin_prompts = 0;
   std::uint64_t terminal = 0;
   std::uint64_t nagari = 0;
 
@@ -84,7 +87,7 @@ void test_rollout_policy_roundtrip() {
         break;
       }
       if (!terminal50_has_chongtong_choice(state) &&
-          !game50_has_pending_decision(state.special.game) &&
+          !game50_has_pending_choice(state.special.game) &&
           rollout_hands_exhausted50(state)) {
         ++nagari;
         break;
@@ -94,9 +97,16 @@ void test_rollout_policy_roundtrip() {
       const CanonicalAction50 canonical = canonical_action50(state);
       assert(canonical.status == ActionStatus50::kOk);
       const std::uint16_t index = primary_action_index50(canonical.action);
-      assert(index < kPolicyActionCount50);
-      assert(has_policy_action50(packet.legal_actions, index));
-      legal_total += policy_action_count50(packet.legal_actions);
+      if (policy_decision_kind50(state) == PolicyDecision50::kGukjin) {
+        // The gukjin prompt answers live outside the 127-wide primary mask.
+        assert(index == kPolicyGukjinPi50);
+        assert(policy_action_count50(packet.legal_actions) == 0);
+        ++gukjin_prompts;
+      } else {
+        assert(index < kPolicyActionCount50);
+        assert(has_policy_action50(packet.legal_actions, index));
+        legal_total += policy_action_count50(packet.legal_actions);
+      }
 
       Action50 decoded = kInvalidAction50;
       assert(decode_primary_action50(state, index, decoded) == ActionStatus50::kOk);
@@ -107,10 +117,12 @@ void test_rollout_policy_roundtrip() {
   }
 
   assert(decisions != 0);
+  assert(gukjin_prompts != 0);
   assert(terminal + nagari == 16384);
   std::cout << "cugo_policy50_test: PASS (decisions=" << decisions
             << " terminal=" << terminal
             << " nagari=" << nagari
+            << " gukjin=" << gukjin_prompts
             << " avg_legal="
             << static_cast<double>(legal_total) / static_cast<double>(decisions)
             << " packet_bytes=" << sizeof(PolicyPacket50) << ")\n";

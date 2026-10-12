@@ -33,7 +33,7 @@ __host__ __device__ Probe make_probe(std::uint32_t index) {
   for (std::uint16_t step = 0; step < target; ++step) {
     if (terminal50_is_finished(state)) break;
     if (!terminal50_has_chongtong_choice(state) &&
-        !game50_has_pending_decision(state.special.game) &&
+        !game50_has_pending_choice(state.special.game) &&
         rollout_hands_exhausted50(state)) break;
     const CanonicalAction50 canonical = canonical_action50(state);
     if (canonical.status != ActionStatus50::kOk) {

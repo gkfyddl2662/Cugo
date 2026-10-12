@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from cugo_eval50 import evaluate_paired, load_policy_checkpoint
+from cugo_ppo_nets50 import ACTIONS, FEATURES
 from cugo_torch50_ext import load_extension
 
 
@@ -30,7 +31,7 @@ def main() -> None:
     device = torch.device("cuda")
     use_amp = not args.no_amp
     ext = load_extension(verbose=args.verbose_build)
-    if int(ext.FEATURE_COUNT) != 496 or int(ext.ACTION_COUNT) != 177:
+    if int(ext.FEATURE_COUNT) != FEATURES or int(ext.ACTION_COUNT) != ACTIONS:
         raise RuntimeError("extension constants do not match the frozen Torch50 contract")
 
     a = load_policy_checkpoint(args.a_checkpoint, args.a_policy, device)

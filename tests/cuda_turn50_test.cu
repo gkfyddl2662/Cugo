@@ -19,8 +19,8 @@ using cugo::game::TurnStateSoA50;
 
 constexpr int kThreads = 256;
 constexpr int kTargetedGames = 2;
-constexpr int kU64Fields = 8;
-constexpr int kU16Fields = 5;
+constexpr int kU64Fields = 9;
+constexpr int kU16Fields = 6;
 constexpr int kU8Fields = 4;
 
 struct BonusSnapshot {
@@ -59,6 +59,8 @@ TurnStateSoA50 make_view(std::uint64_t* u64,
       u8 + games * 1,
       u8 + games * 2,
       u8 + games * 3,
+      u64 + games * 8,
+      u16 + games * 5,
   };
 }
 
@@ -229,7 +231,9 @@ bool same_state(const TurnState50& a, const TurnState50& b) {
          a.bonus3_ppuk_months == b.bonus3_ppuk_months &&
          a.turn_index == b.turn_index && a.actor == b.actor &&
          a.phase == b.phase && a.pending_played == b.pending_played &&
-         a.pending_drawn == b.pending_drawn;
+         a.pending_drawn == b.pending_drawn &&
+         a.mission_cards == b.mission_cards &&
+         a.neutral_ppuk_months == b.neutral_ppuk_months;
 }
 
 bool same_result(const ResolveSnapshot& gpu, const Resolve50Result& cpu) {

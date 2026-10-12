@@ -5,7 +5,7 @@ This layer freezes the engine-to-network contract without making the core engine
 
 ## Unified action space
 
-The policy head has 177 logits.
+The policy head has 179 logits: 177 legacy actions plus the Gukjin answers 177 (double pi) and 178 (animal).
 
 - `0..126`: the existing packed primary policy actions from `policy50.h`.
 - `127..176`: post-chance physical-card choices for card ids `0..49`.
@@ -16,7 +16,7 @@ This means one network head can handle ordinary play, bonus play, shake/bomb/gre
 
 ## Dense feature layout
 
-`kTorch50FeatureCount = 496` floats. Features are always in `[0, 1]`. The first 479 are semantic and the final 17 are zero padding so the width is divisible by 16.
+`kTorch50FeatureCount = 560` floats. The first 479 are semantic and 479..495 are zero padding (the legacy 496-wide block). Hangame features are appended so old networks can be widened with zero weights (`python/migrate_ppo50.py`): 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`.
 
 | Range | Size | Meaning |
 | --- | ---: | --- |
@@ -33,10 +33,10 @@ The scalar block contains turn/stock counts, both players' Go/base-score/bomb/cr
 
 `TorchEnv50` keeps the authoritative `TerminalGameState50` plus `PostChancePending50`. `torch_step50()` accepts one unified action id and handles both primary actions and post-chance card selections transactionally.
 
-The environment returns reward from player 0's perspective only when the game reaches a terminal settlement. Nagari returns zero. Training code can negate the reward for player 1 or use the observation's player-relative features.
+The environment returns reward from player 0's perspective only when the game reaches a terminal settlement. Nagari returns only the event payments already made (ppuk chain, first-turn ttadak). Training code can negate the reward for player 1 or use the observation's player-relative features.
 
 ## Correctness contract
 
 The CPU test runs 8,192 full games through this environment and requires the rollout digest and post-chance choice counts to match the existing explicit post-chance driver. The CUDA test runs 65,536 full-game differential samples plus 4,096 CPU/GPU feature-and-mask differential samples.
 
-No PyTorch dependency is required for these tests. The next integration layer can wrap this fixed 496-float / 177-action contract in a PyTorch CUDA extension without changing game semantics.
+No PyTorch dependency is required for these tests. The next integration layer can wrap this fixed 560-float / 179-action contract in a PyTorch CUDA extension without changing game semantics.

@@ -65,7 +65,7 @@ struct PostChanceProbe50 {
   std::uint8_t requested_pi;
 };
 
-static_assert(sizeof(PostChancePacket50) <= 128,
+static_assert(sizeof(PostChancePacket50) <= 160,
               "post-chance packet should stay cache friendly");
 
 CUGO_HD inline PostChancePacket50 empty_postchance_packet50() noexcept {
@@ -82,6 +82,15 @@ CUGO_HD inline ActionStatus50 decode_primary_action50_raw(
     const TerminalGameState50& state,
     std::uint16_t index,
     Action50& action) noexcept {
+  if (index == kPolicyGukjinPi50 || index == kPolicyGukjinAnimal50) {
+    if (policy_decision_kind50(state) != PolicyDecision50::kGukjin) {
+      action = kInvalidAction50;
+      return ActionStatus50::kNotLegal;
+    }
+    action = make_action50(index == kPolicyGukjinPi50 ? ActionKind50::kGukjinPi
+                                                      : ActionKind50::kGukjinAnimal);
+    return ActionStatus50::kOk;
+  }
   const PolicyActionMask50 legal = legal_primary_actions50(state);
   if (!has_policy_action50(legal, index)) {
     action = kInvalidAction50;
@@ -148,9 +157,9 @@ CUGO_HD inline ResolveChoiceProbe50 probe_resolve_choices50(
   const CardMask played_matches = floor_matches50(state, played);
   const int played_match_count = core::card_count(played_matches);
   const bool same_month = core::card_month(played) == core::card_month(drawn);
-  const bool final_stock_flip = state.stock == 0;
+  const bool last_turn = is_last_turn50(state);
 
-  if (same_month && played_match_count == 1 && !final_stock_flip) {
+  if (same_month && played_match_count == 1 && !last_turn) {
     return ResolveChoiceProbe50{Resolve50Status::kOk,
                                 PostChanceDecision50::kNone, 0};
   }
@@ -213,8 +222,9 @@ CUGO_HD inline PostChanceProbe50 probe_pi_choice50(
                              revealed_card, requested_pi};
   }
 
-  if (requested_pi == 0 || available <= requested_pi) {
-    if (pending.selected_pi != 0) {
+  if (requested_pi == 0 || available <= requested_pi || pending.selected_pi == 0) {
+    // Hangame chooses stolen pi automatically (hangame_pi_steal_selection50).
+    if (pending.selected_pi != 0 && (requested_pi == 0 || available <= requested_pi)) {
       return PostChanceProbe50{ActionStatus50::kInvalidPiSelection,
                                PostChanceDecision50::kNone, 0,
                                revealed_card, requested_pi};
@@ -421,6 +431,8 @@ CUGO_HD inline PostChanceProbe50 probe_postchance50(
     case ActionKind50::kStop:
     case ActionKind50::kChongtongWin:
     case ActionKind50::kChongtongContinue:
+    case ActionKind50::kGukjinPi:
+    case ActionKind50::kGukjinAnimal:
       staged = state;
       return PostChanceProbe50{ActionStatus50::kOk,
                                PostChanceDecision50::kNone, 0,
@@ -590,7 +602,7 @@ CUGO_HD inline PostChanceRollout50 rollout_canonical_postchance50(
     }
 
     if (!terminal50_has_chongtong_choice(state) &&
-        !game50_has_pending_decision(state.special.game) &&
+        !game50_has_pending_choice(state.special.game) &&
         rollout_hands_exhausted50(state)) {
       const RolloutResult50 result{
           RolloutEnd50::kNagari,
@@ -604,7 +616,7 @@ CUGO_HD inline PostChanceRollout50 rollout_canonical_postchance50(
           special_actions,
           go_actions,
           0,
-          0};
+          nagari_reward50(state, 0)};
       return finish_postchance_rollout50(result, resolve_choices, pi_choices);
     }
 

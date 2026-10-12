@@ -43,6 +43,8 @@ struct GameState50 {
   std::uint8_t last_go_base_score1;
   std::uint8_t decision_actor;
   std::uint8_t winner;
+  // Pending Gukjin role prompt: 0 = none, otherwise player + 1.
+  std::uint8_t gukjin_decision;
 };
 
 struct GameResolve50Result {
@@ -61,12 +63,31 @@ CUGO_HOST_DEVICE inline GameState50 make_game_state50(
                      0,
                      0,
                      kNoGame50Player,
-                     kNoGame50Player};
+                     kNoGame50Player,
+                     0};
 }
 
 CUGO_HOST_DEVICE inline bool game50_has_pending_decision(
     const GameState50& state) noexcept {
   return state.decision_actor <= 1u;
+}
+
+CUGO_HOST_DEVICE inline bool game50_has_gukjin_decision(
+    const GameState50& state) noexcept {
+  return state.gukjin_decision != 0;
+}
+
+CUGO_HOST_DEVICE inline std::uint8_t game50_gukjin_actor(
+    const GameState50& state) noexcept {
+  return state.gukjin_decision != 0
+             ? static_cast<std::uint8_t>(state.gukjin_decision - 1u)
+             : kNoGame50Player;
+}
+
+// Any prompt (Go/Stop or Gukjin role) that must be answered before play resumes.
+CUGO_HOST_DEVICE inline bool game50_has_pending_choice(
+    const GameState50& state) noexcept {
+  return game50_has_pending_decision(state) || game50_has_gukjin_decision(state);
 }
 
 CUGO_HOST_DEVICE inline bool game50_is_finished(
@@ -132,11 +153,14 @@ CUGO_HOST_DEVICE inline GoAdjustedScore50 go_adjusted_score_player50(
                              go_count_for_player50(state, player));
 }
 
+// SingleServer GFADGFKNBBD. Reaching the threshold on one of the last two turns
+// (completed turn 19 or 20) stops automatically instead of asking. Before asking,
+// the opponent's undecided Gukjin is settled in the opponent's favour.
 CUGO_HOST_DEVICE inline bool maybe_open_go_stop_decision50(
     GameState50& state,
     std::uint8_t completed_actor) noexcept {
   if (completed_actor > 1u || game50_is_finished(state) ||
-      game50_has_pending_decision(state)) {
+      game50_has_pending_choice(state)) {
     return false;
   }
 
@@ -148,8 +172,42 @@ CUGO_HOST_DEVICE inline bool maybe_open_go_stop_decision50(
           : base_score > last_go_base_score_for_player50(state, completed_actor);
   if (!eligible) return false;
 
+  auto_decide_loser_gukjin50(state.turn,
+                             static_cast<std::uint8_t>(completed_actor ^ 1u));
+  if (state.turn.turn_index > kLastTurnIndex50) {
+    state.winner = completed_actor;
+    return false;
+  }
   state.decision_actor = completed_actor;
   return true;
+}
+
+// SingleServer JMAFCGKLNMB: after a completed turn the actor is first asked about
+// Gukjin (when due), and only then checked for Go/Stop.
+CUGO_HOST_DEVICE inline bool finish_turn_game50(GameState50& state,
+                                                std::uint8_t completed_actor) noexcept {
+  if (completed_actor > 1u || game50_is_finished(state) ||
+      game50_has_pending_choice(state)) {
+    return false;
+  }
+  if (gukjin_prompt_due50(state.turn, completed_actor,
+                          go_count_for_player50(state, completed_actor))) {
+    state.gukjin_decision = static_cast<std::uint8_t>(completed_actor + 1u);
+    return true;
+  }
+  return maybe_open_go_stop_decision50(state, completed_actor);
+}
+
+CUGO_HOST_DEVICE inline GoStopStatus50 apply_gukjin_decision50(
+    GameState50& state,
+    bool as_pi) noexcept {
+  if (game50_is_finished(state)) return GoStopStatus50::kGameFinished;
+  if (!game50_has_gukjin_decision(state)) return GoStopStatus50::kNoDecisionPending;
+  const std::uint8_t actor = game50_gukjin_actor(state);
+  decide_gukjin50(state.turn, actor, as_pi);
+  state.gukjin_decision = 0;
+  maybe_open_go_stop_decision50(state, actor);
+  return GoStopStatus50::kOk;
 }
 
 CUGO_HOST_DEVICE inline GoStopStatus50 apply_go_stop_decision50(
@@ -165,6 +223,7 @@ CUGO_HOST_DEVICE inline GoStopStatus50 apply_go_stop_decision50(
 
   const std::uint8_t actor = state.decision_actor;
   if (action == GoStopAction50::kStop) {
+    auto_decide_loser_gukjin50(state.turn, static_cast<std::uint8_t>(actor ^ 1u));
     state.winner = actor;
     state.decision_actor = kNoGame50Player;
     return GoStopStatus50::kOk;
@@ -185,14 +244,14 @@ CUGO_HOST_DEVICE inline GoStopStatus50 apply_go_stop_decision50(
 CUGO_HOST_DEVICE inline Turn50Status begin_regular_play_game50(
     GameState50& state,
     CardId card) noexcept {
-  if (game50_is_finished(state) || game50_has_pending_decision(state))
+  if (game50_is_finished(state) || game50_has_pending_choice(state))
     return Turn50Status::kWrongPhase;
   return begin_regular_play50(state.turn, card);
 }
 
 CUGO_HOST_DEVICE inline Turn50Status draw_for_game50(
     GameState50& state) noexcept {
-  if (game50_is_finished(state) || game50_has_pending_decision(state))
+  if (game50_is_finished(state) || game50_has_pending_choice(state))
     return Turn50Status::kWrongPhase;
   return draw_for_turn50(state.turn);
 }
@@ -201,7 +260,7 @@ CUGO_HOST_DEVICE inline BonusPlay50WithPiResult play_bonus_for_game50_with_pi_tr
     GameState50& state,
     CardId bonus,
     PiTransferSelection pi_selection = kNoPiTransferSelection) noexcept {
-  if (game50_is_finished(state) || game50_has_pending_decision(state)) {
+  if (game50_is_finished(state) || game50_has_pending_choice(state)) {
     return BonusPlay50WithPiResult{
         Turn50BonusPlayResult{Turn50Status::kWrongPhase, core::kInvalidCard, 0},
         no_pi_transfer_result()};
@@ -213,7 +272,7 @@ CUGO_HOST_DEVICE inline GameResolve50Result resolve_game_turn50_with_pi_transfer
     GameState50& state,
     Resolve50Choices resolve_choices = kNoResolve50Choices,
     PiTransferSelection pi_selection = kNoPiTransferSelection) noexcept {
-  if (game50_is_finished(state) || game50_has_pending_decision(state)) {
+  if (game50_is_finished(state) || game50_has_pending_choice(state)) {
     return GameResolve50Result{
         Resolve50WithPiResult{
             Resolve50Result{Resolve50Status::kWrongPhase,
@@ -237,7 +296,7 @@ CUGO_HOST_DEVICE inline GameResolve50Result resolve_game_turn50_with_pi_transfer
   }
 
   const std::uint8_t base_score = game50_base_score(next, completed_actor);
-  const bool opened = maybe_open_go_stop_decision50(next, completed_actor);
+  const bool opened = finish_turn_game50(next, completed_actor);
   state = next;
   return GameResolve50Result{result,
                              completed_actor,
@@ -251,7 +310,14 @@ CUGO_HOST_DEVICE inline bool is_valid_game_state50(
   if (state.decision_actor != kNoGame50Player && state.decision_actor > 1u)
     return false;
   if (state.winner != kNoGame50Player && state.winner > 1u) return false;
-  if (game50_is_finished(state) && game50_has_pending_decision(state)) return false;
+  if (game50_is_finished(state) && game50_has_pending_choice(state)) return false;
+  if (state.gukjin_decision > 2u) return false;
+  if (game50_has_gukjin_decision(state)) {
+    if (game50_has_pending_decision(state)) return false;
+    if (state.turn.phase != Turn50Phase::kPlay) return false;
+    const std::uint8_t actor = game50_gukjin_actor(state);
+    if (actor == state.turn.actor || !gukjin_undecided50(state.turn, actor)) return false;
+  }
 
   if (state.go_count0 == 0 && state.last_go_base_score0 != 0) return false;
   if (state.go_count1 == 0 && state.last_go_base_score1 != 0) return false;

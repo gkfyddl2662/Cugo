@@ -199,7 +199,7 @@ int main() {
   check_cuda(cudaFree(device), "cudaFree rollout");
 
   if (terminal + nagari != kSamples || choice_actions == 0 ||
-      resolve_choices == 0 || pi_choices == 0) {
+      resolve_choices == 0 || pi_choices != 0) {
     std::cerr << "cugo_cuda_torch50_test: FAIL coverage"
               << " terminal=" << terminal
               << " nagari=" << nagari

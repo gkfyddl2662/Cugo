@@ -36,8 +36,23 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
                           static_cast<std::uint8_t>(terminal)};
   }
 
+  if (action.kind == ActionKind50::kGukjinPi ||
+      action.kind == ActionKind50::kGukjinAnimal) {
+    const GoStopStatus50 status = apply_terminal_gukjin_decision50(
+        next, action.kind == ActionKind50::kGukjinPi);
+    if (status != GoStopStatus50::kOk) {
+      return action_error50(action, ActionStatus50::kNotLegal, actor);
+    }
+    const bool decision = game50_has_pending_choice(next.special.game);
+    const bool terminal = terminal50_is_finished(next);
+    state = next;
+    return ActionResult50{ActionStatus50::kOk, action.kind, actor, 0,
+                          static_cast<std::uint8_t>(decision),
+                          static_cast<std::uint8_t>(terminal)};
+  }
+
   if (terminal50_has_chongtong_choice(next) ||
-      game50_has_pending_decision(next.special.game)) {
+      game50_has_pending_choice(next.special.game)) {
     return action_error50(action, ActionStatus50::kWrongPhase, actor);
   }
 
@@ -67,7 +82,7 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
     const ActionStatus50 status = map_special_status50(result.special_result.status);
     if (status != ActionStatus50::kOk)
       return action_error50(action, status, actor);
-    const bool decision = game50_has_pending_decision(next.special.game);
+    const bool decision = game50_has_pending_choice(next.special.game);
     const bool terminal = terminal50_is_finished(next);
     state = next;
     return ActionResult50{ActionStatus50::kOk, action.kind, actor, 1,
@@ -92,7 +107,7 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
       status = map_pi_status50(resolved.game_result.turn_result.pi_transfer.status);
     if (status != ActionStatus50::kOk)
       return action_error50(action, status, actor);
-    const bool decision = game50_has_pending_decision(next.special.game);
+    const bool decision = game50_has_pending_choice(next.special.game);
     const bool terminal = terminal50_is_finished(next);
     state = next;
     return ActionResult50{ActionStatus50::kOk, action.kind, actor, 1,
@@ -101,6 +116,12 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
   }
 
   if (action.kind == ActionKind50::kPlayCard) {
+    // A card of a bomb/grenade month can only be played as that bomb/grenade.
+    if (core::is_standard_card(action.card) &&
+        (forced_special_months50(next.special) &
+         static_cast<std::uint16_t>(std::uint16_t{1} << core::card_month(action.card))) != 0) {
+      return action_error50(action, ActionStatus50::kNotLegal, actor);
+    }
     ActionStatus50 status = map_turn_status50(begin_regular_play_terminal50(next, action.card));
     if (status != ActionStatus50::kOk)
       return action_error50(action, status, actor);
@@ -114,7 +135,7 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
       status = map_pi_status50(resolved.game_result.turn_result.pi_transfer.status);
     if (status != ActionStatus50::kOk)
       return action_error50(action, status, actor);
-    const bool decision = game50_has_pending_decision(next.special.game);
+    const bool decision = game50_has_pending_choice(next.special.game);
     const bool terminal = terminal50_is_finished(next);
     state = next;
     return ActionResult50{ActionStatus50::kOk, action.kind, actor, 1,

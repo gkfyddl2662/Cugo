@@ -1,3 +1,5 @@
+// Tests rely on assert(); keep it active in Release builds.
+#undef NDEBUG
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -54,23 +56,24 @@ void test_selection_boundary_and_transfer() {
 
   TurnState50 state{};
   state.captured1 = card_bit(first) | card_bit(second);
-  const auto before = state;
-
-  auto result = apply_pi_steal50(state, 0, 1);
-  assert(result.status == PiTransferStatus::kSelectionRequired);
+  // Hangame picks the stolen pi itself: cheapest first, ties by card id.
+  TurnState50 automatic = state;
+  auto result = apply_pi_steal50(automatic, 0, 1);
+  assert(result.status == PiTransferStatus::kOk);
   assert(result.requested_cards == 1);
   assert(result.available_cards == 2);
-  assert(same_state(state, before));
+  assert(result.transferred_mask == card_bit(first));
 
+  // An explicit selection is still honored.
   result = apply_pi_steal50(
-      state, 0, 1, PiTransferSelection{card_bit(first)});
+      state, 0, 1, PiTransferSelection{card_bit(second)});
   assert(result.status == PiTransferStatus::kOk);
   assert(result.transferred_cards == 1);
   assert(result.transferred_pi_units == 1);
-  assert(result.transferred_mask == card_bit(first));
-  assert((state.captured0 & card_bit(first)) != 0);
-  assert((state.captured1 & card_bit(first)) == 0);
-  assert((state.captured1 & card_bit(second)) != 0);
+  assert(result.transferred_mask == card_bit(second));
+  assert((state.captured0 & card_bit(second)) != 0);
+  assert((state.captured1 & card_bit(second)) == 0);
+  assert((state.captured1 & card_bit(first)) != 0);
 }
 
 void test_invalid_selection_is_transactional() {
@@ -134,7 +137,7 @@ void test_bonus_and_gukjin_pi_values_follow_selected_card() {
   assert(gukjin_state.captured0 == card_bit(kGukjin));
 }
 
-void test_resolve_wrapper_is_transactional_on_pi_selection() {
+void test_resolve_wrapper_pi_selection() {
   using namespace cugo::core;
   using namespace cugo::game;
   const CardId first = make_card(2, 2);
@@ -154,13 +157,13 @@ void test_resolve_wrapper_is_transactional_on_pi_selection() {
                 ~(state.floor | state.captured1 | card_bit(played) |
                   card_bit(drawn));
   assert(is_valid_turn_state50(state));
-  const auto before = state;
-
-  auto result = resolve_turn50_with_pi_transfer(state);
+  // Without a selection Hangame steals the cheapest pi, ties by card id.
+  TurnState50 automatic = state;
+  auto result = resolve_turn50_with_pi_transfer(automatic);
   assert(result.resolve.status == Resolve50Status::kOk);
   assert((result.resolve.events & kResolve50EventJjok) != 0);
-  assert(result.pi_transfer.status == PiTransferStatus::kSelectionRequired);
-  assert(same_state(state, before));
+  assert(result.pi_transfer.status == PiTransferStatus::kOk);
+  assert(result.pi_transfer.transferred_mask == card_bit(first));
 
   result = resolve_turn50_with_pi_transfer(
       state,
@@ -204,7 +207,7 @@ int main() {
   test_invalid_selection_is_transactional();
   test_take_all_when_victim_has_too_few_pi_cards();
   test_bonus_and_gukjin_pi_values_follow_selected_card();
-  test_resolve_wrapper_is_transactional_on_pi_selection();
+  test_resolve_wrapper_pi_selection();
   test_hand_bonus_wrapper_applies_one_pi_steal();
   std::cout << "cugo_pi_transfer_test: PASS\n";
   return 0;

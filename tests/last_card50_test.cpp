@@ -1,3 +1,5 @@
+// Tests rely on assert(); keep it active in Release builds.
+#undef NDEBUG
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -39,6 +41,8 @@ cugo::game::TurnState50 make_resolve_fixture(
   state.phase = Turn50Phase::kResolve;
   state.pending_played = played;
   state.pending_drawn = drawn;
+  // Hangame's final hand cards are turns 19/20 (turn_index >= 18).
+  state.turn_index = final_stock_flip ? kLastTurnIndex50 : 0;
   assert(is_valid_turn_state50(state));
   return state;
 }

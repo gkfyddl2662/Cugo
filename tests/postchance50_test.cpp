@@ -122,7 +122,8 @@ int main() {
     test_full_rollout_equivalence(resolve_choices, pi_choices);
     test_packet_contract();
     require(resolve_choices != 0, "must exercise resolve choices");
-    require(pi_choices != 0, "must exercise pi choices");
+    // Hangame picks stolen pi automatically, so no pi-card decision may appear.
+    require(pi_choices == 0, "pi steals must be automatic");
     std::cout << "cugo_postchance50_test: PASS (8192 explicit rollouts; resolve_choices="
               << resolve_choices << " pi_choices=" << pi_choices
               << " packet_bytes=" << sizeof(PostChancePacket50) << ")\n";

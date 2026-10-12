@@ -1,3 +1,5 @@
+// Tests rely on assert(); keep it active in Release builds.
+#undef NDEBUG
 #include <cassert>
 #include <cstdint>
 #include <iostream>

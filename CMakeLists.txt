@@ -72,6 +72,10 @@ if(BUILD_TESTING)
   add_executable(cugo_torch50_test tests/torch50_test.cpp)
   target_link_libraries(cugo_torch50_test PRIVATE cugo_core)
   add_test(NAME cugo_torch50_test COMMAND cugo_torch50_test)
+
+  add_executable(cugo_hangame_rules50_test tests/hangame_rules50_test.cpp)
+  target_link_libraries(cugo_hangame_rules50_test PRIVATE cugo_core)
+  add_test(NAME cugo_hangame_rules50_test COMMAND cugo_hangame_rules50_test)
 endif()
 
 if(CUGO_ENABLE_CUDA)

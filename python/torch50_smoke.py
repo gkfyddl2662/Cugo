@@ -107,7 +107,7 @@ def main() -> None:
         f"extension state_bytes={ext.STATE_BYTES} features={ext.FEATURE_COUNT} "
         f"actions={ext.ACTION_COUNT} primary={ext.PRIMARY_ACTION_COUNT}"
     )
-    if int(ext.FEATURE_COUNT) != 496 or int(ext.ACTION_COUNT) != 177:
+    if int(ext.FEATURE_COUNT) != 560 or int(ext.ACTION_COUNT) != 179:
         raise RuntimeError("extension constants do not match the frozen Torch50 contract")
 
     torch.manual_seed(12345)

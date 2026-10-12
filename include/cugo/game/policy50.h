@@ -27,11 +27,18 @@ inline constexpr std::uint16_t kInvalidPolicyAction50 = 0xffffu;
 
 static_assert(kPolicyChongtongContinue50 + 1u == kPolicyActionCount50);
 
+// Gukjin role prompt answers. They sit after the card-choice actions in the unified
+// torch action space (127 primary + 50 card choices), so they are not part of the
+// 127-bit primary mask.
+inline constexpr std::uint16_t kPolicyGukjinPi50 = 177;
+inline constexpr std::uint16_t kPolicyGukjinAnimal50 = 178;
+
 enum class PolicyDecision50 : std::uint8_t {
   kNone = 0,
   kPrimary = 1,
   kGoStop = 2,
   kChongtong = 3,
+  kGukjin = 7,
 };
 
 struct PolicyActionMask50 {
@@ -75,6 +82,18 @@ struct PolicyObservation50 {
   std::uint8_t opponent_ppuk_streak;
   std::uint8_t own_gukjin_double_pi;
   std::uint8_t opponent_gukjin_double_pi;
+
+  // Hangame Shin Matgo extensions.
+  CardMask mission_cards;
+  std::int32_t own_side_points;
+  std::uint8_t mission_type;
+  std::uint8_t mission_multiplier;
+  std::uint8_t own_mission_multi;
+  std::uint8_t opponent_mission_multi;
+  std::uint8_t own_gukjin_locked;
+  std::uint8_t opponent_gukjin_locked;
+  std::uint8_t round_multiplier;
+  std::uint8_t last_turn;
 };
 
 struct PolicyPacket50 {
@@ -110,6 +129,7 @@ CUGO_HD inline PolicyDecision50 policy_decision_kind50(
     const TerminalGameState50& state) noexcept {
   if (terminal50_is_finished(state)) return PolicyDecision50::kNone;
   if (terminal50_has_chongtong_choice(state)) return PolicyDecision50::kChongtong;
+  if (game50_has_gukjin_decision(state.special.game)) return PolicyDecision50::kGukjin;
   if (game50_has_pending_decision(state.special.game)) return PolicyDecision50::kGoStop;
   if (state.special.game.turn.phase == Turn50Phase::kPlay)
     return PolicyDecision50::kPrimary;
@@ -120,6 +140,8 @@ CUGO_HD inline std::uint8_t policy_decision_player50(
     const TerminalGameState50& state) noexcept {
   if (terminal50_is_finished(state)) return kNoTerminal50Player;
   if (terminal50_has_chongtong_choice(state)) return state.pending_chongtong_actor;
+  if (game50_has_gukjin_decision(state.special.game))
+    return game50_gukjin_actor(state.special.game);
   if (game50_has_pending_decision(state.special.game))
     return state.special.game.decision_actor;
   return state.special.game.turn.actor;
@@ -147,9 +169,12 @@ CUGO_HD inline PolicyActionMask50 legal_primary_actions50(
   const CardMask hand = active_hand50(turn);
   if (turn.stock == 0) return mask;
 
+  const std::uint16_t forced = forced_special_months50(state.special);
   CardMask standard = hand & core::kStandardDeckMask;
   while (standard != 0) {
     const CardId card = core::pop_first_card(standard);
+    if ((forced & static_cast<std::uint16_t>(std::uint16_t{1} << core::card_month(card))) != 0)
+      continue;
     set_policy_action50(mask, static_cast<std::uint16_t>(card));
   }
 
@@ -216,6 +241,8 @@ CUGO_HD inline std::uint16_t primary_action_index50(
     case ActionKind50::kStop: return kPolicyStop50;
     case ActionKind50::kChongtongWin: return kPolicyChongtongWin50;
     case ActionKind50::kChongtongContinue: return kPolicyChongtongContinue50;
+    case ActionKind50::kGukjinPi: return kPolicyGukjinPi50;
+    case ActionKind50::kGukjinAnimal: return kPolicyGukjinAnimal50;
     default: return kInvalidPolicyAction50;
   }
 }
@@ -224,6 +251,15 @@ CUGO_HD inline ActionStatus50 decode_primary_action50(
     const TerminalGameState50& state,
     std::uint16_t index,
     Action50& action) noexcept {
+  if (index == kPolicyGukjinPi50 || index == kPolicyGukjinAnimal50) {
+    if (policy_decision_kind50(state) != PolicyDecision50::kGukjin) {
+      action = kInvalidAction50;
+      return ActionStatus50::kNotLegal;
+    }
+    action = make_action50(index == kPolicyGukjinPi50 ? ActionKind50::kGukjinPi
+                                                      : ActionKind50::kGukjinAnimal);
+    return ActionStatus50::kOk;
+  }
   const PolicyActionMask50 legal = legal_primary_actions50(state);
   if (!has_policy_action50(legal, index)) {
     action = kInvalidAction50;
@@ -350,7 +386,17 @@ CUGO_HD inline PolicyObservation50 pack_policy_observation50(
       static_cast<std::uint8_t>(
           persistent_gukjin_role50(turn, player) == PersistentGukjinRole50::kDoublePi),
       static_cast<std::uint8_t>(
-          persistent_gukjin_role50(turn, opponent) == PersistentGukjinRole50::kDoublePi)};
+          persistent_gukjin_role50(turn, opponent) == PersistentGukjinRole50::kDoublePi),
+      turn.mission_cards,
+      player == 0 ? state.side_points0 : -state.side_points0,
+      state.mission_type,
+      state.mission_multiplier,
+      mission_multi50(state, player),
+      mission_multi50(state, opponent),
+      static_cast<std::uint8_t>(gukjin_locked50(turn, player)),
+      static_cast<std::uint8_t>(gukjin_locked50(turn, opponent)),
+      round_multiplier50(state),
+      static_cast<std::uint8_t>(is_last_turn50(turn))};
 }
 
 CUGO_HD inline PolicyPacket50 make_policy_packet50(
@@ -390,7 +436,16 @@ CUGO_HD inline bool equal_policy_observation50(
          a.own_ppuk_streak == b.own_ppuk_streak &&
          a.opponent_ppuk_streak == b.opponent_ppuk_streak &&
          a.own_gukjin_double_pi == b.own_gukjin_double_pi &&
-         a.opponent_gukjin_double_pi == b.opponent_gukjin_double_pi;
+         a.opponent_gukjin_double_pi == b.opponent_gukjin_double_pi &&
+         a.mission_cards == b.mission_cards &&
+         a.own_side_points == b.own_side_points &&
+         a.mission_type == b.mission_type &&
+         a.mission_multiplier == b.mission_multiplier &&
+         a.own_mission_multi == b.own_mission_multi &&
+         a.opponent_mission_multi == b.opponent_mission_multi &&
+         a.own_gukjin_locked == b.own_gukjin_locked &&
+         a.opponent_gukjin_locked == b.opponent_gukjin_locked &&
+         a.round_multiplier == b.round_multiplier && a.last_turn == b.last_turn;
 }
 
 CUGO_HD inline bool equal_policy_packet50(const PolicyPacket50& a,

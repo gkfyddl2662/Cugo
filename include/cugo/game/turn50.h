@@ -21,6 +21,21 @@ using core::CardMask;
 inline constexpr std::uint16_t kAllMonthBits50 =
     (std::uint16_t{1} << core::kMonthCount) - 1;
 
+// Hangame counts turns 1..20 (each player plays exactly ten). Turns 19 and 20 are
+// each player's final hand card: no ppuk forms, no pi is stolen, and reaching the
+// Go/Stop threshold stops automatically. With zero-based turn_index that is >= 18.
+inline constexpr std::uint16_t kLastTurnIndex50 = 18;
+
+// Plain pi of months 1..11 (slots 2 and 3). Month 12's slots 2/3 are a ribbon and a double pi.
+inline constexpr CardMask kPlainPiMask50 = [] {
+  CardMask mask = 0;
+  for (int month = 0; month < 11; ++month) {
+    mask |= core::card_bit(core::make_card(month, 2)) |
+            core::card_bit(core::make_card(month, 3));
+  }
+  return mask;
+}();
+
 enum class Turn50Phase : std::uint8_t {
   kPlay = 0,
   kDraw = 1,
@@ -65,6 +80,7 @@ struct Resolve50Result {
   std::uint8_t captured_own_ppuk;
   std::uint8_t captured_opponent_ppuk;
   CardMask captured_cards;
+  std::uint8_t last_turn;
 };
 
 struct Turn50BonusPlayResult {
@@ -91,6 +107,11 @@ struct TurnState50 {
   Turn50Phase phase;
   CardId pending_played;
   CardId pending_drawn;
+  // Cards of this game's mission (Hangame Shin Matgo); they steer pi-steal priority.
+  CardMask mission_cards;
+  // Three same-month cards dealt onto the initial floor. Hangame treats them as a
+  // ppuk stack without an owner: capturing it steals one opponent pi.
+  std::uint16_t neutral_ppuk_months;
 };
 
 struct TurnStateSoA50 {
@@ -111,12 +132,44 @@ struct TurnStateSoA50 {
   std::uint8_t* phase;
   CardId* pending_played;
   CardId* pending_drawn;
+  CardMask* mission_cards;
+  std::uint16_t* neutral_ppuk_months;
 };
+
+CUGO_HOST_DEVICE inline std::uint16_t floor_triple_months50(CardMask floor) noexcept {
+  std::uint16_t months = 0;
+  for (std::uint8_t month = 0; month < core::kMonthCount; ++month) {
+    if (core::card_count(floor & core::month_mask(month)) == 3)
+      months |= static_cast<std::uint16_t>(std::uint16_t{1} << month);
+  }
+  return months;
+}
+
+// Hangame gives initial-floor bonus cards to the first player and refills the floor
+// from the deck, repeating while a refill card is itself a bonus.
+CUGO_HOST_DEVICE inline void refill_initial_floor_bonuses50(
+    InitialDeal50& deal,
+    std::uint8_t first_player) noexcept {
+  int missing = core::card_count(collect_initial_floor_bonuses(deal, first_player));
+  if (missing == 0) return;
+  core::SplitMix64 rng{deal.rng_state};
+  while (missing > 0 && deal.stock != 0) {
+    const CardId card = draw_uniform_card(deal.stock, rng);
+    if (core::is_bonus_card(card)) {
+      if ((first_player & 1u) == 0) deal.captured0 |= core::card_bit(card);
+      else deal.captured1 |= core::card_bit(card);
+      continue;
+    }
+    deal.floor |= core::card_bit(card);
+    --missing;
+  }
+  deal.rng_state = rng.state();
+}
 
 CUGO_HOST_DEVICE inline TurnState50 make_turn_state50(
     InitialDeal50 deal,
     std::uint8_t first_player = 0) noexcept {
-  collect_initial_floor_bonuses(deal, first_player);
+  refill_initial_floor_bonuses50(deal, first_player);
   return TurnState50{deal.hand0,
                      deal.hand1,
                      deal.floor,
@@ -133,7 +186,19 @@ CUGO_HOST_DEVICE inline TurnState50 make_turn_state50(
                      static_cast<std::uint8_t>(first_player & 1u),
                      Turn50Phase::kPlay,
                      core::kInvalidCard,
-                     core::kInvalidCard};
+                     core::kInvalidCard,
+                     0,
+                     floor_triple_months50(deal.floor & core::kStandardDeckMask)};
+}
+
+CUGO_HOST_DEVICE inline bool is_last_turn50(const TurnState50& state) noexcept {
+  return state.turn_index >= kLastTurnIndex50;
+}
+
+// Hangame resolves a two-card floor choice automatically when both candidates are
+// the plain pi of one month (SingleServer JDAKOOAHHKI); they are interchangeable.
+CUGO_HOST_DEVICE inline bool auto_floor_choice50(CardMask matches) noexcept {
+  return core::card_count(matches) == 2 && (matches & ~kPlainPiMask50) == 0;
 }
 
 CUGO_HOST_DEVICE inline CardMask active_hand50(const TurnState50& state) noexcept {
@@ -198,9 +263,9 @@ CUGO_HOST_DEVICE inline Turn50BonusPlayResult play_bonus_for_turn50(
       play_hand_bonus(hand, state.stock, captured, state.rng_state, bonus);
   switch (result.status) {
     case BonusPlayStatus::kOk:
-      return Turn50BonusPlayResult{Turn50Status::kOk,
-                                   result.replacement,
-                                   result.pi_steal_count};
+      return Turn50BonusPlayResult{
+          Turn50Status::kOk, result.replacement,
+          static_cast<std::uint8_t>(is_last_turn50(state) ? 0u : result.pi_steal_count)};
     case BonusPlayStatus::kCardNotInHand:
       return Turn50BonusPlayResult{Turn50Status::kCardNotInHand,
                                    core::kInvalidCard,
@@ -311,6 +376,10 @@ CUGO_HOST_DEVICE inline Resolve50Status resolve_card_against_floor50(
   if (match_count == 1) {
     floor_capture = matches;
   } else if (match_count == 2) {
+    if (auto_floor_choice50(matches) &&
+        (choice == core::kInvalidCard || (matches & core::card_bit(choice)) == 0)) {
+      choice = core::first_card(matches);
+    }
     if (choice == core::kInvalidCard) {
       return Resolve50Status::kChoiceRequired;
     }
@@ -326,6 +395,9 @@ CUGO_HOST_DEVICE inline Resolve50Status resolve_card_against_floor50(
       floor_capture |= ppuk_bonus_mask_for_month(state, month_bit);
       clear_ppuk_bonus_association(state, month_bit);
       record_ppuk_capture50(state, card, result);
+    } else if ((state.neutral_ppuk_months & month_bit) != 0) {
+      state.neutral_ppuk_months &= static_cast<std::uint16_t>(~month_bit);
+      ++result.captured_opponent_ppuk;
     }
   }
 
@@ -350,6 +422,7 @@ CUGO_HOST_DEVICE inline Resolve50Result resolve_turn50(
                          kResolve50EventNone,
                          0,
                          0,
+                         0,
                          0};
   if (state.phase != Turn50Phase::kResolve) {
     return result;
@@ -358,14 +431,14 @@ CUGO_HOST_DEVICE inline Resolve50Result resolve_turn50(
   TurnState50 next = state;
   const CardId played = next.pending_played;
   const CardId drawn = next.pending_drawn;
-  const CardMask original_floor = next.floor;
   const CardMask played_matches = floor_matches50(next, played);
   const int played_match_count = core::card_count(played_matches);
   const bool same_month = core::card_month(played) == core::card_month(drawn);
-  const bool final_stock_flip = next.stock == 0;
+  const bool last_turn = is_last_turn50(next);
+  result.last_turn = static_cast<std::uint8_t>(last_turn);
 
   if (same_month && played_match_count == 1) {
-    if (final_stock_flip) {
+    if (last_turn) {
       Resolve50Status status = resolve_card_against_floor50(
           next, played, choices.played_match, result);
       if (status != Resolve50Status::kOk) {
@@ -404,9 +477,7 @@ CUGO_HOST_DEVICE inline Resolve50Result resolve_turn50(
                     core::card_bit(played) | core::card_bit(drawn) |
                         next.pending_bonus_mask,
                     result);
-    if (!final_stock_flip) {
-      result.events |= kResolve50EventJjok;
-    }
+    if (!last_turn) result.events |= kResolve50EventJjok;
   } else {
     Resolve50Status status = resolve_card_against_floor50(
         next, played, choices.played_match, result);
@@ -425,7 +496,8 @@ CUGO_HOST_DEVICE inline Resolve50Result resolve_turn50(
     }
   }
 
-  if (original_floor != 0 && next.floor == 0 && result.captured_cards != 0) {
+  // Hangame steals for a sweep whenever the floor is empty after the turn.
+  if (next.floor == 0 && result.captured_cards != 0) {
     result.events |= kResolve50EventSweep;
   }
 
@@ -445,7 +517,10 @@ CUGO_HOST_DEVICE inline bool is_valid_turn_state50(const TurnState50& state) noe
       (state.bonus3_ppuk_months & ~state.ppuk_months) != 0 ||
       core::card_count(state.bonus2_ppuk_months) > 1 ||
       core::card_count(state.bonus3_ppuk_months) > 1 ||
-      (state.pending_bonus_mask & ~core::kBonusCardMask) != 0) {
+      (state.pending_bonus_mask & ~core::kBonusCardMask) != 0 ||
+      (state.neutral_ppuk_months & ~kAllMonthBits50) != 0 ||
+      (state.neutral_ppuk_months & state.ppuk_months) != 0 ||
+      (state.mission_cards & ~core::kStandardDeckMask) != 0) {
     return false;
   }
 
@@ -463,7 +538,7 @@ CUGO_HOST_DEVICE inline bool is_valid_turn_state50(const TurnState50& state) noe
   for (std::uint8_t month = 0; month < core::kMonthCount; ++month) {
     const std::uint16_t month_bit =
         static_cast<std::uint16_t>(std::uint16_t{1} << month);
-    if ((state.ppuk_months & month_bit) != 0 &&
+    if (((state.ppuk_months | state.neutral_ppuk_months) & month_bit) != 0 &&
         core::card_count(standard_floor50(state) & core::month_mask(month)) != 3) {
       return false;
     }
@@ -540,7 +615,9 @@ CUGO_HOST_DEVICE inline TurnState50 load_turn_state50(
                      states.actor[game],
                      static_cast<Turn50Phase>(states.phase[game]),
                      states.pending_played[game],
-                     states.pending_drawn[game]};
+                     states.pending_drawn[game],
+                     states.mission_cards[game],
+                     states.neutral_ppuk_months[game]};
 }
 
 CUGO_HOST_DEVICE inline void store_turn_state50(const TurnStateSoA50& states,
@@ -563,6 +640,8 @@ CUGO_HOST_DEVICE inline void store_turn_state50(const TurnStateSoA50& states,
   states.phase[game] = static_cast<std::uint8_t>(state.phase);
   states.pending_played[game] = state.pending_played;
   states.pending_drawn[game] = state.pending_drawn;
+  states.mission_cards[game] = state.mission_cards;
+  states.neutral_ppuk_months[game] = state.neutral_ppuk_months;
 }
 
 }  // namespace cugo::game

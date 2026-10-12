@@ -27,6 +27,8 @@ struct SpecialGameState50 {
   std::uint16_t shaken0, shaken1;
   std::uint8_t bombs0, bombs1;
   std::uint8_t credits0, credits1;
+  // Four-card shakes (holding a whole month after a bonus-replacement Chongtong).
+  std::uint16_t shaken4_0, shaken4_1;
 };
 struct SpecialAction50 {
   SpecialKind50 kind;
@@ -44,10 +46,13 @@ struct SpecialResult50 {
 };
 
 CUGO_HD inline SpecialGameState50 make_special_game_state50(InitialDeal50 d, std::uint8_t first = 0) noexcept {
-  return SpecialGameState50{make_game_state50(d, first), 0, 0, 0, 0, 0, 0};
+  return SpecialGameState50{make_game_state50(d, first), 0, 0, 0, 0, 0, 0, 0, 0};
 }
 CUGO_HD inline std::uint16_t shaken50(const SpecialGameState50& s, std::uint8_t p) noexcept {
   return (p & 1u) == 0 ? s.shaken0 : s.shaken1;
+}
+CUGO_HD inline std::uint16_t shaken4_50(const SpecialGameState50& s, std::uint8_t p) noexcept {
+  return (p & 1u) == 0 ? s.shaken4_0 : s.shaken4_1;
 }
 CUGO_HD inline std::uint8_t bombs50(const SpecialGameState50& s, std::uint8_t p) noexcept {
   return (p & 1u) == 0 ? s.bombs0 : s.bombs1;
@@ -59,7 +64,7 @@ CUGO_HD inline CardMask month_cards50(CardMask cards, std::uint8_t m) noexcept {
   return m < core::kMonthCount ? cards & core::month_mask(m) : 0;
 }
 CUGO_HD inline bool special_ready50(const SpecialGameState50& s) noexcept {
-  return !game50_is_finished(s.game) && !game50_has_pending_decision(s.game) &&
+  return !game50_is_finished(s.game) && !game50_has_pending_choice(s.game) &&
          s.game.turn.phase == Turn50Phase::kPlay;
 }
 
@@ -71,7 +76,8 @@ CUGO_HD inline std::uint16_t legal_special_months50(const SpecialGameState50& s,
   const auto& t = s.game.turn;
   const CardMask h = active_hand50(t) & core::kStandardDeckMask;
   const CardMask f = standard_floor50(t);
-  const std::uint16_t old = exclude_shaken ? shaken50(s, t.actor) : 0;
+  const std::uint16_t old = !exclude_shaken ? 0
+      : hand_count == 4 ? shaken4_50(s, t.actor) : shaken50(s, t.actor);
   std::uint16_t out = 0;
   for (std::uint8_t m = 0; m < core::kMonthCount; ++m) {
     const std::uint16_t bit = static_cast<std::uint16_t>(std::uint16_t{1} << m);
@@ -80,8 +86,12 @@ CUGO_HD inline std::uint16_t legal_special_months50(const SpecialGameState50& s,
   }
   return out;
 }
+// SingleServer FJKDOKPFOFP: three cards of a month absent from the floor offer a
+// shake; holding all four (bonus-replacement Chongtong kept in hand) offers a
+// four-card shake. Both double the score.
 CUGO_HD inline std::uint16_t legal_shake_months50(const SpecialGameState50& s) noexcept {
-  return legal_special_months50(s, 3, 0, true);
+  return static_cast<std::uint16_t>(legal_special_months50(s, 3, 0, true) |
+                                    legal_special_months50(s, 4, 0, true));
 }
 CUGO_HD inline std::uint16_t legal_bomb_months50(const SpecialGameState50& s) noexcept {
   return legal_special_months50(s, 3, 1, false);
@@ -89,10 +99,14 @@ CUGO_HD inline std::uint16_t legal_bomb_months50(const SpecialGameState50& s) no
 CUGO_HD inline std::uint16_t legal_grenade_months50(const SpecialGameState50& s) noexcept {
   return legal_special_months50(s, 2, 2, false);
 }
+// Hangame forces these: playing a card of a month with three in hand and one on
+// the floor is a bomb, two in hand and two on the floor a grenade.
+CUGO_HD inline std::uint16_t forced_special_months50(const SpecialGameState50& s) noexcept {
+  return static_cast<std::uint16_t>(legal_bomb_months50(s) | legal_grenade_months50(s));
+}
 CUGO_HD inline std::uint8_t shake_count50(const SpecialGameState50& s, std::uint8_t p) noexcept {
-  std::uint16_t x = shaken50(s, p); std::uint8_t n = 0;
-  while (x) { x = static_cast<std::uint16_t>(x & (x - 1u)); ++n; }
-  return n;
+  return static_cast<std::uint8_t>(core::card_count(shaken50(s, p)) +
+                                   core::card_count(shaken4_50(s, p)));
 }
 CUGO_HD inline std::uint64_t bomb_shake_multiplier50(const SpecialGameState50& s,
                                                       std::uint8_t p) noexcept {
@@ -128,8 +142,8 @@ CUGO_HD inline DrawOnlySpecial50 draw_only_special50(TurnState50& t, CardId choi
     return DrawOnlySpecial50{SpecialStatus50::kStockEmpty, 0, core::kInvalidCard, 0,
       Resolve50Result{Resolve50Status::kWrongPhase, 0, 0, 0, 0}};
   t.stock = stock; t.rng_state = rng;
-  const CardMask old_floor = t.floor;
-  Resolve50Result rr{Resolve50Status::kOk, 0, 0, 0, 0};
+  Resolve50Result rr{Resolve50Status::kOk, 0, 0, 0, 0,
+                     static_cast<std::uint8_t>(is_last_turn50(t))};
   const Resolve50Status rs = resolve_card_against_floor50(t, flip.standard_card, choice, rr);
   if (rs != Resolve50Status::kOk) {
     const SpecialStatus50 st = rs == Resolve50Status::kChoiceRequired
@@ -139,7 +153,7 @@ CUGO_HD inline DrawOnlySpecial50 draw_only_special50(TurnState50& t, CardId choi
   }
   if (flip.pending_bonus_mask) capture_cards50(t, flip.pending_bonus_mask, rr);
   std::uint8_t ev = 0;
-  if (old_floor && t.floor == 0 && rr.captured_cards) { rr.events |= kResolve50EventSweep; ev |= kSpecialSweep; }
+  if (t.floor == 0 && rr.captured_cards) { rr.events |= kResolve50EventSweep; ev |= kSpecialSweep; }
   rr.status = Resolve50Status::kOk;
   return DrawOnlySpecial50{SpecialStatus50::kOk, ev, flip.standard_card, flip.pending_bonus_mask, rr};
 }
@@ -157,7 +171,10 @@ CUGO_HD inline SpecialResult50 begin_shake50(SpecialGameState50& s, CardId card)
       (active_hand50(s.game.turn) & core::card_bit(card)) == 0)
     return special_error50(SpecialStatus50::kNotLegal);
   SpecialGameState50 n = s;
-  if (n.game.turn.actor == 0) n.shaken0 |= bit; else n.shaken1 |= bit;
+  const bool four = core::card_count(month_cards50(active_hand50(s.game.turn), m)) == 4;
+  std::uint16_t& shaken = four ? (n.game.turn.actor == 0 ? n.shaken4_0 : n.shaken4_1)
+                               : (n.game.turn.actor == 0 ? n.shaken0 : n.shaken1);
+  shaken |= bit;
   if (begin_regular_play_game50(n.game, card) != Turn50Status::kOk)
     return special_error50(SpecialStatus50::kNotLegal);
   s = n;
@@ -185,7 +202,8 @@ CUGO_HD inline SpecialResult50 capture_special50(SpecialGameState50& s,
 
   const DrawOnlySpecial50 d = draw_only_special50(t, choice);
   if (d.status != SpecialStatus50::kOk) return special_error50(d.status);
-  const std::uint8_t steal = static_cast<std::uint8_t>(1u + resolve_pi_steal_card_count(d.resolve));
+  const std::uint8_t steal = static_cast<std::uint8_t>(
+      (is_last_turn50(t) ? 0u : 1u) + resolve_pi_steal_card_count(d.resolve));
   finish_draw_only50(t);
   const PiTransferResult pt = apply_pi_steal50(t, actor, steal, sel);
   if (pt.status != PiTransferStatus::kOk) {
@@ -193,7 +211,7 @@ CUGO_HD inline SpecialResult50 capture_special50(SpecialGameState50& s,
     r.pi_transfer = pt; r.pi_steal_cards = steal; r.drawn = d.drawn; r.stock_bonuses = d.bonuses; return r;
   }
   const std::uint8_t score = game50_base_score(n.game, actor);
-  const bool opened = maybe_open_go_stop_decision50(n.game, actor);
+  const bool opened = finish_turn_game50(n.game, actor);
   s = n;
   return SpecialResult50{SpecialStatus50::kOk,
     static_cast<std::uint8_t>((grenade ? kSpecialGrenade : kSpecialBomb) | d.events), actor,
@@ -228,7 +246,7 @@ CUGO_HD inline SpecialResult50 play_bomb_credit50(SpecialGameState50& s,
     r.pi_transfer = pt; r.pi_steal_cards = steal; r.drawn = d.drawn; r.stock_bonuses = d.bonuses; return r;
   }
   const std::uint8_t score = game50_base_score(n.game, actor);
-  const bool opened = maybe_open_go_stop_decision50(n.game, actor);
+  const bool opened = finish_turn_game50(n.game, actor);
   s = n;
   return SpecialResult50{SpecialStatus50::kOk,
     static_cast<std::uint8_t>(kSpecialBombCredit | d.events), actor, score,
@@ -247,7 +265,8 @@ CUGO_HD inline SpecialResult50 apply_special_action50(SpecialGameState50& s,
 }
 CUGO_HD inline bool is_valid_special_game_state50(const SpecialGameState50& s) noexcept {
   return is_valid_game_state50(s.game) &&
-         (s.shaken0 & ~kAllMonthBits50) == 0 && (s.shaken1 & ~kAllMonthBits50) == 0;
+         (s.shaken0 & ~kAllMonthBits50) == 0 && (s.shaken1 & ~kAllMonthBits50) == 0 &&
+         (s.shaken4_0 & ~kAllMonthBits50) == 0 && (s.shaken4_1 & ~kAllMonthBits50) == 0;
 }
 
 }  // namespace cugo::game

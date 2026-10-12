@@ -1,3 +1,5 @@
+// Tests rely on assert(); keep it active in Release builds.
+#undef NDEBUG
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -175,7 +177,7 @@ void test_resolve_opens_decision_after_committed_turn() {
   assert(is_valid_game_state50(state));
 }
 
-void test_pi_selection_keeps_whole_game_transactional() {
+void test_automatic_pi_selection_commits_turn() {
   using namespace cugo::core;
   using namespace cugo::game;
   CardMask pi = kPlainPiMask;
@@ -198,14 +200,17 @@ void test_pi_selection_keeps_whole_game_transactional() {
   state.decision_actor = kNoGame50Player;
   state.winner = kNoGame50Player;
   assert(is_valid_game_state50(state));
-  const auto before = state;
 
+  // Hangame chooses the stolen pi itself, so the jjok commits in one step.
   const auto result = resolve_game_turn50_with_pi_transfer(state);
   assert(result.turn_result.resolve.status == Resolve50Status::kOk);
-  assert(result.turn_result.pi_transfer.status ==
-         PiTransferStatus::kSelectionRequired);
+  assert(result.turn_result.pi_transfer.status == PiTransferStatus::kOk);
+  assert(result.turn_result.pi_transfer.transferred_mask == card_bit(first));
   assert(result.decision_opened == 0);
-  assert(same_game(state, before));
+  assert((state.turn.captured0 & card_bit(first)) != 0);
+  assert(state.turn.captured1 == card_bit(second));
+  assert(state.turn.actor == 1);
+  assert(is_valid_game_state50(state));
 }
 
 }  // namespace
@@ -215,7 +220,7 @@ int main() {
   test_first_decision_go_and_additional_score_gate();
   test_stop_finishes_and_blocks_turn_actions();
   test_resolve_opens_decision_after_committed_turn();
-  test_pi_selection_keeps_whole_game_transactional();
+  test_automatic_pi_selection_commits_turn();
   std::cout << "cugo_game50_test: PASS\n";
   return 0;
 }

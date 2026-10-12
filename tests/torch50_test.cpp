@@ -68,7 +68,7 @@ void verify_features(const TorchPacket50& packet) {
             "semantic feature must stay in [0, 1]");
   }
   for (std::uint16_t i = kTorch50SemanticFeatureCount;
-       i < kTorch50FeatureCount; ++i) {
+       i < kTorch50MissionPlaneOffset; ++i) {
     require(features[i] == 0.0f, "padding features must be zero");
   }
 
@@ -77,9 +77,21 @@ void verify_features(const TorchPacket50& packet) {
     decision_hot += static_cast<std::uint16_t>(
         features[kTorch50DecisionOffset + i] == 1.0f);
   }
-  require(decision_hot == 1, "decision kind must be one-hot");
-  require(features[kTorch50DecisionOffset + packet.decision_kind] == 1.0f,
-          "decision kind one-hot index");
+  if (packet.decision_kind < kTorch50DecisionCount) {
+    require(decision_hot == 1, "decision kind must be one-hot");
+    require(features[kTorch50DecisionOffset + packet.decision_kind] == 1.0f,
+            "decision kind one-hot index");
+    require(features[kTorch50ExtScalarOffset + 8] == 0.0f,
+            "gukjin flag only on the gukjin prompt");
+  } else {
+    // The gukjin prompt sits outside the legacy one-hot; an appended flag marks it.
+    require(packet.decision_kind ==
+                static_cast<std::uint8_t>(PolicyDecision50::kGukjin),
+            "unknown decision kind");
+    require(decision_hot == 0, "gukjin prompt leaves the legacy one-hot empty");
+    require(features[kTorch50ExtScalarOffset + 8] == 1.0f,
+            "gukjin prompt flag");
+  }
 }
 
 void test_feature_and_action_contract(std::uint64_t& packets,
@@ -160,7 +172,8 @@ int main() {
 
     require(choice_packets != 0, "must exercise post-chance packets");
     require(resolve_choices != 0, "must exercise resolve choices");
-    require(pi_choices != 0, "must exercise pi choices");
+    // Hangame picks the stolen pi itself, so no pi-card choice is ever offered.
+    require(pi_choices == 0, "pi steals must be automatic");
 
     std::cout << "cugo_torch50_test: PASS (8192 rollouts; packets=" << packets
               << " choice_packets=" << choice_packets

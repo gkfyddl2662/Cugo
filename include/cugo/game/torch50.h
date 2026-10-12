@@ -15,8 +15,10 @@ namespace cugo::game {
 inline constexpr std::uint16_t kTorch50PrimaryActionCount = kPolicyActionCount50;
 inline constexpr std::uint16_t kTorch50ChoiceActionBegin = kPolicyActionCount50;
 inline constexpr std::uint16_t kTorch50ChoiceActionCount = core::kShinMatgoCardCount;
-inline constexpr std::uint16_t kTorch50ActionCount =
+// Two Gukjin-prompt answers follow the card choices (Hangame Shin Matgo).
+inline constexpr std::uint16_t kTorch50GukjinActionBegin =
     kTorch50PrimaryActionCount + kTorch50ChoiceActionCount;
+inline constexpr std::uint16_t kTorch50ActionCount = kTorch50GukjinActionBegin + 2;
 inline constexpr std::uint16_t kInvalidTorch50Action = 0xffffu;
 
 inline constexpr std::uint16_t kTorch50CardPlaneCount = 6;
@@ -35,13 +37,23 @@ inline constexpr std::uint16_t kTorch50ScalarOffset =
     kTorch50DecisionOffset + kTorch50DecisionCount;
 inline constexpr std::uint16_t kTorch50SemanticFeatureCount =
     kTorch50ScalarOffset + kTorch50ScalarCount;
-inline constexpr std::uint16_t kTorch50FeatureCount = 496;
+// Hangame extensions are appended after the original 496 (479 used + padding) so
+// older networks can be widened with zero weights.
+inline constexpr std::uint16_t kTorch50MissionPlaneOffset = 496;
+inline constexpr std::uint16_t kTorch50ExtScalarOffset =
+    kTorch50MissionPlaneOffset + core::kStandardCardCount;
+inline constexpr std::uint16_t kTorch50ExtScalarCount = 16;
+inline constexpr std::uint16_t kTorch50FeatureCount =
+    kTorch50ExtScalarOffset + kTorch50ExtScalarCount;
 
 static_assert(kTorch50PrimaryActionCount == 127);
-static_assert(kTorch50ActionCount == 177);
+static_assert(kTorch50ActionCount == 179);
+static_assert(kTorch50GukjinActionBegin == kPolicyGukjinPi50);
+static_assert(kTorch50GukjinActionBegin + 1u == kPolicyGukjinAnimal50);
+static_assert(kTorch50FeatureCount == 560);
 static_assert(kTorch50SemanticFeatureCount == 479);
 static_assert((kTorch50FeatureCount % 16u) == 0u);
-static_assert(kTorch50SemanticFeatureCount <= kTorch50FeatureCount);
+static_assert(kTorch50SemanticFeatureCount <= kTorch50MissionPlaneOffset);
 
 struct TorchActionMask50 {
   std::uint64_t word0;
@@ -152,7 +164,7 @@ CUGO_HD inline std::uint8_t torch_decision_kind50(
 CUGO_HD inline bool torch_nagari_ready50(const TorchEnv50& env) noexcept {
   return env.pending.active == 0 && !terminal50_is_finished(env.game) &&
          !terminal50_has_chongtong_choice(env.game) &&
-         !game50_has_pending_decision(env.game.special.game) &&
+         !game50_has_pending_choice(env.game.special.game) &&
          rollout_hands_exhausted50(env.game);
 }
 
@@ -173,8 +185,9 @@ CUGO_HD inline void refresh_torch_done50(TorchEnv50& env) noexcept {
 
 CUGO_HD inline TorchEnv50 make_torch_env50(
     InitialDeal50 deal,
-    std::uint8_t first_player = 0) noexcept {
-  TorchEnv50 env{make_terminal_game_state50(deal, first_player),
+    std::uint8_t first_player = 0,
+    std::uint8_t round_multiplier = 1) noexcept {
+  TorchEnv50 env{make_terminal_game_state50(deal, first_player, round_multiplier),
                  PostChancePending50{},
                  0, 0, 0, 0, 0, 0, 0,
                  ActionStatus50::kOk,
@@ -185,8 +198,16 @@ CUGO_HD inline TorchEnv50 make_torch_env50(
 
 CUGO_HD inline TorchEnv50 make_torch_env50(
     std::uint64_t seed,
-    std::uint8_t first_player = 0) noexcept {
-  return make_torch_env50(deal_shin_matgo_50(seed), first_player);
+    std::uint8_t first_player = 0,
+    std::uint8_t round_multiplier = 1) noexcept {
+  return make_torch_env50(deal_shin_matgo_50(seed), first_player, round_multiplier);
+}
+
+CUGO_HD inline TorchActionMask50 gukjin_torch_action_mask50() noexcept {
+  TorchActionMask50 mask = empty_torch_action_mask50();
+  set_torch_action50(mask, kTorch50GukjinActionBegin);
+  set_torch_action50(mask, static_cast<std::uint16_t>(kTorch50GukjinActionBegin + 1u));
+  return mask;
 }
 
 CUGO_HD inline TorchPacket50 make_torch_packet50(
@@ -224,10 +245,13 @@ CUGO_HD inline TorchPacket50 make_torch_packet50(
   if (player > 1u) {
     player = static_cast<std::uint8_t>(env.game.special.game.turn.actor & 1u);
   }
+  const bool gukjin = packet.observation.decision_kind ==
+                     static_cast<std::uint8_t>(PolicyDecision50::kGukjin);
   return TorchPacket50{packet.observation,
                        env.done != 0
                            ? empty_torch_action_mask50()
-                           : primary_torch_action_mask50(packet.legal_actions),
+                           : gukjin ? gukjin_torch_action_mask50()
+                                    : primary_torch_action_mask50(packet.legal_actions),
                        0,
                        kInvalidPolicyAction50,
                        core::kInvalidCard,
@@ -333,8 +357,8 @@ CUGO_HD inline void encode_torch_packet50(const TorchPacket50& packet,
   s[11] = torch_unit50(o.opponent_credits, 4);
   s[12] = torch_unit50(o.own_ppuk_count, 3);
   s[13] = torch_unit50(o.opponent_ppuk_count, 3);
-  s[14] = torch_unit50(o.own_ppuk_streak, 3);
-  s[15] = torch_unit50(o.opponent_ppuk_streak, 3);
+  s[14] = torch_unit50(o.own_ppuk_streak <= 3u ? o.own_ppuk_streak : 0u, 3);
+  s[15] = torch_unit50(o.opponent_ppuk_streak <= 3u ? o.opponent_ppuk_streak : 0u, 3);
   s[16] = o.own_gukjin_double_pi != 0 ? 1.0f : 0.0f;
   s[17] = o.opponent_gukjin_double_pi != 0 ? 1.0f : 0.0f;
   s[18] = torch_unit50(packet.requested_pi, 8);
@@ -355,12 +379,39 @@ CUGO_HD inline void encode_torch_packet50(const TorchPacket50& packet,
       static_cast<std::uint32_t>(core::card_count(o.floor)), 50);
   s[25] = torch_unit50(
       static_cast<std::uint32_t>(core::card_count(o.unseen)), 50);
+
+  for (std::uint16_t card = 0; card < core::kStandardCardCount; ++card) {
+    features[kTorch50MissionPlaneOffset + card] =
+        (o.mission_cards & (std::uint64_t{1} << card)) != 0 ? 1.0f : 0.0f;
+  }
+  float* x = features + kTorch50ExtScalarOffset;
+  const std::uint8_t mission = o.mission_type;
+  x[0] = mission == kMissionEasy50 ? 1.0f : 0.0f;
+  x[1] = mission == kMissionNormal50 ? 1.0f : 0.0f;
+  x[2] = mission == kMissionHard50 ? 1.0f : 0.0f;
+  x[3] = mission == kMissionNoCondition50 ? 1.0f : 0.0f;
+  x[4] = mission == kMissionTriple50 ? 1.0f : 0.0f;
+  x[5] = torch_unit50(o.mission_multiplier, 4);
+  x[6] = torch_unit50(o.own_mission_multi, 8);
+  x[7] = torch_unit50(o.opponent_mission_multi, 8);
+  x[8] = packet.decision_kind == static_cast<std::uint8_t>(PolicyDecision50::kGukjin)
+      ? 1.0f : 0.0f;
+  x[9] = o.own_gukjin_locked != 0 ? 1.0f : 0.0f;
+  x[10] = o.opponent_gukjin_locked != 0 ? 1.0f : 0.0f;
+  x[11] = o.last_turn != 0 ? 1.0f : 0.0f;
+  const float side = static_cast<float>(o.own_side_points) / 64.0f;
+  x[12] = side > 1.0f ? 1.0f : side < -1.0f ? -1.0f : side;
+  x[13] = torch_unit50(o.round_multiplier, 8);
+  x[14] = o.own_ppuk_streak == kPpukFirst50 || o.own_ppuk_streak == kPpukSecond50
+      ? 1.0f : 0.0f;
+  x[15] = o.opponent_ppuk_streak == kPpukFirst50 || o.opponent_ppuk_streak == kPpukSecond50
+      ? 1.0f : 0.0f;
 }
 
 CUGO_HD inline std::int64_t torch_reward0_50(const TorchEnv50& env) noexcept {
-  if (env.done == 0 || env.nagari != 0 || !terminal50_is_finished(env.game)) {
-    return 0;
-  }
+  if (env.done == 0) return 0;
+  if (env.nagari != 0) return nagari_reward50(env.game, 0);
+  if (!terminal50_is_finished(env.game)) return 0;
   const Settlement50 settlement = settle_terminal50(env.game);
   return settlement_reward50(settlement, 0);
 }
@@ -466,7 +517,7 @@ CUGO_HD inline TorchRollout50 finish_torch_rollout50(
                              env.special_actions,
                              env.go_actions,
                              0,
-                             0};
+                             nagari_reward50(env.game, 0)};
   } else {
     result = RolloutResult50{fallback_end,
                              env.status,

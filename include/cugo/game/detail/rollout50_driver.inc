@@ -56,7 +56,7 @@ CUGO_HD inline RolloutResult50 rollout_canonical50(
     }
 
     if (!terminal50_has_chongtong_choice(state) &&
-        !game50_has_pending_decision(state.special.game) &&
+        !game50_has_pending_choice(state.special.game) &&
         rollout_hands_exhausted50(state)) {
       return RolloutResult50{RolloutEnd50::kNagari,
                              ActionStatus50::kOk,
@@ -69,7 +69,7 @@ CUGO_HD inline RolloutResult50 rollout_canonical50(
                              special_actions,
                              go_actions,
                              0,
-                             0};
+                             nagari_reward50(state, 0)};
     }
 
     const CanonicalAction50 canonical = canonical_action50(state);

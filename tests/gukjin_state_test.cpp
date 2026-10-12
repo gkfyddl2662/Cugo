@@ -1,3 +1,5 @@
+// Tests rely on assert(); keep it active in Release builds.
+#undef NDEBUG
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -61,14 +63,18 @@ void test_role_moves_with_pi_transfer() {
   assert(transfer.transferred_pi_units == 2);
   assert(state.captured0 == card_bit(kGukjin));
   assert(state.captured1 == 0);
-  assert(persistent_gukjin_role50(state, 0) == PersistentGukjinRole50::kDoublePi);
+  // Hangame: the role does not follow the card; the thief gets an undecided animal.
+  assert(persistent_gukjin_role50(state, 0) == PersistentGukjinRole50::kAnimal);
   assert(persistent_gukjin_role50(state, 1) == PersistentGukjinRole50::kAnimal);
-  assert(persistent_score_player50(state, 0).pi_units == 2);
-
-  assert(set_persistent_gukjin_role50(state, 0, PersistentGukjinRole50::kAnimal) ==
-         PersistentGukjinRole50Status::kOk);
+  assert(gukjin_undecided50(state, 0));
   assert(persistent_score_player50(state, 0).animal_count == 1);
   assert(persistent_score_player50(state, 0).pi_units == 0);
+
+  decide_gukjin50(state, 0, true);
+  assert(!gukjin_undecided50(state, 0));
+  assert(gukjin_locked50(state, 0));
+  assert(persistent_gukjin_role50(state, 0) == PersistentGukjinRole50::kDoublePi);
+  assert(persistent_score_player50(state, 0).pi_units == 2);
 }
 
 void test_packed_flag_survives_ppuk_metadata_updates() {

@@ -63,7 +63,7 @@ IDs `50..63` remain available for future nonstandard physical/synthetic cards if
 - Pi: 10 pi units = 1 point and each additional unit adds 1. Plain pi contributes 1 unit. The fixed month-11/month-12 double-pi cards contribute 2. Gukjin contributes 2 only when its current role is double-pi, in which case it no longer counts as an animal.
 - The bonus cards contribute 2 and 3 pi units respectively.
 
-Hangame explicitly documents Gukjin as an animal card that can also be used as double-pi. The public guide does not specify a mandatory conversion moment. Cugo therefore exposes the role as explicit state rather than inventing an automatic conversion rule.
+Hangame explicitly documents Gukjin as an animal card that can also be used as double-pi. The public guide does not specify a mandatory conversion moment. The Hangame client decides it: Gukjin starts as an animal, the owner gets a one-time prompt, and the loser is decided automatically at Go/Stop. See `hangame50.md`.
 
 ### Persistent Gukjin role representation
 
@@ -72,11 +72,12 @@ Hangame explicitly documents Gukjin as an animal card that can also be used as d
 - bits `0..11`: existing ppuk-owner-by-month metadata
 - bit `12`: player 0 currently treats captured Gukjin as double-pi
 - bit `13`: player 1 currently treats captured Gukjin as double-pi
-- bits `14..15`: reserved
+- bit `14`: player 0's Gukjin role is locked (decided)
+- bit `15`: player 1's Gukjin role is locked (decided)
 
 `set_persistent_gukjin_role50()` changes the interpretation only when that player physically owns Gukjin in the captured pile. `persistent_score_player50()` derives the appropriate `ScoreOptions` from the state. `is_valid_persistent_turn_state50()` masks the role bits for the legacy base-state invariant and additionally rejects a double-pi role bit when the corresponding player does not own Gukjin.
 
-If Gukjin is currently double-pi and is physically transferred by a pi-steal event, the current role follows the physical card to the new owner. This keeps physical ownership, pi eligibility, and scoring interpretation consistent. The new owner can later set the role back to animal explicitly. This is an engine-state convention; it does not claim that Hangame exposes the role-change timing as a separate UI action.
+If Gukjin is transferred by a pi-steal event, the role does not follow the card: the thief receives it as an undecided animal, as the Hangame client does.
 
 ## Go/Stop decision state
 
@@ -94,7 +95,7 @@ The public guide's nagari description explicitly includes the case where a playe
 
 `resolve_game_turn50_with_pi_transfer()` commits the underlying resolve and pi transfer first, then evaluates the completed player's base score. A floor-selection or pi-transfer selection requirement remains fully transactional and cannot open a Go/Stop decision from an uncommitted turn.
 
-Final settlement is not part of this milestone. In particular, pi-bak, gwang-bak, meongtta, dokbak, bomb/shake, missions, and nagari carry-over multipliers are not yet combined into a final payout score.
+Final settlement is in `settlement50.md` and `hangame50.md`.
 
 ## Pinned bonus-card behavior
 
@@ -128,7 +129,7 @@ Choice/error resolution remains transactional: if a two-card floor selection is 
 - Capturing an opponent's ppuk stack steals one opponent pi; capturing one's own ppuk stack steals two opponent pi.
 - First/second/third consecutive ppuk have Hangame-specific immediate money effects. Those economy effects are outside the current engine milestone but the ppuk ownership/history state must be representable.
 - Ttadak: two same-month cards are already on the floor, the player plays that month, and the stock draw is also that month; all four are captured and one opponent pi is stolen.
-- Sweep / pansseuri: taking all floor cards also steals one opponent pi.
+- Sweep / pansseuri: leaving the floor empty after the turn also steals one opponent pi.
 - Bomb: three same-month hand cards can capture the fourth card from the floor in one play, steals one opponent pi, creates future bomb cards, and carries a score multiplier.
 - Shake: showing three same-month hand cards when there is no floor match can create a score multiplier if the player later wins.
 - Grenade / two-card bomb: two same-month hand cards can be used against the two same-month floor cards. Hangame's guide states that this steals pi but does not get the bomb score multiplier.
@@ -182,12 +183,10 @@ The guide says ppuk and jjok have a last-card exception but does not describe th
 
 ## Not implemented yet
 
-- Last-card ppuk/jjok exception transition
-- Exact Hangame automatic pi-card priority when more candidates exist than must be stolen
-- Exact Hangame UI/timing policy for changing Gukjin between animal and double-pi
-- Bomb/grenade action encoding and bomb-card credits
-- Final settlement multipliers and payout composition (pi-bak, gwang-bak, meongtta, dokbak, bomb/shake, missions, nagari carry-over)
-- Chongtong and three-ppuk terminal integration into `GameState50`
-- Missions and economy/betting effects
+- Economy/betting effects and the next game's first player
+- Nagari carry between games (the engine takes the round multiplier as an input)
+
+The last-turn rules, automatic pi priority, Gukjin timing, settlement multipliers, and
+missions are implemented as described in `hangame50.md`.
 
 Each item should be added first to the deterministic CPU reference path, covered by fixed examples and randomized invariants, and only then mirrored into CUDA with CPU/GPU differential tests.

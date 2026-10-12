@@ -2,7 +2,7 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "cugo/game/terminal50.h"
+#include "cugo/game/settlement50.h"
 
 namespace {
 
@@ -143,34 +143,67 @@ void test_bonus_replacement_chongtong_choice() {
           "continue must resume game");
 }
 
+TerminalGameState50 ppuk_at(TerminalGameState50 state, std::uint8_t actor,
+                            std::uint16_t completed_turn, bool* terminal) {
+  // completed_turn is Hangame's 1-based turn number (turn_index after the turn).
+  state.special.game.turn.turn_index = completed_turn;
+  *terminal = record_completed_turn_ppuk50(state, actor, true);
+  return state;
+}
+
 void test_three_ppuk() {
+  bool terminal = false;
   {
+    // First player's turns 1, 3, 5: first/second/third ppuk pay 7 + 14 + 21 and
+    // the third ends the game at 7 points (49 in total).
     TerminalGameState50 state = make_terminal_game_state50(make_deal(), 0);
-    require(!record_completed_turn_ppuk50(state, 0, true), "first ppuk");
-    require(!record_completed_turn_ppuk50(state, 0, false), "streak reset 1");
-    require(!record_completed_turn_ppuk50(state, 0, true), "second ppuk");
-    require(!record_completed_turn_ppuk50(state, 0, false), "streak reset 2");
-    require(record_completed_turn_ppuk50(state, 0, true), "third ppuk terminal");
-    require(state.terminal_reason == TerminalReason50::kThreePpuk &&
-                state.terminal_winner == 0 &&
-                state.terminal_points == kThreePpukPoints50,
-            "nonconsecutive three-ppuk score");
-    require(state.ppuk_count0 == 3 && state.ppuk_streak0 == 1,
-            "nonconsecutive ppuk counters");
+    state = ppuk_at(state, 0, 1, &terminal);
+    require(!terminal && state.ppuk_streak0 == kPpukFirst50 && state.side_points0 == 7,
+            "first ppuk pays 7");
+    state = ppuk_at(state, 0, 3, &terminal);
+    require(!terminal && state.ppuk_streak0 == kPpukSecond50 && state.side_points0 == 21,
+            "second consecutive ppuk pays 14");
+    state = ppuk_at(state, 0, 5, &terminal);
+    require(terminal && state.terminal_reason == TerminalReason50::kThreePpuk &&
+                state.terminal_winner == 0 && state.terminal_points == kThreePpukPoints50,
+            "third consecutive ppuk ends at 7");
+    require(state.side_points0 == 42 && state.ppuk_count0 == 3, "third ppuk pays 21");
+    const Settlement50 settlement = settle_terminal50(state);
+    require(settlement_reward50(settlement, 0) ==
+                static_cast<std::int64_t>(kThreeConsecutivePpukPoints50),
+            "consecutive three-ppuk totals 49");
+    require(is_valid_terminal_game_state50(state), "49-point ppuk invariant");
+  }
+  {
+    // The second player can never chain first ppuk (its first turn is turn 2).
+    TerminalGameState50 state = make_terminal_game_state50(make_deal(), 0);
+    state = ppuk_at(state, 1, 2, &terminal);
+    require(!terminal && state.ppuk_streak1 == kPpukOne50 && state.side_points0 == 0,
+            "second player's ppuk is an ordinary ppuk");
+    state = ppuk_at(state, 1, 4, &terminal);
+    state = ppuk_at(state, 1, 6, &terminal);
+    require(terminal && state.terminal_winner == 1 && state.terminal_points == 7 &&
+                state.side_points0 == 0 && state.ppuk_streak1 == kPpukThree50,
+            "nonconsecutive three-ppuk ends at 7 without payments");
+    require(settlement_reward50(settle_terminal50(state), 1) == 7, "three-ppuk reward");
     require(is_valid_terminal_game_state50(state), "three-ppuk invariant");
   }
   {
-    TerminalGameState50 state = make_terminal_game_state50(make_deal(), 1);
-    require(!record_completed_turn_ppuk50(state, 1, true), "consecutive ppuk 1");
-    require(!record_completed_turn_ppuk50(state, 1, true), "consecutive ppuk 2");
-    require(record_completed_turn_ppuk50(state, 1, true), "consecutive ppuk 3");
-    require(state.terminal_reason == TerminalReason50::kThreePpuk &&
-                state.terminal_winner == 1 &&
-                state.terminal_points == kThreeConsecutivePpukPoints50,
-            "consecutive three-ppuk score");
-    require(state.ppuk_count1 == 3 && state.ppuk_streak1 == 3,
-            "consecutive ppuk counters");
-    require(is_valid_terminal_game_state50(state), "49-point ppuk invariant");
+    // A first ppuk, then later ones outside the window: only the first pays.
+    TerminalGameState50 state = make_terminal_game_state50(make_deal(), 0);
+    state = ppuk_at(state, 0, 1, &terminal);
+    state = ppuk_at(state, 0, 7, &terminal);
+    require(!terminal && state.ppuk_streak0 == kPpukTwo50 && state.side_points0 == 7,
+            "late second ppuk breaks the chain");
+    state = ppuk_at(state, 0, 9, &terminal);
+    require(terminal && state.terminal_points == 7 && state.side_points0 == 7,
+            "broken chain third ppuk");
+  }
+  {
+    // Nagari carry-over doubles payments.
+    TerminalGameState50 state = make_terminal_game_state50(make_deal(), 0, 2);
+    state = ppuk_at(state, 0, 1, &terminal);
+    require(state.side_points0 == 14, "round multiplier scales the first-ppuk payment");
   }
 }
 

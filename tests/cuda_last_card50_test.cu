@@ -61,6 +61,7 @@ __host__ __device__ TurnState50 make_case(std::uint32_t i) {
   state.phase = Turn50Phase::kResolve;
   state.pending_played = played;
   state.pending_drawn = drawn;
+  state.turn_index = kLastTurnIndex50;
   return state;
 }
 

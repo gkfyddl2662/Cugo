@@ -13,6 +13,11 @@ CUGO_HD inline CanonicalAction50 canonical_action50(
     return CanonicalAction50{ActionStatus50::kOk, action};
   }
 
+  if (game50_has_gukjin_decision(state.special.game)) {
+    // Hangame's AI always turns Gukjin into double pi when asked.
+    return CanonicalAction50{ActionStatus50::kOk, make_action50(ActionKind50::kGukjinPi)};
+  }
+
   if (game50_has_pending_decision(state.special.game)) {
     const std::uint8_t actor = state.special.game.decision_actor;
     const std::uint8_t go_count = go_count_for_player50(state.special.game, actor);

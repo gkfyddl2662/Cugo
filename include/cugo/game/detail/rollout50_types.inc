@@ -9,6 +9,8 @@ enum class ActionKind50 : std::uint8_t {
   kStop = 7,
   kChongtongWin = 8,
   kChongtongContinue = 9,
+  kGukjinPi = 10,
+  kGukjinAnimal = 11,
 };
 
 enum class ActionStatus50 : std::uint8_t {
@@ -123,7 +125,8 @@ CUGO_HD inline PiTransferSelection canonical_pi_selection50(
   if (requested_cards == 0 || available <= requested_cards) {
     return kNoPiTransferSelection;
   }
-  return PiTransferSelection{take_first_cards50(candidates, requested_cards)};
+  return PiTransferSelection{
+      hangame_pi_steal_selection50(state, stealing_actor, requested_cards)};
 }
 
 CUGO_HD inline void canonical_choice_step50(CardMask& floor,
@@ -159,9 +162,9 @@ CUGO_HD inline Resolve50Choices canonical_resolve_choices50(
   const CardMask played_matches = core::matching_month_cards(floor, played);
   const int played_count = core::card_count(played_matches);
   const bool same_month = core::card_month(played) == core::card_month(drawn);
-  const bool final_stock_flip = state.stock == 0;
+  const bool last_turn = is_last_turn50(state);
 
-  if (same_month && played_count == 1 && !final_stock_flip) return choices;
+  if (same_month && played_count == 1 && !last_turn) return choices;
   if (same_month && (played_count == 0 || played_count == 2)) return choices;
 
   canonical_choice_step50(floor, played, choices.played_match);

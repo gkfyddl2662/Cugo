@@ -80,17 +80,32 @@ bool credit_case() {
 }
 
 bool rollback_case() {
+  // The drawn card matches a bright and a ribbon: a floor choice is required, so
+  // the whole bomb rolls back.
   auto s = base();
   s.game.turn.hand0 = card_bit(0) | card_bit(1) | card_bit(2);
-  s.game.turn.floor = card_bit(3) | card_bit(8);
-  s.game.turn.captured1 = card_bit(10) | card_bit(14);
-  s.game.turn.stock = card_bit(12);
+  s.game.turn.floor = card_bit(3) | card_bit(8) | card_bit(9);
+  s.game.turn.captured1 = card_bit(10 + 4) | card_bit(14 + 4);
+  s.game.turn.stock = card_bit(10);
   const auto before = s;
   const auto r = play_bomb50(s, 0);
-  CHECK(r.status == SpecialStatus50::kPiSelectionRequired);
+  CHECK(r.status == SpecialStatus50::kResolveChoiceRequired);
   CHECK(s.game.turn.hand0 == before.game.turn.hand0 && s.game.turn.floor == before.game.turn.floor);
   CHECK(s.game.turn.stock == before.game.turn.stock && s.game.turn.captured0 == before.game.turn.captured0);
   CHECK(s.game.turn.captured1 == before.game.turn.captured1 && s.bombs0 == 0 && s.credits0 == 0);
+  return true;
+}
+
+bool automatic_pi_steal_case() {
+  // Hangame takes the stolen pi itself: lowest value first, then lowest card id.
+  auto s = base();
+  s.game.turn.hand0 = card_bit(0) | card_bit(1) | card_bit(2);
+  s.game.turn.floor = card_bit(3) | card_bit(8);
+  s.game.turn.captured1 = card_bit(10) | card_bit(14) | card_bit(41);
+  s.game.turn.stock = card_bit(12);
+  const auto r = play_bomb50(s, 0);
+  CHECK(r.status == SpecialStatus50::kOk && r.pi_transfer.transferred_mask == card_bit(10));
+  CHECK(s.game.turn.captured1 == (card_bit(14) | card_bit(41)));
   return true;
 }
 
@@ -112,7 +127,8 @@ bool arithmetic_and_illegal_case() {
 
 int main() {
   if (!shake_case() || !bomb_case() || !grenade_case() || !credit_case() ||
-      !rollback_case() || !arithmetic_and_illegal_case()) return 1;
+      !rollback_case() || !automatic_pi_steal_case() ||
+      !arithmetic_and_illegal_case()) return 1;
   std::cout << "cugo_special50_test: PASS\n";
   return 0;
 }

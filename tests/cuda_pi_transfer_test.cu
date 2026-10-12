@@ -163,6 +163,7 @@ int main() {
   cudaFree(device);
 
   std::uint32_t ok = 0;
+  std::uint32_t automatic = 0;
   std::uint32_t selection_required = 0;
   std::uint32_t invalid_selection = 0;
 
@@ -194,6 +195,18 @@ int main() {
     switch (cpu.status) {
       case PiTransferStatus::kOk:
         ++ok;
+        if (selection == 0 && cpu.requested_cards < cpu.available_cards &&
+            cpu.requested_cards != 0) {
+          // Hangame chooses the stolen pi itself: cheapest first, then card id.
+          const CardMask expected = cugo::game::hangame_pi_steal_selection50(
+              cugo::game::pi_card_mask(actor == 0 ? initial1 : initial0, options), 0,
+              false, requested);
+          if (cpu.transferred_mask != expected) {
+            std::cerr << "automatic pi selection mismatch at sample " << i << '\n';
+            return 4;
+          }
+          ++automatic;
+        }
         break;
       case PiTransferStatus::kSelectionRequired:
         ++selection_required;
@@ -204,8 +217,9 @@ int main() {
     }
   }
 
-  if (ok == 0 || selection_required == 0 || invalid_selection == 0) {
+  if (ok == 0 || automatic == 0 || selection_required != 0 || invalid_selection == 0) {
     std::cerr << "pi-transfer coverage missing: ok=" << ok
+              << " automatic=" << automatic
               << " selection_required=" << selection_required
               << " invalid_selection=" << invalid_selection << '\n';
     return 3;
@@ -213,7 +227,7 @@ int main() {
 
   std::cout << "cugo_cuda_pi_transfer_test: PASS (" << kSamples
             << " differential samples; ok=" << ok
-            << " selection_required=" << selection_required
+            << " automatic=" << automatic
             << " invalid_selection=" << invalid_selection << ")\n";
   return 0;
 }

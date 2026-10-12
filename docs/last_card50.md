@@ -48,6 +48,6 @@ but it supports keeping the last-card exception free of a special pi-steal event
 - non-final ppuk and jjok behavior;
 - ttadak and sweep behavior, because Hangame's current public page does not mark those entries
   with the same explicit last-card exception;
-- the existing final-turn predicate (`stock == 0`);
+- the final-turn predicate, now Hangame's turns 19 and 20 (`is_last_turn50`), where all pi steals are off (see `hangame50.md`);
 - bonus-to-ppuk association for non-final ppuk;
 - terminal, Go/Stop, scoring, and settlement layers.
