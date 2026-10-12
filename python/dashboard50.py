@@ -92,6 +92,10 @@ def parse_training_log(path: Path, mtime: float) -> dict:
     sampled = iterations[::stride]
     if sampled[-1] != iterations[-1]:
         sampled.append(iterations[-1])
+    if stride > 1:  # never drop rows that carry sparse metrics such as periodic evals
+        sparse = {k for k in keys if sum(k in row for row in rows.values()) * 2 < len(rows)}
+        extra = {i for i in iterations if sparse & rows[i].keys()}
+        sampled = sorted(set(sampled) | extra)
 
     if finished:
         status = "done"
@@ -104,7 +108,12 @@ def parse_training_log(path: Path, mtime: float) -> dict:
 
     timed_keys = ("selfplay_s", "buffer_add_s", "br_train_s", "average_train_s", "train_s")
     measured_s = sum(row.get(k, 0.0) for row in rows.values() for k in timed_keys)
-    kind = "nfsp" if any(k.startswith("br_") for k in keys) else "train50"
+    if any(k.startswith("ppo_") for k in keys):
+        kind = "ppo"
+    elif any(k.startswith("br_") for k in keys):
+        kind = "nfsp"
+    else:
+        kind = "train50"
 
     return {
         "is_run": True,
@@ -118,7 +127,7 @@ def parse_training_log(path: Path, mtime: float) -> dict:
         "total_games": sum(row.get("games", 0.0) for row in rows.values()),
         "measured_seconds": measured_s,
         "checkpoint_dirs": checkpoint_dirs,
-        "latest": rows[iterations[-1]],
+        "latest": {k: v for i in iterations for k, v in rows[i].items()},
         "series": {
             "iter": sampled,
             **{key: [rows[i].get(key) for i in sampled] for key in keys},

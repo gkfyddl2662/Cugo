@@ -304,6 +304,7 @@ function duration(sec) {
   if (mm) return `${mm}분 ${ss}초`;
   return `${ss}초`;
 }
+const KIND_LABEL = { nfsp: "NFSP", ppo: "PPO", train50: "train50" };
 const STATUS_LABEL = { running: "학습 중", done: "완료", stopped: "중단됨", failed: "실패" };
 const statusBadge = (st) => h("span", { class: "status " + st }, h("span", { class: "dot" }), STATUS_LABEL[st] || st);
 
@@ -349,13 +350,18 @@ function lineChart(card, cfg) {
 
   const ends = [];
   cfg.series.forEach((sr) => {
-    let d = "", pen = false, last = -1;
+    let d = "", pen = false, last = -1, count = 0;
     sr.values.forEach((v, i) => {
-      if (v == null || !isFinite(v)) { pen = false; return; }
+      if (v == null || !isFinite(v)) return;
       d += (pen ? "L" : "M") + X(xs[i]).toFixed(1) + " " + Y(v).toFixed(1);
-      pen = true; last = i;
+      pen = true; last = i; count++;
     });
     svg.append(s("path", { d, fill: "none", stroke: sr.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    if (count <= 60 && count < xs.length / 2) sr.values.forEach((v, i) => {
+      if (v != null && isFinite(v) && i !== last) svg.append(s("circle", { cx: X(xs[i]), cy: Y(v), r: 3, fill: sr.color, stroke: "var(--surface)", "stroke-width": 2 }));
+    });
+    if (cfg.zero && y.lo < 0 && y.hi > 0)
+      svg.append(s("line", { x1: M.l, x2: W - M.r, y1: Y(0), y2: Y(0), stroke: "var(--axis)", "stroke-width": 1, "shape-rendering": "crispEdges" }));
     if (last >= 0) ends.push({ sr, i: last, y: Y(sr.values[last]) });
   });
   // End labels only when they cannot collide; otherwise legend + tooltip carry identity.
@@ -434,6 +440,17 @@ function chartCard(cfg, extraHead) {
 const C = { br: "var(--series-1)", avg: "var(--series-2)", env: "var(--series-3)" };
 const nagariPct = (sr) => sr.games && sr.nagari ? sr.games.map((g, i) => (g ? (100 * sr.nagari[i]) / g : null)) : null;
 const PRESETS = {
+  ppo: [
+    { title: "기준 정책 대비 판당 점수", sub: "주기적 paired 평가, 0 위면 기준보다 강함", zero: true,
+      series: [["점수", "eval_ref_score", C.br], ["95% CI 하한", "eval_ref_ci_low", C.avg]] },
+    { title: "정책 엔트로피", sub: "전체 결정 vs Go/Stop 결정", series: [["전체", "ppo_entropy", C.br], ["Go/Stop", "ppo_entropy_gostop", C.avg]] },
+    { title: "근사 KL", sub: "업데이트당 정책 변화량", series: [["KL", "ppo_kl", C.br]] },
+    { title: "클립 비율", sub: "PPO ratio가 클립 범위를 벗어난 비율", fmt: "pct01", series: [["clipfrac", "ppo_clipfrac", C.br]] },
+    { title: "가치 설명력", sub: "oracle critic의 explained variance", fmt: "pct01", series: [["critic", "ppo_explained_var", C.avg]] },
+    { title: "가치 손실", sub: "smooth L1, 스케일된 점수 기준", series: [["critic", "ppo_value", C.avg]] },
+    { title: "평균 |보상|", sub: "판당 점수 절댓값, Go 배수가 늘면 커짐", series: [["|reward|", "mean_abs_reward0", C.env]] },
+    { title: "셀프플레이 처리량", sub: "초당 게임 수", fmt: "compact", series: [["games/s", "games_per_s", C.env]] },
+  ],
   nfsp: [
     { title: "정책 엔트로피", sub: "BR이 0 근처로 붙으면 정책이 결정론적으로 굳은 것", fmt: "smart",
       series: [["BR", "br_entropy", C.br], ["평균 정책", "average_entropy", C.avg]] },
@@ -470,6 +487,11 @@ function healthAlerts(run) {
       out.push(["serious", "BR 정책 엔트로피 붕괴", `최근 엔트로피 ${smart(L.br_entropy)}. BR이 거의 결정론적인 정책으로 굳어 새 행동을 시도하지 않습니다.`]);
     if (L.br_policy != null && L.br_policy < -10)
       out.push(["critical", "BR 정책 손실 발산", `최근 정책 손실 ${smart(L.br_policy)}. 리플레이의 오래된 행동 확률을 0으로 계속 밀어내고 있을 가능성이 큽니다.`]);
+  } else if (run.kind === "ppo") {
+    if (L.ppo_entropy_gostop != null && L.ppo_entropy_gostop < 0.02)
+      out.push(["warning", "Go/Stop 엔트로피 붕괴", `Go/Stop 결정 엔트로피 ${smart(L.ppo_entropy_gostop)}. 결정이 거의 결정론적입니다.`]);
+    if (L.ppo_kl != null && L.ppo_kl > 0.05)
+      out.push(["warning", "정책 변화 과다", `근사 KL ${smart(L.ppo_kl)}. 학습률이나 클립 범위를 낮춰야 할 수 있습니다.`]);
   } else if (L.entropy != null && L.entropy < 0.05) {
     out.push(["serious", "정책 엔트로피 붕괴", `최근 엔트로피 ${smart(L.entropy)}.`]);
   }
@@ -515,7 +537,7 @@ function renderRuns() {
     const prog = r.target_iterations ? `${intFmt.format(r.last_iteration)} / ${intFmt.format(r.target_iterations)}` : `iter ${intFmt.format(r.last_iteration)}`;
     nav.append(h("button", { class: "run-item", "aria-current": String(r.id === state.runId), title: r.id, onclick: () => selectRun(r.id) },
       h("span", { class: "rn" }, r.name), statusBadge(r.status),
-      h("span", { class: "rm" }, h("span", {}, r.kind === "nfsp" ? "NFSP" : "train50"), h("span", {}, prog), h("span", {}, ago(r.mtime, state.now)))));
+      h("span", { class: "rm" }, h("span", {}, KIND_LABEL[r.kind] || r.kind), h("span", {}, prog), h("span", {}, ago(r.mtime, state.now)))));
   }
 }
 
@@ -532,7 +554,7 @@ function renderDetail() {
 
   parts.push(h("div", { class: "run-head" },
     h("h1", {}, run.name), statusBadge(run.status),
-    h("span", { class: "tag" }, run.kind === "nfsp" ? "NFSP" : "train50"),
+    h("span", { class: "tag" }, KIND_LABEL[run.kind] || run.kind),
     h("div", { class: "run-sub" }, `build/${run.id} · 마지막 기록 ${ago(run.mtime, state.now)}`)));
 
   if (target) {
@@ -553,6 +575,8 @@ function renderDetail() {
     tile("누적 게임", compactFmt.format(run.total_games), `${intFmt.format(run.total_games)}판`),
     tile("셀프플레이 속도", L.games_per_s != null ? compactFmt.format(L.games_per_s) : "–", "최근 iteration games/s"),
     tile("계측 학습 시간", duration(run.measured_seconds), rate ? `평균 ${compactFmt.format(rate)} games/s (학습 포함)` : null),
+    run.kind === "ppo" && L.eval_ref_score != null ? tile("기준 정책 대비", (L.eval_ref_score > 0 ? "+" : "") + L.eval_ref_score.toFixed(2),
+      `판당 점수 · 95% CI ${L.eval_ref_ci_low.toFixed(2)} ~ ${L.eval_ref_ci_high.toFixed(2)}`) : null,
     run.kind === "nfsp" ? tile("BR 결정 비율", L.br_decision_pct != null ? L.br_decision_pct.toFixed(1) + "%" : "–", `anticipatory η = ${run.config?.anticipatory ?? "–"}`) : null));
 
   const presets = (PRESETS[run.kind] || []).map((p) => resolveSeries(p, run.series)).filter(Boolean);
