@@ -44,10 +44,33 @@ struct InitialDeal50 {
   std::uint64_t rng_state;
 };
 
+#if !defined(__CUDA_ARCH__)
+// Host-only replay hook: when set, stock draws take these cards in order instead of
+// sampling (used to replay games recorded from another implementation). A forced card
+// missing from the remaining stock sets `mismatch` and falls back to sampling.
+struct ForcedDraws50 {
+  const CardId* cards;
+  int count;
+  int next;
+  bool mismatch;
+};
+inline thread_local ForcedDraws50* g_forced_draws50 = nullptr;
+#endif
+
 CUGO_HOST_DEVICE inline CardId draw_uniform_card(CardMask& remaining,
                                                  core::SplitMix64& rng) noexcept {
   const std::uint32_t count = static_cast<std::uint32_t>(core::card_count(remaining));
   if (count == 0u) return core::kInvalidCard;
+#if !defined(__CUDA_ARCH__)
+  if (ForcedDraws50* forced = g_forced_draws50; forced != nullptr && forced->next < forced->count) {
+    const CardId card = forced->cards[forced->next++];
+    if ((remaining & core::card_bit(card)) != 0) {
+      remaining &= ~core::card_bit(card);
+      return card;
+    }
+    forced->mismatch = true;
+  }
+#endif
   const std::uint32_t rank = core::uniform_bounded(rng, count);
   const CardId card = core::select_card_by_rank(remaining, rank);
   remaining &= ~core::card_bit(card);

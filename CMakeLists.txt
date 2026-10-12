@@ -73,6 +73,10 @@ if(BUILD_TESTING)
   target_link_libraries(cugo_torch50_test PRIVATE cugo_core)
   add_test(NAME cugo_torch50_test COMMAND cugo_torch50_test)
 
+  # Differential replay of games recorded from another implementation (not a test).
+  add_executable(cugo_hg_replay50 tools/hg_replay50.cpp)
+  target_link_libraries(cugo_hg_replay50 PRIVATE cugo_core)
+
   add_executable(cugo_hangame_rules50_test tests/hangame_rules50_test.cpp)
   target_link_libraries(cugo_hangame_rules50_test PRIVATE cugo_core)
   add_test(NAME cugo_hangame_rules50_test COMMAND cugo_hangame_rules50_test)

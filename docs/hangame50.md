@@ -58,6 +58,8 @@ Hangame number of that turn. `kLastTurnIndex50 = 18` marks the start of turn 19,
 
 When both candidates are plain pi of months 1..11, the choice is made automatically
 (`JDAKOOAHHKI`, `auto_floor_choice50`). December and any mixed pair stay a real choice.
+Hangame captures the card that reached the floor first; Cugo takes the lower id. Every
+mission set holds both plain pi of a month or neither, so the two are interchangeable.
 
 ## Bomb, grenade, shake
 
@@ -130,6 +132,24 @@ final = (base + go) × go multiplier × 2^(shakes + bombs) × meongtta × missio
 - **Nagari carry-over**: `round_multiplier` scales the whole next game, side payments
   included. Training uses 1, which leaves the optimal policy unchanged because every
   payoff scales together.
+
+## Differential check
+
+`tools/hg_replay50.cpp` (`cugo_hg_replay50 <trace>`) replays games recorded from the
+client's own SingleServer, run offline outside Unity against copies of its assemblies.
+The deck order comes from the trace and stock draws are forced through
+`g_forced_draws50`. At every turn notice it compares the actor, floor, hands, bomb
+credits, captured cards, running score, Go count, ppuk state, shakes and mission
+multiplier. At the end it compares the winner, the final score and side payments, and
+a nagari against exhausted hands. Interchangeable cards (same pi value and mission
+membership) are aligned first. Hangame also settles the loser's gukjin after a
+fixed-score end, where it cannot matter, so the running score is not compared there.
+
+The recording harness stays outside the repository because it loads the client's
+binaries. Seat 0 plays a random client with four styles: random, capture-seeking,
+always Go and always stop. Seat 1 is the server's AI. On 80,000 recorded games every
+game replayed identically. That included 156 nagari, 2,143 Chongtong, 267 three-ppuk,
+about 21k bomb dummies and about 42k gukjin choices.
 
 ## Known approximations
 
