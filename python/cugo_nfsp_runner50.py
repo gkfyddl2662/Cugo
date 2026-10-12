@@ -96,7 +96,8 @@ def run_nfsp(args) -> None:
     br_replay_mib = br_replay.storage_bytes / (1024.0 * 1024.0)
     average_reservoir_mib = average_reservoir.storage_bytes / (1024.0 * 1024.0)
     print(
-        f"algorithm=nfsp-actor-critic-v1 anticipatory={args.anticipatory:g} "
+        f"algorithm=nfsp-actor-critic-v1 iterations={args.iterations} "
+        f"anticipatory={args.anticipatory:g} "
         f"br_temperature={args.br_temperature:g} "
         f"average_temperature={args.average_temperature:g}"
     )
