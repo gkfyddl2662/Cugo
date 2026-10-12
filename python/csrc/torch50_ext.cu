@@ -275,6 +275,26 @@ __global__ void branch_indexed_kernel(const TorchEnv50* envs,
                     status + i, primary_committed + i);
 }
 
+__global__ void hands_indexed_kernel(const TorchEnv50* envs,
+                                     const std::int64_t* env_ids,
+                                     std::int64_t* hands,
+                                     std::int64_t count,
+                                     std::int64_t env_count) {
+  const std::int64_t i =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  const std::int64_t env_id = env_ids[i];
+  if (env_id < 0 || env_id >= env_count) {
+    hands[2 * i] = 0;
+    hands[2 * i + 1] = 0;
+    return;
+  }
+  const auto& turn = envs[env_id].game.special.game.turn;
+  hands[2 * i] = static_cast<std::int64_t>(turn.hand0);
+  hands[2 * i + 1] = static_cast<std::int64_t>(turn.hand1);
+}
+
 std::vector<torch::Tensor> allocate_observation_tensors(
     std::int64_t count,
     const c10::Device& device) {
@@ -495,4 +515,28 @@ std::vector<torch::Tensor> cugo_torch50_branch_indexed_cuda(
   }
 
   return {children, outputs[0], outputs[1], outputs[2], outputs[3], outputs[4]};
+}
+
+torch::Tensor cugo_torch50_hands_indexed_cuda(torch::Tensor states,
+                                              torch::Tensor env_ids) {
+  check_states(states);
+  check_cuda_1d(env_ids, at::kLong, "env_ids");
+  check_same_device(states, env_ids, "states", "env_ids");
+
+  const c10::cuda::CUDAGuard guard(states.device());
+  const std::int64_t count = env_ids.numel();
+  auto hands = torch::empty(
+      {count, 2}, torch::TensorOptions().device(states.device()).dtype(at::kLong));
+
+  if (count != 0) {
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    hands_indexed_kernel<<<blocks, kThreads, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const TorchEnv50*>(states.data_ptr<std::uint8_t>()),
+        env_ids.data_ptr<std::int64_t>(), hands.data_ptr<std::int64_t>(), count,
+        states.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  return hands;
 }

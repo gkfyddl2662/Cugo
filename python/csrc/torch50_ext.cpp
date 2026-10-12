@@ -23,6 +23,8 @@ std::vector<torch::Tensor> cugo_torch50_branch_indexed_cuda(
     torch::Tensor states,
     torch::Tensor env_ids,
     torch::Tensor actions);
+torch::Tensor cugo_torch50_hands_indexed_cuda(torch::Tensor states,
+                                              torch::Tensor env_ids);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Cugo Shin Matgo CUDA batch environment";
@@ -40,6 +42,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Clone selected environment rows on the current CUDA stream");
   m.def("branch_indexed", &cugo_torch50_branch_indexed_cuda,
         "Clone selected rows and apply actions without mutating parents");
+  m.def("hands_indexed", &cugo_torch50_hands_indexed_cuda,
+        "Return [N, 2] int64 card masks of both players' hidden hands");
 
   m.attr("FEATURE_COUNT") = pybind11::int_(cugo::game::kTorch50FeatureCount);
   m.attr("ACTION_COUNT") = pybind11::int_(cugo::game::kTorch50ActionCount);
