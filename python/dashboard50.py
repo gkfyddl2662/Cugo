@@ -97,15 +97,6 @@ def parse_training_log(path: Path, mtime: float) -> dict:
         extra = {i for i in iterations if sparse & rows[i].keys()}
         sampled = sorted(set(sampled) | extra)
 
-    if finished:
-        status = "done"
-    elif failed:
-        status = "failed"
-    elif time.time() - mtime < RUNNING_WINDOW_S:
-        status = "running"
-    else:
-        status = "stopped"
-
     timed_keys = ("selfplay_s", "buffer_add_s", "br_train_s", "average_train_s", "train_s")
     measured_s = sum(row.get(k, 0.0) for row in rows.values() for k in timed_keys)
     if any(k.startswith("ppo_") for k in keys):
@@ -118,7 +109,7 @@ def parse_training_log(path: Path, mtime: float) -> dict:
     return {
         "is_run": True,
         "kind": kind,
-        "status": status,
+        "outcome": "done" if finished else "failed" if failed else None,
         "mtime": mtime,
         "config": config,
         "final": final,
@@ -135,9 +126,16 @@ def parse_training_log(path: Path, mtime: float) -> dict:
     }
 
 
+def live_status(info: dict, idle: str = "stopped") -> str:
+    """Status depends on the clock, so it is computed per request, never cached."""
+    if info.get("outcome"):
+        return info["outcome"]
+    return "running" if time.time() - info["mtime"] < RUNNING_WINDOW_S else idle
+
+
 def parse_eval_log(path: Path, mtime: float) -> dict:
     sides: dict[str, dict] = {}
-    record: dict = {"status": "running" if time.time() - mtime < RUNNING_WINDOW_S else "failed"}
+    record: dict = {"outcome": None}
     for line in read_text(path).splitlines():
         line = line.strip()
         head = line.split(" ", 1)[0]
@@ -158,7 +156,7 @@ def parse_eval_log(path: Path, mtime: float) -> dict:
                 {"ci_low": float(ci.group(1)), "ci_high": float(ci.group(2))} if ci else {}
             )
         elif line == "evaluation PASS":
-            record["status"] = "done"
+            record["outcome"] = "done"
     record.update(name=path.stem, mtime=mtime, a=sides.get("A"), b=sides.get("B"))
     return record
 
@@ -204,7 +202,7 @@ def summarize_runs(build: Path) -> list[dict]:
                 "id": run_id(build, path),
                 "name": path.stem,
                 "kind": info["kind"],
-                "status": info["status"],
+                "status": live_status(info),
                 "mtime": info["mtime"],
                 "last_iteration": info["last_iteration"],
                 "target_iterations": target,
@@ -255,7 +253,8 @@ def make_handler(build: Path):
             if url.path == "/":
                 self.send(PAGE.read_bytes(), "text/html; charset=utf-8")
             elif url.path == "/api/state":
-                evals = [cached(p, parse_eval_log) for p in (build / "evals").glob("*.log")]
+                evals = [(e := cached(p, parse_eval_log)) | {"status": live_status(e, "failed")}
+                         for p in (build / "evals").glob("*.log")]
                 evals.sort(key=lambda e: e["mtime"], reverse=True)
                 self.json({"runs": summarize_runs(build), "evals": evals, "gpu": gpu_status(),
                            "now": time.time()})
@@ -266,7 +265,7 @@ def make_handler(build: Path):
                     self.json({"error": "unknown run"}, 404)
                     return
                 info = cached(path, parse_training_log)
-                self.json(info | {"id": wanted, "name": path.stem,
+                self.json(info | {"id": wanted, "name": path.stem, "status": live_status(info),
                                   "checkpoints": list_checkpoints(info.get("checkpoint_dirs", []))})
             else:
                 self.json({"error": "not found"}, 404)

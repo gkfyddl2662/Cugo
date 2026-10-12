@@ -149,7 +149,7 @@ def main() -> None:
             snapshots.append(frozen(actor))
             del snapshots[:-args.pool_size]
 
-        if reference is not None and args.eval_every > 0 and iteration % args.eval_every == 0:
+        if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):
             s = evaluate_paired(ext=ext, model_a=actor.eval(), model_b=reference, pairs=args.eval_pairs,
                                 seed_offset=EVAL_SEED_OFFSET, max_steps=128, use_amp=True)
             print(f"iter={iteration} eval_ref_score={s.mean_pair_score_a:.4f} "

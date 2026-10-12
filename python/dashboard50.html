@@ -333,7 +333,7 @@ function lineChart(card, cfg) {
   const fmt = FORMATS[cfg.fmt || "smart"];
   const tickFmt = cfg.fmt ? fmt : (t) => (Math.abs(t) >= 100000 ? compactFmt.format(t) : String(+t.toPrecision(6)));
   const all = cfg.series.flatMap((sr) => sr.values).filter((v) => v != null && isFinite(v));
-  if (!xs.length || !all.length) { plot.append(h("div", { class: "empty" }, "데이터 없음")); return; }
+  if (!xs.length || !all.length) { plot.append(h("div", { class: "empty" }, cfg.empty || "데이터 없음")); return; }
   const y = niceScale(Math.min(...all), Math.max(...all), 4);
   const x0 = xs[0], x1 = xs[xs.length - 1] === x0 ? x0 + 1 : xs[xs.length - 1];
   const X = (v) => M.l + ((v - x0) / (x1 - x0)) * (W - M.l - M.r);
@@ -442,6 +442,7 @@ const nagariPct = (sr) => sr.games && sr.nagari ? sr.games.map((g, i) => (g ? (1
 const PRESETS = {
   ppo: [
     { title: "기준 정책 대비 판당 점수", sub: "주기적 paired 평가, 0 위면 기준보다 강함", zero: true,
+      pending: "아직 평가 기록이 없습니다. --eval-every 주기마다 기록되며, 평가를 끈 실행(--eval-every 0)에는 나타나지 않습니다.",
       series: [["점수", "eval_ref_score", C.br], ["95% CI 하한", "eval_ref_ci_low", C.avg]] },
     { title: "정책 엔트로피", sub: "전체 결정 vs Go/Stop 결정", series: [["전체", "ppo_entropy", C.br], ["Go/Stop", "ppo_entropy_gostop", C.avg]] },
     { title: "근사 KL", sub: "업데이트당 정책 변화량", series: [["KL", "ppo_kl", C.br]] },
@@ -475,7 +476,9 @@ function resolveSeries(preset, series) {
   const out = preset.series
     .map(([name, key, color]) => ({ name, color, values: typeof key === "function" ? key(series) : series[key] }))
     .filter((sr) => sr.values);
-  return out.length ? { ...preset, x: series.iter, series: out } : null;
+  if (out.length) return { ...preset, x: series.iter, series: out };
+  // Keep charts whose data arrives later (periodic evals) visible with an explanation.
+  return preset.pending ? { ...preset, x: series.iter, series: [], empty: preset.pending } : null;
 }
 
 // ---------- health checks ----------
