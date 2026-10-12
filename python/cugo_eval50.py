@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from cugo_nfsp50 import AveragePolicyNet
+from cugo_ppo_nets50 import PpoActor
 from cugo_train50 import PolicyValueNet, make_seeds
 
 
@@ -80,7 +81,9 @@ def load_policy_checkpoint(
     iteration = int(iteration_value) if iteration_value is not None else None
 
     if policy == "auto":
-        if "average_model" in payload:
+        if "actor" in payload:
+            policy = "ppo"
+        elif "average_model" in payload:
             policy = "average"
         elif "model" in payload:
             policy = "legacy"
@@ -99,13 +102,19 @@ def load_policy_checkpoint(
         if state is None:
             raise ValueError(f"checkpoint {path} has no br_model")
         model = PolicyValueNet(496, 177, hidden)
+    elif policy == "ppo":
+        state = payload.get("actor")
+        if state is None:
+            raise ValueError(f"checkpoint {path} has no actor")
+        blocks = int(payload.get("config", {}).get("blocks", 3))
+        model = PpoActor(hidden, blocks)
     elif policy == "legacy":
         state = payload.get("model")
         if state is None:
             raise ValueError(f"checkpoint {path} has no legacy model")
         model = PolicyValueNet(496, 177, hidden)
     else:
-        raise ValueError("policy must be one of auto, average, br, legacy")
+        raise ValueError("policy must be one of auto, average, br, legacy, ppo")
 
     model.load_state_dict(state, strict=True)
     model.to(device)
@@ -132,9 +141,12 @@ def _greedy_actions(
     features: torch.Tensor,
     legal: torch.Tensor,
     use_amp: bool,
+    sample: bool = False,
 ) -> torch.Tensor:
     logits = _policy_logits(model, features, use_amp)
     masked = logits.float().masked_fill(~legal, -1.0e30)
+    if sample:
+        return torch.multinomial(torch.softmax(masked, dim=1), 1).squeeze(1)
     return masked.argmax(dim=1).to(torch.int64)
 
 
@@ -146,6 +158,8 @@ def evaluate_paired(
     seed_offset: int,
     max_steps: int,
     use_amp: bool,
+    sample_a: bool = False,
+    sample_b: bool = False,
 ) -> EvalSummary:
     if pairs <= 0:
         raise ValueError("pairs must be positive")
@@ -234,6 +248,7 @@ def evaluate_paired(
                         features.index_select(0, a_rows),
                         legal.index_select(0, a_rows),
                         use_amp,
+                        sample_a,
                     ),
                 )
             if b_rows.numel():
@@ -245,6 +260,7 @@ def evaluate_paired(
                         features.index_select(0, b_rows),
                         legal.index_select(0, b_rows),
                         use_amp,
+                        sample_b,
                     ),
                 )
 

@@ -13,8 +13,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Paired seat-balanced Torch50 policy evaluator")
     parser.add_argument("--a-checkpoint", type=Path, required=True)
     parser.add_argument("--b-checkpoint", type=Path, required=True)
-    parser.add_argument("--a-policy", choices=("auto", "average", "br", "legacy"), default="auto")
-    parser.add_argument("--b-policy", choices=("auto", "average", "br", "legacy"), default="auto")
+    parser.add_argument("--a-policy", choices=("auto", "average", "br", "legacy", "ppo"), default="auto")
+    parser.add_argument("--b-policy", choices=("auto", "average", "br", "legacy", "ppo"), default="auto")
+    parser.add_argument("--a-sample", action="store_true", help="A samples from its policy instead of argmax")
+    parser.add_argument("--b-sample", action="store_true", help="B samples from its policy instead of argmax")
     parser.add_argument("--pairs", type=int, default=131072)
     parser.add_argument("--seed-offset", type=int, default=900000000)
     parser.add_argument("--max-steps", type=int, default=128)
@@ -43,7 +45,8 @@ def main() -> None:
     )
     print(
         f"eval paired_seat_swap=True deterministic_argmax=True pairs={args.pairs} "
-        f"games={args.pairs * 2} seed_offset={args.seed_offset} amp={use_amp}"
+        f"games={args.pairs * 2} seed_offset={args.seed_offset} amp={use_amp} "
+        f"a_sample={args.a_sample} b_sample={args.b_sample}"
     )
 
     s = evaluate_paired(
@@ -54,6 +57,8 @@ def main() -> None:
         seed_offset=args.seed_offset,
         max_steps=args.max_steps,
         use_amp=use_amp,
+        sample_a=args.a_sample,
+        sample_b=args.b_sample,
     )
     print(
         f"RESULT games={s.games} evaluated_games={s.evaluated_games} "
