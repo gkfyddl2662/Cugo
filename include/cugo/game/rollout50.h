@@ -236,6 +236,10 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
   }
 
   TerminalGameState50 next = state;
+  // Every card leaves a hand through an action, so recording the hands here keeps
+  // held0/held1 complete; replacements drawn into a hand are recorded before use.
+  next.held0 |= next.special.game.turn.hand0;
+  next.held1 |= next.special.game.turn.hand1;
 
   if (action.kind == ActionKind50::kChongtongWin ||
       action.kind == ActionKind50::kChongtongContinue) {
@@ -321,6 +325,12 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
   }
 
   if (action.kind == ActionKind50::kShake) {
+    // A shake shows the month's cards in hand to the opponent.
+    if (core::is_standard_card(action.card)) {
+      const CardMask shown = month_cards50(active_hand50(next.special.game.turn),
+                                           core::card_month(action.card));
+      (actor == 0 ? next.revealed0 : next.revealed1) |= shown;
+    }
     const SpecialAction50 shake{SpecialKind50::kShake, action.card, action.month,
                                 core::kInvalidCard, kNoPiTransferSelection};
     const TerminalSpecial50Result started = apply_terminal_special_action50(next, shake);

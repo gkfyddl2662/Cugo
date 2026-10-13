@@ -16,7 +16,7 @@ This means one network head can handle ordinary play, bonus play, shake/bomb/gre
 
 ## Dense feature layout
 
-`kTorch50FeatureCount = 560` floats. The first 479 are semantic and 479..495 are zero padding (the legacy 496-wide block). Hangame features are appended so old networks could be widened with zero weights (done once by `migrate_ppo50.py`, removed after the migration): 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`.
+`kTorch50FeatureCount = 720` floats (contract v3, extension `cugo_torch50_ext_v3`). The first 479 are semantic, 479..490 is the neutral-ppuk month plane and 491..495 stay zero (the legacy 496-wide block). The Hangame block follows: 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). 560..709 are three public-history card planes and 710..719 are zero. Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`. New inputs are added where a zero weight leaves an old network's output unchanged; `python/migrate_ppo50.py` widens 560-feature checkpoints that way.
 
 | Range | Size | Meaning |
 | --- | ---: | --- |
@@ -25,7 +25,11 @@ This means one network head can handle ordinary play, bonus play, shake/bomb/gre
 | `396..445` | 50 | already-selected physical pi cards during a multi-card pi choice |
 | `446..452` | 7 | one-hot decision kind: none, primary, Go/Stop, Chongtong, resolve-played, resolve-drawn, pi-card |
 | `453..478` | 26 | normalized scalar state and post-chance metadata |
-| `479..495` | 17 | zero padding |
+| `479..490` | 12 | neutral ppuk months (initial-floor stacks without an owner) |
+| `491..495` | 5 | zero padding |
+| `496..559` | 64 | Hangame block: mission card plane (48) and 16 scalars |
+| `560..709` | 150 | own played cards, opponent played cards, opponent cards known from a shake |
+| `710..719` | 10 | zero padding |
 
 The scalar block contains turn/stock counts, both players' Go/base-score/bomb/credit/ppuk summaries, persistent Gukjin roles, requested pi count, primary action, revealed card, selected/legal choice counts, and compact hand/floor/unseen counts.
 
@@ -39,4 +43,4 @@ The environment returns reward from player 0's perspective only when the game re
 
 The CPU test runs 8,192 full games through this environment and requires the rollout digest and post-chance choice counts to match the existing explicit post-chance driver. The CUDA test runs 65,536 full-game differential samples plus 4,096 CPU/GPU feature-and-mask differential samples.
 
-No PyTorch dependency is required for these tests. The next integration layer can wrap this fixed 560-float / 179-action contract in a PyTorch CUDA extension without changing game semantics.
+No PyTorch dependency is required for these tests. The next integration layer can wrap this fixed 720-float / 179-action contract in a PyTorch CUDA extension without changing game semantics.

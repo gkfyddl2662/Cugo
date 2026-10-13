@@ -11,8 +11,8 @@ The JIT extension exposes three operations:
   - both inputs are CUDA `int64` vectors.
   - `states` is an opaque CUDA `uint8 [N, STATE_BYTES]` tensor containing `TorchEnv50` objects.
 - `observe(states) -> features, legal, players, done, status`
-  - `features`: CUDA `float32 [N, 496]`.
-  - `legal`: CUDA `bool [N, 177]`.
+  - `features`: CUDA `float32 [N, 720]` (`FEATURE_COUNT`).
+  - `legal`: CUDA `bool [N, 179]` (`ACTION_COUNT`).
   - `players`: CUDA `uint8 [N]` decision player.
   - `done`: CUDA `bool [N]`.
   - `status`: CUDA `int16 [N]`.
@@ -40,9 +40,9 @@ py python/torch50_smoke.py --batch 32768 --warmup 1 --iters 3
 
 `python/torch50_smoke.py` creates a deliberately small FP16 policy/value MLP:
 
-- input: 496 floats
+- input: 720 floats
 - trunk: 256 -> 256 with SiLU
-- policy: 177 logits
+- policy: 179 logits
 - value: scalar
 
 The policy logits are masked by the engine-generated 177-way legal mask before `argmax`. The script runs complete games until terminal or nagari and reports end-to-end games/s. This network is not a training architecture decision; it is a transport/inference baseline for measuring the CUDA-env/PyTorch boundary.

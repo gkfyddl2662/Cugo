@@ -43,17 +43,26 @@ inline constexpr std::uint16_t kTorch50MissionPlaneOffset = 496;
 inline constexpr std::uint16_t kTorch50ExtScalarOffset =
     kTorch50MissionPlaneOffset + core::kStandardCardCount;
 inline constexpr std::uint16_t kTorch50ExtScalarCount = 16;
-inline constexpr std::uint16_t kTorch50FeatureCount =
+// Contract v3: the neutral-ppuk month plane takes 12 of the legacy padding slots, and
+// three public-history card planes (own played, opponent played, opponent cards
+// known from a shake) follow the Hangame block. Zero padding keeps the width a
+// multiple of 16.
+inline constexpr std::uint16_t kTorch50NeutralPpukOffset = kTorch50ScalarOffset + kTorch50ScalarCount;
+inline constexpr std::uint16_t kTorch50HistoryOffset =
     kTorch50ExtScalarOffset + kTorch50ExtScalarCount;
+inline constexpr std::uint16_t kTorch50HistoryPlaneCount = 3;
+inline constexpr std::uint16_t kTorch50FeatureCount = 720;
 
 static_assert(kTorch50PrimaryActionCount == 127);
 static_assert(kTorch50ActionCount == 179);
 static_assert(kTorch50GukjinActionBegin == kPolicyGukjinPi50);
 static_assert(kTorch50GukjinActionBegin + 1u == kPolicyGukjinAnimal50);
-static_assert(kTorch50FeatureCount == 560);
+static_assert(kTorch50HistoryOffset == 560);
 static_assert(kTorch50SemanticFeatureCount == 479);
 static_assert((kTorch50FeatureCount % 16u) == 0u);
-static_assert(kTorch50SemanticFeatureCount <= kTorch50MissionPlaneOffset);
+static_assert(kTorch50NeutralPpukOffset + core::kMonthCount <= kTorch50MissionPlaneOffset);
+static_assert(kTorch50HistoryOffset + kTorch50HistoryPlaneCount * core::kShinMatgoCardCount <=
+              kTorch50FeatureCount);
 
 struct TorchActionMask50 {
   std::uint64_t word0;
@@ -406,6 +415,16 @@ CUGO_HD inline void encode_torch_packet50(const TorchPacket50& packet,
       ? 1.0f : 0.0f;
   x[15] = o.opponent_ppuk_streak == kPpukFirst50 || o.opponent_ppuk_streak == kPpukSecond50
       ? 1.0f : 0.0f;
+
+  encode_torch_month_plane50(features, kTorch50NeutralPpukOffset, o.neutral_ppuk_months);
+  const core::CardMask history[kTorch50HistoryPlaneCount] = {
+      o.own_played, o.opponent_played, o.opponent_known_hand};
+  for (std::uint16_t plane = 0; plane < kTorch50HistoryPlaneCount; ++plane) {
+    encode_torch_card_plane50(
+        features,
+        static_cast<std::uint16_t>(kTorch50HistoryOffset + plane * core::kShinMatgoCardCount),
+        history[plane]);
+  }
 }
 
 CUGO_HD inline std::int64_t torch_reward0_50(const TorchEnv50& env) noexcept {

@@ -94,6 +94,15 @@ struct PolicyObservation50 {
   std::uint8_t opponent_gukjin_locked;
   std::uint8_t round_multiplier;
   std::uint8_t last_turn;
+
+  // Public information a player at the table can see.
+  // Initial-floor ppuk stacks without an owner (capturing one steals one pi).
+  std::uint16_t neutral_ppuk_months;
+  // Cards each side has played from hand so far.
+  CardMask own_played;
+  CardMask opponent_played;
+  // Opponent cards known from a shake declaration and still in their hand.
+  CardMask opponent_known_hand;
 };
 
 struct PolicyPacket50 {
@@ -335,7 +344,14 @@ CUGO_HD inline PolicyObservation50 pack_policy_observation50(
   const CardMask pending_public = pending_public_cards50(turn);
   const CardMask public_known = own_hand | turn.floor | own_captured |
                                 opponent_captured | pending_public;
-  const CardMask unseen = core::kShinMatgoDeckMask & ~public_known;
+  const CardMask opponent_revealed = player == 0 ? state.revealed1 : state.revealed0;
+  const CardMask opponent_known_hand =
+      opponent_revealed & core::kShinMatgoDeckMask & ~public_known;
+  const CardMask unseen =
+      core::kShinMatgoDeckMask & ~public_known & ~opponent_known_hand;
+  const CardMask own_held = player == 0 ? state.held0 : state.held1;
+  const CardMask opponent_held = player == 0 ? state.held1 : state.held0;
+  const CardMask opponent_hand = player == 0 ? turn.hand1 : turn.hand0;
 
   const std::uint16_t owner1_months = static_cast<std::uint16_t>(
       turn.ppuk_owner1_months & kAllMonthBits50);
@@ -344,10 +360,13 @@ CUGO_HD inline PolicyObservation50 pack_policy_observation50(
   const std::uint16_t own_ppuk = player == 0 ? owner0_months : owner1_months;
   const std::uint16_t opponent_ppuk = player == 0 ? owner1_months : owner0_months;
 
-  const std::uint16_t own_shaken = player == 0 ? state.special.shaken0
-                                                : state.special.shaken1;
-  const std::uint16_t opponent_shaken = player == 0 ? state.special.shaken1
-                                                     : state.special.shaken0;
+  // Three- and four-card shakes both double the score and both are public.
+  const std::uint16_t shaken0 =
+      static_cast<std::uint16_t>(state.special.shaken0 | state.special.shaken4_0);
+  const std::uint16_t shaken1 =
+      static_cast<std::uint16_t>(state.special.shaken1 | state.special.shaken4_1);
+  const std::uint16_t own_shaken = player == 0 ? shaken0 : shaken1;
+  const std::uint16_t opponent_shaken = player == 0 ? shaken1 : shaken0;
   const ScoreBreakdown own_score = persistent_score_player50(turn, player);
   const ScoreBreakdown opponent_score = persistent_score_player50(turn, opponent);
 
@@ -396,7 +415,11 @@ CUGO_HD inline PolicyObservation50 pack_policy_observation50(
       static_cast<std::uint8_t>(gukjin_locked50(turn, player)),
       static_cast<std::uint8_t>(gukjin_locked50(turn, opponent)),
       round_multiplier50(state),
-      static_cast<std::uint8_t>(is_last_turn50(turn))};
+      static_cast<std::uint8_t>(is_last_turn50(turn)),
+      turn.neutral_ppuk_months,
+      own_held & ~own_hand,
+      opponent_held & ~opponent_hand,
+      opponent_known_hand};
 }
 
 CUGO_HD inline PolicyPacket50 make_policy_packet50(
@@ -445,7 +468,10 @@ CUGO_HD inline bool equal_policy_observation50(
          a.opponent_mission_multi == b.opponent_mission_multi &&
          a.own_gukjin_locked == b.own_gukjin_locked &&
          a.opponent_gukjin_locked == b.opponent_gukjin_locked &&
-         a.round_multiplier == b.round_multiplier && a.last_turn == b.last_turn;
+         a.round_multiplier == b.round_multiplier && a.last_turn == b.last_turn &&
+         a.neutral_ppuk_months == b.neutral_ppuk_months &&
+         a.own_played == b.own_played && a.opponent_played == b.opponent_played &&
+         a.opponent_known_hand == b.opponent_known_hand;
 }
 
 CUGO_HD inline bool equal_policy_packet50(const PolicyPacket50& a,

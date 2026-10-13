@@ -151,10 +151,25 @@ always Go and always stop. Seat 1 is the server's AI. On 80,000 recorded games e
 game replayed identically. That included 156 nagari, 2,143 Chongtong, 267 three-ppuk,
 about 21k bomb dummies and about 42k gukjin choices.
 
+## Shake answers
+
+Hangame records a month as soon as its shake question is answered, yes or no, and does
+not ask again (`_listShakeMonth`, `_listShake4Month`). Cugo keeps no such record and
+needs none: a card of a shakeable month that is played without shaking lands on the
+empty floor, so its owner can never again hold three of that month with none on the
+floor. `test_declined_shake_never_returns` checks this over random games.
+
+## Public information in the observation
+
+A shake shows the month's cards to the opponent (`NoticeShakeToC` lists them), and
+every card played from a hand is seen by both players. The observation carries the
+cards each side has played, the opponent cards known from a shake that are still in
+their hand (removed from the unseen plane), three- and four-card shakes alike, and
+neutral ppuk stacks as their own plane.
+
 ## Known approximations
 
 - Steal tie-break by card id, as noted above.
-- A shake declined and later re-offered after a bonus replacement is not modeled.
 - The mission is drawn from a hash of the deal, not from Hangame's server RNG.
 - The next game's first player and the carry of nagari between games live outside
   the single-game engine.

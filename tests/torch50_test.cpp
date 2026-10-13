@@ -67,10 +67,26 @@ void verify_features(const TorchPacket50& packet) {
     require(features[i] >= 0.0f && features[i] <= 1.0f,
             "semantic feature must stay in [0, 1]");
   }
-  for (std::uint16_t i = kTorch50SemanticFeatureCount;
+  for (std::uint16_t i = kTorch50NeutralPpukOffset + core::kMonthCount;
        i < kTorch50MissionPlaneOffset; ++i) {
     require(features[i] == 0.0f, "padding features must be zero");
   }
+  constexpr std::uint16_t kHistoryEnd =
+      kTorch50HistoryOffset + kTorch50HistoryPlaneCount * core::kShinMatgoCardCount;
+  for (std::uint16_t i = kHistoryEnd; i < kTorch50FeatureCount; ++i) {
+    require(features[i] == 0.0f, "trailing padding must be zero");
+  }
+  for (std::uint16_t i = kTorch50HistoryOffset; i < kHistoryEnd; ++i) {
+    require(features[i] == 0.0f || features[i] == 1.0f, "history planes are binary");
+  }
+
+  // Public-history planes never overlap what they claim to exclude.
+  const PolicyObservation50& o = packet.observation;
+  require((o.own_played & o.own_hand) == 0, "own played cards are out of hand");
+  require((o.opponent_known_hand & (o.own_hand | o.floor | o.own_captured |
+                                     o.opponent_captured | o.unseen)) == 0,
+          "known opponent cards are neither public nor unseen");
+  require((o.own_played & o.opponent_played) == 0, "a card is played by one side only");
 
   std::uint16_t decision_hot = 0;
   for (std::uint16_t i = 0; i < kTorch50DecisionCount; ++i) {

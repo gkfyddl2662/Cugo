@@ -92,6 +92,13 @@ struct TerminalGameState50 {
   std::uint8_t mission_multiplier;
   std::uint8_t mission_multi0;
   std::uint8_t mission_multi1;
+  // Public history kept for observations (apply_action50 maintains both).
+  // Every card a player has held in hand, so held & ~hand is what they have played.
+  CardMask held0;
+  CardMask held1;
+  // Cards a player showed by declaring a shake.
+  CardMask revealed0;
+  CardMask revealed1;
 };
 
 CUGO_HD inline std::uint8_t round_multiplier50(const TerminalGameState50& s) noexcept {

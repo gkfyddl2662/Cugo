@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-FEATURES = 560  # 496 legacy + Hangame mission plane (48) and scalars (16)
+FEATURES = 720  # 560 (legacy 496 + Hangame block) + public-history planes (150) + padding
 ACTIONS = 179  # 177 legacy + Gukjin pi/animal
 ORACLE_FEATURES = 50  # opponent hidden hand plane, critic only
 SIGNED_GOLDEN = -7046029254386353131
@@ -50,7 +50,7 @@ class ResidualMlp(nn.Module):
 
 
 class PpoActor(ResidualMlp):
-    """Policy over the public 560-feature information state; returns logits."""
+    """Policy over the public 720-feature information state; returns logits."""
 
     def __init__(self, hidden: int = 512, blocks: int = 3, norm: str = "layer") -> None:
         super().__init__(FEATURES, ACTIONS, hidden, blocks, norm)

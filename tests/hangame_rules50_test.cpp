@@ -5,6 +5,7 @@
 
 #include "cugo/game/policy50.h"
 #include "cugo/game/settlement50.h"
+#include "cugo/game/torch50.h"
 
 namespace {
 
@@ -431,6 +432,115 @@ void test_steal_order_choice_sweep_ttadak() {
 
 }  // namespace
 
+// 9. Public information in the observation: neutral ppuk, four-card shakes, cards a
+// shake revealed, and each side's played cards.
+void test_public_observation() {
+  // Neutral ppuk has its own plane and belongs to neither player.
+  TurnState50 neutral{};
+  neutral.actor = 0;
+  neutral.phase = Turn50Phase::kPlay;
+  neutral.pending_played = cugo::core::kInvalidCard;
+  neutral.pending_drawn = cugo::core::kInvalidCard;
+  neutral.floor = card_bit(make_card(3, 0)) | card_bit(make_card(3, 1)) |
+                  card_bit(make_card(3, 2));
+  neutral.hand0 = card_bit(make_card(6, 0));
+  neutral.hand1 = card_bit(make_card(7, 0));
+  neutral.stock = cugo::core::kShinMatgoDeckMask & ~(neutral.floor | neutral.hand0 | neutral.hand1);
+  neutral.neutral_ppuk_months = 1u << 3;
+  const PolicyObservation50 n = pack_policy_observation50(terminal_from_turn(neutral));
+  require(n.neutral_ppuk_months == (1u << 3), "neutral ppuk is observed");
+  require(((n.own_ppuk_months | n.opponent_ppuk_months | n.ppuk_months) & (1u << 3)) == 0,
+          "neutral ppuk has no owner");
+
+  // A shake reveals the month's cards; the opponent sees the ones still in hand.
+  TurnState50 turn{};
+  turn.actor = 0;
+  turn.phase = Turn50Phase::kPlay;
+  turn.pending_played = cugo::core::kInvalidCard;
+  turn.pending_drawn = cugo::core::kInvalidCard;
+  turn.hand0 = card_bit(make_card(4, 0)) | card_bit(make_card(4, 1)) |
+               card_bit(make_card(4, 2)) | card_bit(make_card(6, 0));
+  turn.hand1 = card_bit(make_card(7, 0)) | card_bit(make_card(8, 0));
+  turn.floor = card_bit(make_card(9, 0)) | card_bit(make_card(10, 0));
+  turn.stock = cugo::core::kShinMatgoDeckMask & ~(turn.hand0 | turn.hand1 | turn.floor);
+  turn.rng_state = 7;
+  TerminalGameState50 game = terminal_from_turn(turn);
+  Action50 shake = make_action50(ActionKind50::kShake);
+  shake.card = make_card(4, 0);
+  shake.month = 4;
+  require(apply_action50(game, shake).status == ActionStatus50::kOk, "shake applies");
+  require(game.revealed0 == (cugo::core::month_mask(4) & turn.hand0), "shake reveals three cards");
+  require(game.special.game.turn.actor == 1, "turn passes");
+  const PolicyObservation50 seen = pack_policy_observation50(game);
+  const CardMask still = card_bit(make_card(4, 1)) | card_bit(make_card(4, 2));
+  require(seen.opponent_known_hand == still, "revealed cards still in hand are known");
+  require((seen.unseen & still) == 0, "known cards leave the unseen plane");
+  require((seen.opponent_shaken_months & (1u << 4)) != 0, "opponent shake is observed");
+  require(seen.opponent_played == card_bit(make_card(4, 0)), "opponent's played card");
+  require(seen.own_played == 0, "nothing played yet by the observer");
+
+  // Four-card shakes show up in the shake planes like three-card ones.
+  TerminalGameState50 four = terminal_from_turn(turn);
+  four.special.shaken4_1 = 1u << 5;
+  require((pack_policy_observation50(four).opponent_shaken_months & (1u << 5)) != 0,
+          "four-card shake is observed");
+}
+
+// 10. Hangame records a month once its shake question is answered and never asks
+// again. Cugo keeps no such record; random games check that a declined month (a
+// card of a shakeable month played without shaking) can never be offered again.
+void test_declined_shake_never_returns() {
+  std::uint64_t rng = 0x5eedf00dULL;
+  auto next = [&rng]() {
+    rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<std::uint32_t>(rng >> 33);
+  };
+  int declines = 0;
+  for (int g = 0; g < 4000; ++g) {
+    TorchEnv50 env = make_torch_env50(0x9e3779b97f4a7c15ULL * (g + 1), static_cast<std::uint8_t>(g & 1));
+    std::uint16_t declined[2] = {0, 0};
+    for (int step = 0; step < 200 && env.done == 0; ++step) {
+      const TorchPacket50 packet = make_torch_packet50(env);
+      require(packet.status == ActionStatus50::kOk, "packet");
+      const std::uint8_t actor = env.game.special.game.turn.actor;
+      const bool primary = env.pending.active == 0 &&
+          packet.decision_kind == static_cast<std::uint8_t>(PolicyDecision50::kPrimary);
+      std::uint16_t shakeable = 0;
+      if (primary) {
+        shakeable = legal_shake_months50(env.game.special);
+        require((shakeable & declined[actor]) == 0, "a declined shake is never offered again");
+      }
+      const CardMask hand_before = actor == 0 ? env.game.special.game.turn.hand0
+                                              : env.game.special.game.turn.hand1;
+      const std::uint16_t shaken_before = static_cast<std::uint16_t>(
+          shaken50(env.game.special, actor) | shaken4_50(env.game.special, actor));
+
+      std::uint16_t legal[kTorch50ActionCount];
+      int count = 0;
+      for (std::uint16_t a = 0; a < kTorch50ActionCount; ++a)
+        if (has_torch_action50(packet.legal_actions, a)) legal[count++] = a;
+      require(count > 0, "legal action exists");
+      require(torch_step50(env, legal[next() % count]).status == ActionStatus50::kOk, "step");
+
+      if (shakeable == 0) continue;
+      const CardMask hand_after = actor == 0 ? env.game.special.game.turn.hand0
+                                             : env.game.special.game.turn.hand1;
+      const std::uint16_t shaken_after = static_cast<std::uint16_t>(
+          shaken50(env.game.special, actor) | shaken4_50(env.game.special, actor));
+      for (std::uint8_t m = 0; m < cugo::core::kMonthCount; ++m) {
+        const std::uint16_t bit = static_cast<std::uint16_t>(1u << m);
+        const bool played_month =
+            ((hand_before & ~hand_after) & cugo::core::month_mask(m)) != 0;
+        if ((shakeable & bit) != 0 && played_month && (shaken_after & ~shaken_before & bit) == 0) {
+          declined[actor] |= bit;
+          ++declines;
+        }
+      }
+    }
+  }
+  require(declines > 100, "random games decline shakes often enough to test");
+}
+
 int main() {
   try {
     test_initial_floor_refill();
@@ -441,6 +551,8 @@ int main() {
     test_forced_specials_and_four_shake();
     test_missions();
     test_steal_order_choice_sweep_ttadak();
+    test_public_observation();
+    test_declined_shake_never_returns();
   } catch (const std::exception& error) {
     std::cerr << "cugo_hangame_rules50_test: FAIL: " << error.what() << '\n';
     return 1;
