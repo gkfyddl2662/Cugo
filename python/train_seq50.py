@@ -30,24 +30,31 @@ EVAL_SEED_OFFSET = 900000000
 
 
 class SeqStorage:
-    """Fixed per-decision buffers (see RolloutStorage) plus the event-count column."""
+    """Reused per-decision buffers (see RolloutStorage) plus the event-count column."""
+
+    NAMES = ("features", "legal", "actions", "logp", "opp_hand", "env_ids", "seat", "count")
 
     def __init__(self, capacity: int, device: torch.device) -> None:
-        d = device
-        self.device, self.capacity, self.size = device, capacity, 0
-        self.features = torch.empty((capacity, FEATURES), dtype=torch.bfloat16, device=d)
-        self.legal = torch.empty((capacity, ACTIONS), dtype=torch.bool, device=d)
-        self.actions = torch.empty(capacity, dtype=torch.int64, device=d)
-        self.logp = torch.empty(capacity, dtype=torch.float32, device=d)
-        self.opp_hand = torch.empty(capacity, dtype=torch.int64, device=d)
-        self.env_ids = torch.empty(capacity, dtype=torch.int64, device=d)
-        self.seat = torch.empty(capacity, dtype=torch.int64, device=d)
-        self.count = torch.empty(capacity, dtype=torch.int64, device=d)
+        self.device, self.capacity, self.size = device, 0, 0
+        self._allocate(capacity)
+
+    def _allocate(self, capacity: int) -> None:
+        d = self.device
+        shapes = {"features": ((capacity, FEATURES), torch.bfloat16), "legal": ((capacity, ACTIONS), torch.bool),
+                  "logp": ((capacity,), torch.float32)}
+        for name in self.NAMES:
+            shape, dtype = shapes.get(name, ((capacity,), torch.int64))
+            new = torch.empty(shape, dtype=dtype, device=d)
+            if self.size:
+                new[:self.size].copy_(getattr(self, name)[:self.size])
+            setattr(self, name, new)
+        self.capacity = capacity
 
     def append(self, **parts: torch.Tensor) -> None:
         n = parts["actions"].shape[0]
         if self.size + n > self.capacity:
-            raise RuntimeError(f"rollout storage full ({self.capacity}); raise --storage-per-game")
+            # Rare: longer games as the policy learns to Go. Grow once, with headroom.
+            self._allocate(int((self.size + n) * 1.25))
         for name, part in parts.items():
             getattr(self, name)[self.size:self.size + n].copy_(part)
         self.size += n
