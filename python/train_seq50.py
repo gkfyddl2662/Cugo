@@ -23,14 +23,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cugo_eval50 import evaluate_paired, load_policy_checkpoint
+from cugo_eval50 import load_policy_checkpoint
 from cugo_ppo50 import DECISION_OFFSET, GOSTOP_KIND, TrainStats
 from cugo_ppo_nets50 import ACTIONS, FEATURES, make_seeds
 from cugo_seq50 import History, HistBatch, policy_logits, seq_actor, seq_critic, stored_columns
 from cugo_seq_selfplay50 import GameLog, WaveCollector, make_opponent_slot
 from cugo_torch50_ext import load_extension
+from league50 import match
 
 EVAL_SEED_OFFSET = 900000000
+EVAL_CHUNK = 8192
 
 
 class SeqStorage:
@@ -500,13 +502,6 @@ def main() -> None:
             snapshots.append(frozen(actor, args))
             del snapshots[:-args.pool_size]
 
-        if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):
-            s = evaluate_paired(ext=ext, model_a=ema_actor, model_b=reference, pairs=args.eval_pairs,
-                                seed_offset=EVAL_SEED_OFFSET, max_steps=128, use_amp=True)
-            print(f"iter={iteration} eval_ref_score={s.mean_pair_score_a:.4f} "
-                  f"eval_ref_ci_low={s.pair_score_ci95_low:.4f} eval_ref_ci_high={s.pair_score_ci95_high:.4f} "
-                  f"eval_ref_win_pct={100.0 * s.a_wins / max(1, s.evaluated_games):.3f}", flush=True)
-
         if args.checkpoint_every > 0 and (iteration % args.checkpoint_every == 0 or iteration == args.iterations):
             path = args.checkpoint_dir / f"iter_{iteration:06d}.pt"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,6 +509,15 @@ def main() -> None:
                         "actor_ema": ema_actor.state_dict(), "optimizer": optimizer.state_dict(),
                         "config": config}, path)
             print(f"checkpoint={path}", flush=True)
+
+        if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):
+            # The evaluator replays whole histories next to the resident self-play buffers: hand it the
+            # cached blocks and run it in chunks (same deal seeds as one big match).
+            torch.cuda.empty_cache()
+            r = match(ext, ema_actor, reference, args.eval_pairs, EVAL_CHUNK, EVAL_SEED_OFFSET, False)
+            print(f"iter={iteration} eval_ref_score={r['score']:.4f} "
+                  f"eval_ref_ci_low={r['lo']:.4f} eval_ref_ci_high={r['hi']:.4f} "
+                  f"eval_ref_win_pct={r['win']:.3f}", flush=True)
 
     print(f"seq training PASS iterations={args.iterations} total_games={total_games}")
 

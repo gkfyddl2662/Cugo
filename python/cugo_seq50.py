@@ -324,7 +324,7 @@ def seq_critic(mode: str, d_model: int, layers: int, heads: int) -> SeqNet:
 
 
 def policy_logits(model: nn.Module, features: torch.Tensor, legal: torch.Tensor,
-                  hist: HistBatch | None, chunk: int = 8192) -> torch.Tensor:
+                  hist: HistBatch | None, chunk: int = 4096) -> torch.Tensor:
     """Logits from either kind of policy; sequence models run in row chunks."""
     if not getattr(model, "uses_history", False):
         out = model(features)

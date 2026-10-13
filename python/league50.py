@@ -2,8 +2,9 @@
 
     python python/league50.py ckpt_a.pt ckpt_b.pt ... [--pairs 32768] [--sample]
 
-Large matches run in chunks of --chunk pairs on disjoint deal seeds and are
-pooled, so GPU memory stays bounded.
+Large matches run in chunks of --chunk pairs and are pooled, so GPU memory stays
+bounded. Each chunk continues the deal sequence of one big match, so the chunk size
+does not change which deals are played (an even chunk keeps the seat alternation).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from pathlib import Path
 import torch
 
 from cugo_eval50 import evaluate_paired, load_policy_checkpoint
+from cugo_ppo_nets50 import SEED_BASE, SIGNED_GOLDEN
 from cugo_torch50_ext import load_extension
 
 
@@ -22,11 +24,19 @@ def label(path: Path) -> str:
     return f"{path.parent.name}/{path.stem.replace('iter_', '')}"
 
 
+def chunk_offset(seed_offset: int, start: int) -> int:
+    """Seed offset whose first deal is deal `start` of a match at `seed_offset` (make_seeds wraps in int64)."""
+    seed = (SEED_BASE + seed_offset + start * SIGNED_GOLDEN + 2 ** 63) % 2 ** 64 - 2 ** 63
+    return seed - SEED_BASE
+
+
 def match(ext, a, b, pairs: int, chunk: int, seed_offset: int, sample: bool) -> dict:
+    if chunk % 2:
+        raise ValueError("chunk must be even so every chunk starts with the same seat order")
     n = total = sq = wins = games = 0
     for start in range(0, pairs, chunk):
         size = min(chunk, pairs - start)
-        s = evaluate_paired(ext=ext, model_a=a, model_b=b, pairs=size, seed_offset=seed_offset + start,
+        s = evaluate_paired(ext=ext, model_a=a, model_b=b, pairs=size, seed_offset=chunk_offset(seed_offset, start),
                             max_steps=128, use_amp=True, sample_a=sample, sample_b=sample)
         k = s.evaluated_pairs
         n += k
