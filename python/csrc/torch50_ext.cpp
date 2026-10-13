@@ -25,6 +25,11 @@ std::vector<torch::Tensor> cugo_torch50_branch_indexed_cuda(
     torch::Tensor actions);
 torch::Tensor cugo_torch50_hands_indexed_cuda(torch::Tensor states,
                                               torch::Tensor env_ids);
+std::vector<torch::Tensor> cugo_torch50_step_events_indexed_cuda(
+    torch::Tensor states,
+    torch::Tensor env_ids,
+    torch::Tensor actions);
+torch::Tensor cugo_torch50_start_cuda(torch::Tensor states);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Cugo Shin Matgo CUDA batch environment";
@@ -44,6 +49,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Clone selected rows and apply actions without mutating parents");
   m.def("hands_indexed", &cugo_torch50_hands_indexed_cuda,
         "Return [N, 2] int64 card masks of both players' hidden hands");
+  m.def("step_events_indexed", &cugo_torch50_step_events_indexed_cuda,
+        "step_indexed that also returns [N, EVENT_WORDS] int64 event records");
+  m.def("start", &cugo_torch50_start_cuda,
+        "Return [N, START_WORDS] int64 opening records of fresh games");
 
   m.attr("FEATURE_COUNT") = pybind11::int_(cugo::game::kTorch50FeatureCount);
   m.attr("ACTION_COUNT") = pybind11::int_(cugo::game::kTorch50ActionCount);
@@ -51,6 +60,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       pybind11::int_(cugo::game::kTorch50PrimaryActionCount);
   m.attr("CHOICE_ACTION_BEGIN") =
       pybind11::int_(cugo::game::kTorch50ChoiceActionBegin);
+  m.attr("EVENT_WORDS") = pybind11::int_(cugo::game::kTorch50EventWords);
+  m.attr("START_WORDS") = pybind11::int_(cugo::game::kTorch50StartWords);
   m.attr("STATE_BYTES") = pybind11::int_(sizeof(cugo::game::TorchEnv50));
   m.attr("STATUS_OK") =
       pybind11::int_(static_cast<int>(cugo::game::ActionStatus50::kOk));

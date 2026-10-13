@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from cugo_ppo_nets50 import PpoActor, make_seeds
+from cugo_seq50 import History, policy_logits, seq_actor
 
 
 @dataclass
@@ -90,7 +91,11 @@ def load_policy_checkpoint(
         if state is None:
             raise ValueError(f"checkpoint {path} has no actor")
         config = payload.get("config", {})
-        model: nn.Module = PpoActor(hidden, int(config.get("blocks", 3)), config.get("norm", "layer"))
+        if str(config.get("algorithm", "")).startswith("seq-ppo"):
+            model: nn.Module = seq_actor(config["mode"], int(config["d_model"]), int(config["layers"]),
+                                         int(config["heads"]))
+        else:
+            model = PpoActor(hidden, int(config.get("blocks", 3)), config.get("norm", "layer"))
     else:
         raise ValueError("policy must be one of auto, ppo, ppo_raw")
 
@@ -106,26 +111,28 @@ def load_policy_checkpoint(
     )
 
 
-def _policy_logits(model: nn.Module, features: torch.Tensor, use_amp: bool) -> torch.Tensor:
-    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-        output = model(features)
-    if isinstance(output, tuple):
-        return output[0]
-    return output
-
-
 def _greedy_actions(
     model: nn.Module,
     features: torch.Tensor,
     legal: torch.Tensor,
     use_amp: bool,
     sample: bool = False,
+    hist: Any = None,
 ) -> torch.Tensor:
-    logits = _policy_logits(model, features, use_amp)
+    # Sequence models run in bf16: fp16 attention scores can overflow.
+    dtype = torch.bfloat16 if getattr(model, "uses_history", False) else torch.float16
+    with torch.autocast(device_type="cuda", dtype=dtype, enabled=use_amp):
+        logits = policy_logits(model, features, legal, hist)
     masked = logits.float().masked_fill(~legal, -1.0e30)
     if sample:
         return torch.multinomial(torch.softmax(masked, dim=1), 1).squeeze(1)
     return masked.argmax(dim=1).to(torch.int64)
+
+
+def _rows_history(hist: Any, active_ids: torch.Tensor, players: torch.Tensor, rows: torch.Tensor) -> Any:
+    if hist is None:
+        return None
+    return hist.batch(active_ids.index_select(0, rows), players.index_select(0, rows).to(torch.int64))
 
 
 def evaluate_paired(
@@ -159,6 +166,8 @@ def evaluate_paired(
     )
 
     states = ext.create(seeds, first)
+    # Event logs only when a sequence policy plays; plain stepping is cheaper.
+    hist = History(ext, states) if any(getattr(m, "uses_history", False) for m in (model_a, model_b)) else None
     final_reward0 = torch.zeros(games, dtype=torch.float32, device=device)
     final_nagari = torch.zeros(games, dtype=torch.bool, device=device)
     predecision_done = torch.zeros(games, dtype=torch.bool, device=device)
@@ -227,6 +236,7 @@ def evaluate_paired(
                         legal.index_select(0, a_rows),
                         use_amp,
                         sample_a,
+                        _rows_history(hist, active_ids, players, a_rows),
                     ),
                 )
             if b_rows.numel():
@@ -239,12 +249,19 @@ def evaluate_paired(
                         legal.index_select(0, b_rows),
                         use_amp,
                         sample_b,
+                        _rows_history(hist, active_ids, players, b_rows),
                     ),
                 )
 
-            reward0, new_done, nagari, step_status, _committed = ext.step_indexed(
-                states, active_ids, actions
-            )
+            if hist is None:
+                reward0, new_done, nagari, step_status, _committed = ext.step_indexed(
+                    states, active_ids, actions
+                )
+            else:
+                reward0, new_done, nagari, step_status, committed, events = ext.step_events_indexed(
+                    states, active_ids, actions
+                )
+                hist.record(active_ids, committed & (step_status == int(ext.STATUS_OK)), events)
             step_ok = step_status == int(ext.STATUS_OK)
             step_bad.add_((~step_ok).sum())
             just_finished = step_ok & new_done

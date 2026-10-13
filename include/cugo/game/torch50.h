@@ -576,6 +576,94 @@ CUGO_HD inline TorchRollout50 rollout_canonical_torch50(
                                               : RolloutEnd50::kMaxActions);
 }
 
+// ---------------------------------------------------------------------------
+// Event log: one record per committed action, the table-wide difference between
+// the states before and after it. Records are observer-independent; whoever
+// encodes them for a player must hide `drawn` unless that player is the actor.
+// Replaying the records from the start record reproduces the floor and both
+// captured piles exactly.
+
+inline constexpr std::uint16_t kTorch50EventWords = 9;
+inline constexpr std::uint16_t kTorch50StartWords = 8;
+
+struct TorchEvent50 {
+  core::CardMask played;   // left the actor's hand (public)
+  core::CardMask drawn;    // entered the actor's hand from the stock (actor only)
+  core::CardMask flipped;  // left the stock for the table (public)
+  core::CardMask gained0;  // entered player 0's captured pile
+  core::CardMask gained1;
+  core::CardMask lost0;    // left player 0's captured pile (stolen)
+  core::CardMask lost1;
+  core::CardMask shown;    // shown by a shake declaration
+  std::uint8_t actor;
+  std::uint8_t kind;       // ActionKind50
+};
+
+CUGO_HD inline TorchEvent50 make_torch_event50(const TorchEnv50& before,
+                                               const TorchEnv50& after) noexcept {
+  const TurnState50& b = before.game.special.game.turn;
+  const TurnState50& a = after.game.special.game.turn;
+  const std::uint8_t actor = static_cast<std::uint8_t>(after.pending.actor & 1u);
+  const core::CardMask hand_before = actor == 0 ? b.hand0 : b.hand1;
+  const core::CardMask hand_after = actor == 0 ? a.hand0 : a.hand1;
+  const core::CardMask revealed_before = actor == 0 ? before.game.revealed0 : before.game.revealed1;
+  const core::CardMask revealed_after = actor == 0 ? after.game.revealed0 : after.game.revealed1;
+  TorchEvent50 e{};
+  e.played = hand_before & ~hand_after;
+  e.drawn = hand_after & ~hand_before;
+  e.flipped = b.stock & ~a.stock & ~e.drawn;
+  e.gained0 = a.captured0 & ~b.captured0;
+  e.gained1 = a.captured1 & ~b.captured1;
+  e.lost0 = b.captured0 & ~a.captured0;
+  e.lost1 = b.captured1 & ~a.captured1;
+  e.shown = revealed_after & ~revealed_before;
+  e.actor = actor;
+  e.kind = static_cast<std::uint8_t>(after.pending.action.kind);
+  return e;
+}
+
+// Words 0..7 are the card masks in field order; word 8 packs actor | kind << 8.
+CUGO_HD inline void pack_torch_event50(const TorchEvent50& e, std::int64_t* out) noexcept {
+  out[0] = static_cast<std::int64_t>(e.played);
+  out[1] = static_cast<std::int64_t>(e.drawn);
+  out[2] = static_cast<std::int64_t>(e.flipped);
+  out[3] = static_cast<std::int64_t>(e.gained0);
+  out[4] = static_cast<std::int64_t>(e.gained1);
+  out[5] = static_cast<std::int64_t>(e.lost0);
+  out[6] = static_cast<std::int64_t>(e.lost1);
+  out[7] = static_cast<std::int64_t>(e.shown);
+  out[8] = static_cast<std::int64_t>(e.actor) | (static_cast<std::int64_t>(e.kind) << 8);
+}
+
+// The game's opening as each player learns it: both hands (encoders show only the
+// observer's), the refilled floor, floor bonuses already captured, and the mission.
+// Word 6 is the neutral-ppuk months; word 7 packs mission type | multiplier << 8 | first player << 16 |
+// mission_multi0 << 24 | mission_multi1 << 32.
+CUGO_HD inline void pack_torch_start50(const TorchEnv50& env, std::int64_t* out) noexcept {
+  const TurnState50& t = env.game.special.game.turn;
+  out[0] = static_cast<std::int64_t>(t.hand0);
+  out[1] = static_cast<std::int64_t>(t.hand1);
+  out[2] = static_cast<std::int64_t>(t.floor);
+  out[3] = static_cast<std::int64_t>(t.captured0);
+  out[4] = static_cast<std::int64_t>(t.captured1);
+  out[5] = static_cast<std::int64_t>(t.mission_cards);
+  out[6] = static_cast<std::int64_t>(t.neutral_ppuk_months);
+  out[7] = static_cast<std::int64_t>(env.game.mission_type) |
+           (static_cast<std::int64_t>(env.game.mission_multiplier) << 8) |
+           (static_cast<std::int64_t>(t.actor & 1u) << 16) |
+           (static_cast<std::int64_t>(env.game.mission_multi0) << 24) |
+           (static_cast<std::int64_t>(env.game.mission_multi1) << 32);
+}
+
+// Steps the environment and reports the committed action's event, if any.
+CUGO_HD inline TorchStepResult50 torch_step_event50(TorchEnv50& env, std::uint16_t action,
+                                                    TorchEvent50& event) noexcept {
+  const TorchEnv50 before = env;
+  const TorchStepResult50 result = torch_step50(env, action);
+  event = result.primary_committed != 0 ? make_torch_event50(before, env) : TorchEvent50{};
+  return result;
+}
+
 }  // namespace cugo::game
 
 #undef CUGO_HD

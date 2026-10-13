@@ -210,6 +210,35 @@ def _critic_input(features: torch.Tensor, opp_hand: torch.Tensor) -> torch.Tenso
     return torch.cat((features, card_plane(opp_hand, features.dtype)), dim=1)
 
 
+def gae_advantages(values: torch.Tensor, returns: torch.Tensor, env_ids: torch.Tensor,
+                   seat: torch.Tensor, lam: float) -> torch.Tensor:
+    """GAE(lambda), gamma=1, along each (game, seat) sequence of own decisions.
+
+    Rewards arrive only at the end, so delta_t = V(h_next_own) - V(h_t) and the
+    last decision bootstraps from the final score. lam=1 is the Monte-Carlo
+    advantage R - V(h_t). Rows must be in step-major order within each game.
+    """
+    if lam >= 1.0:
+        return returns - values
+    n = values.numel()
+    order = torch.sort(env_ids * 2 + seat, stable=True).indices  # storage is step-major
+    key = (env_ids * 2 + seat)[order]
+    has_next = torch.zeros(n, dtype=torch.bool, device=values.device)
+    has_next[:-1] = key[1:] == key[:-1]
+    v = values[order]
+    delta = torch.where(has_next, v.roll(-1), returns[order]) - v
+    pos = torch.arange(n, device=values.device)
+    last = torch.where(has_next, n, pos).flip(0).cummin(0).values.flip(0)
+    to_end = last - pos
+    adv = torch.zeros_like(v)
+    for d in range(int(to_end.max()) + 1):
+        rows = torch.nonzero(to_end == d).squeeze(1)
+        adv[rows] = delta[rows] + (lam * adv[rows + 1] if d else 0.0)
+    out = torch.empty_like(adv)
+    out[order] = adv
+    return out
+
+
 class PpoUpdater:
     """PPO minibatch step, optionally captured once as a CUDA graph and replayed.
 
@@ -293,32 +322,8 @@ class PpoUpdater:
         self.graph.replay()
 
     def _advantages(self, values: torch.Tensor, returns: torch.Tensor, lam: float) -> torch.Tensor:
-        """GAE(lambda), gamma=1, along each (game, seat) sequence of own decisions.
-
-        Rewards arrive only at the end, so delta_t = V(h_next_own) - V(h_t) and the
-        last decision bootstraps from the final score. lam=1 is the Monte-Carlo
-        advantage R - V(h_t).
-        """
-        if lam >= 1.0:
-            return returns - values
         n = values.numel()
-        env_ids, seat = self.storage.tensors[5][:n], self.storage.tensors[6][:n]
-        order = torch.sort(env_ids * 2 + seat, stable=True).indices  # storage is step-major
-        key = (env_ids * 2 + seat)[order]
-        has_next = torch.zeros(n, dtype=torch.bool, device=values.device)
-        has_next[:-1] = key[1:] == key[:-1]
-        v = values[order]
-        delta = torch.where(has_next, v.roll(-1), returns[order]) - v
-        pos = torch.arange(n, device=values.device)
-        last = torch.where(has_next, n, pos).flip(0).cummin(0).values.flip(0)
-        to_end = last - pos
-        adv = torch.zeros_like(v)
-        for d in range(int(to_end.max()) + 1):
-            rows = torch.nonzero(to_end == d).squeeze(1)
-            adv[rows] = delta[rows] + (lam * adv[rows + 1] if d else 0.0)
-        out = torch.empty_like(adv)
-        out[order] = adv
-        return out
+        return gae_advantages(values, returns, self.storage.tensors[5][:n], self.storage.tensors[6][:n], lam)
 
     def update(self, data: Rollout, epochs: int, entropy_coef: float, target_kl: float,
                gae_lambda: float = 1.0) -> TrainStats:

@@ -16,7 +16,7 @@ This means one network head can handle ordinary play, bonus play, shake/bomb/gre
 
 ## Dense feature layout
 
-`kTorch50FeatureCount = 720` floats (contract v3, extension `cugo_torch50_ext_v3`). The first 479 are semantic, 479..490 is the neutral-ppuk month plane and 491..495 stay zero (the legacy 496-wide block). The Hangame block follows: 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). 560..709 are three public-history card planes and 710..719 are zero. Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`. New inputs are added where a zero weight leaves an old network's output unchanged; `python/migrate_ppo50.py` widens 560-feature checkpoints that way.
+`kTorch50FeatureCount = 720` floats (contract v3, extension `cugo_torch50_ext_v4`). The first 479 are semantic, 479..490 is the neutral-ppuk month plane and 491..495 stay zero (the legacy 496-wide block). The Hangame block follows: 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). 560..709 are three public-history card planes and 710..719 are zero. Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`. New inputs are added where a zero weight leaves an old network's output unchanged; `python/migrate_ppo50.py` widens 560-feature checkpoints that way.
 
 | Range | Size | Meaning |
 | --- | ---: | --- |
@@ -39,6 +39,12 @@ The scalar block contains turn/stock counts, both players' Go/base-score/bomb/cr
 
 The environment returns reward from player 0's perspective only when the game reaches a terminal settlement. Nagari returns only the event payments already made (ppuk chain, first-turn ttadak). Training code can negate the reward for player 1 or use the observation's player-relative features.
 
+
+## Event log
+
+`torch_step_event50()` steps like `torch_step50()` and, when a primary action commits, also fills a `TorchEvent50`: the diff between the table before and after that action. `played` left the actor's hand, `drawn` entered it, `flipped` came off the stock, `gained0/1` and `lost0/1` changed each captured pile, `shown` was revealed by a shake, plus the actor and the action kind. `pack_torch_start50()` records the opening (both hands, floor, captured piles, mission and first player). The records are observer-independent; a policy must hide the opponent's `drawn` cards itself. `tests/torch50_test.cpp` replays start plus events and requires the hands, floor and piles to match the engine after every commit.
+
+The extension exposes them as `step_events_indexed(states, env_ids, actions)` (the five `step_indexed` outputs plus `[N, 9]` int64 event words) and `start(states)` (`[N, 8]` int64). `python/cugo_seq50.py` turns them into token sequences; see `docs/seq50.md`.
 ## Correctness contract
 
 The CPU test runs 8,192 full games through this environment and requires the rollout digest and post-chance choice counts to match the existing explicit post-chance driver. The CUDA test runs 65,536 full-game differential samples plus 4,096 CPU/GPU feature-and-mask differential samples.
