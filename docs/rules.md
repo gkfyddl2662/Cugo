@@ -102,7 +102,7 @@ Final settlement is in `settlement50.md` and `hangame50.md`.
 Hangame describes two bonus cards in Shin Matgo. The printed number determines whether the card contributes 2 or 3 pi units.
 
 - The raw 50-card deal gives each player 10 cards and exposes 8 floor cards, leaving 22 cards in stock.
-- If a bonus card is among the initial floor cards, it is automatically taken before the first player starts. `collect_initial_floor_bonuses()` moves those bonus cards to the first player's captured set. The referenced Hangame guide does not state that another floor card is dealt as a replacement, so Cugo does not invent that replacement step.
+- If a bonus card is among the initial floor cards, it is automatically taken before the first player starts. `collect_initial_floor_bonuses()` moves those bonus cards to the first player's captured set. The public guide is silent on a replacement; the Hangame client refills the floor from the stock, repeating while the refill is itself a bonus (`refill_initial_floor_bonuses50`, see `hangame50.md`).
 - If a player has a bonus card in hand, they may play it like a normal hand action. Before the normal stock flip, they receive one replacement card from the stock and get another opportunity to play a hand card. `play_bonus_for_turn50()` keeps the state in `PLAY`, captures the played bonus, and inserts the replacement into the active hand.
 - In Shin Matgo, playing a bonus card also takes one opponent pi.
 - If a bonus appears while flipping the stock, the player flips again. `draw_for_turn50()` consumes consecutive stock bonuses until it reaches a standard card and stores those bonuses in `pending_bonus_mask`.
@@ -139,7 +139,7 @@ Choice/error resolution remains transactional: if a two-card floor selection is 
 
 The Hangame guide pins the number of opponent pi cards taken by the events above, and the Shin Matgo mode guide confirms that playing a bonus card also takes an opponent pi. The public guide does not specify the physical-card priority when the victim owns more eligible pi cards than must be transferred.
 
-Cugo therefore does not silently encode an undocumented automatic priority. `pi_transfer.h` separates the pinned steal count from the provider-specific selection policy:
+The Hangame client's automatic priority is implemented as `hangame_pi_steal_selection50()` (see `hangame50.md`), so no pi choice is ever offered to a player. Underneath, `pi_transfer.h` keeps the pinned steal count separate from the selection policy:
 
 - `resolve_pi_steal_card_count()` converts resolver event metadata into the number of physical pi cards to take.
 - `apply_pi_steal50()` moves physical cards between captured piles and, by default, derives the victim's Gukjin interpretation from `TurnState50`.
@@ -151,7 +151,7 @@ Cugo therefore does not silently encode an undocumented automatic priority. `pi_
 
 Legacy overloads that accept an explicit `ScoreOptions` remain available for low-level differential/regression tests, but the normal 50-card state path uses the persistent player role.
 
-This selection mask is an environment-policy input, not a documented Shin Matgo player action. Once Hangame's exact automatic priority is sourced or measured, that policy can supply the mask without changing the state representation.
+This selection mask is an environment-policy input, not a Shin Matgo player action; the Hangame priority supplies it.
 
 ## Resolver paths
 
@@ -179,7 +179,7 @@ The bonus-aware `TurnState50` path implements the same current standard-card sub
 
 Both resolver paths currently implement normal unique same-month capture, unmatched floor placement, ppuk, capture of a three-card ppuk stack, jjok, ttadak, sweep detection, and explicit same-month floor choice when exactly two matching floor cards exist.
 
-The guide says ppuk and jjok have a last-card exception but does not describe the replacement transition on that page. Both resolver paths therefore return an unsupported status for those exact final-stock-flip patterns instead of guessing.
+The last-card exceptions for ppuk and jjok follow the Hangame client (`last_card50.md`, `hangame50.md`). The legacy `TurnState48` fixture still returns an unsupported status for those final-stock-flip patterns.
 
 ## Not implemented yet
 

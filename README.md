@@ -1,111 +1,142 @@
 # Cugo
 
-High-performance tabula-rasa self-play research project for Korean Go-Stop / Shin Matgo.
+**GPU-resident self-play for Hangame Shin Matgo** — a rules-exact two-player
+Go-Stop engine in C++20/CUDA, a batched PyTorch environment built on it, and the
+reinforcement-learning stack that trains Shin Matgo agents with it.
 
-## Current milestone
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
+![CUDA](https://img.shields.io/badge/CUDA-13.2-76B900)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.14-EE4C2C)
 
-The repository contains a deterministic CPU reference path and CUDA differential path with:
+## Highlights
 
-- 48 standard cards packed into IDs `0..47`
-- Shin Matgo bonus cards at IDs `48` (2-pi) and `49` (3-pi)
-- separate standard-deck and 50-card Shin Matgo masks inside one `uint64_t`
-- a fixed engine slot convention for the 48 standard hwatu identities
-- bright/animal/ribbon/pi metadata, including godori and ribbon-set masks
-- fixed double-pi cards, 2-pi/3-pi bonus scoring, and Gukjin animal/double-pi interpretation
-- host/device base scoring for bright, animal, ribbon, and pi groups
-- deterministic base-48 and raw 50-card deal primitives
-- raw 50-card layout: 10 cards per player, 8 initial floor cards, 22-card stock
-- initial-floor bonus collection before the first player's turn
-- hand-bonus replacement draws plus Shin Matgo pi-steal integration
-- stock bonus chaining until a standard card is flipped
-- a bonus-aware `TurnState50` with `PLAY -> DRAW -> RESOLVE`
-- pending stock bonuses kept transactional until the standard-card resolve is known
-- per-bonus ppuk association metadata so floor bonuses stay attached to the ppuk month that owns them
-- ppuk creation with pending bonuses and later capture of the ppuk plus its associated bonus cards
-- normal unique capture, ppuk, jjok, ttadak, sweep detection, and ppuk ownership/capture metadata
-- persistent per-player Gukjin animal/double-pi role stored inside existing packed turn metadata
-- state-derived scoring and pi eligibility for Gukjin, including role-preserving physical transfer
-- host/device pi-steal count calculation and physical captured-card transfer
-- an explicit pi-transfer selection boundary instead of guessing undocumented Hangame card-priority behavior
-- transactional resolve/bonus wrappers: unresolved pi selection never partially mutates the turn state
-- a `GameState50` layer with 7-point Go/Stop decisions, per-player Go counts, Stop terminal state, and Go score arithmetic
-- fixed CPU examples plus randomized card-partition/scoring/bonus/turn/pi-transfer/Gukjin/game-flow invariants
-- CUDA CPU/GPU differential validation over deals, score masks, bonus primitives, base-48 turns, 50-card turns, pi transfers, persistent Gukjin roles, and Go/Stop state
-- one-thread-per-game CUDA throughput baselines
-- CUDA Graph as the current repeated-phase scheduling baseline
+- **Faithful to the Hangame client.** The 50-card Shin Matgo rules follow the
+  client's own rule server: the deal and floor refill, ppuk chains, last-turn
+  exceptions, automatic pi steals, Gukjin prompts, missions and the full settlement.
+  80,000 games recorded from that server replay move-for-move and point-for-point
+  identically (`tools/hg_replay50.cpp`).
+- **One engine, CPU and GPU.** Header-only C++20 that compiles for the host and for
+  CUDA. A CPU/GPU differential test suite checks every layer, from card masks to
+  whole games.
+- **Self-play without leaving the GPU.** Game states live in device memory. A PyTorch
+  CUDA extension observes, steps, clones and branches them in batches: about 100k
+  complete games/s with a small policy, and over 100M state branches/s on one RTX 5080.
+- **Two kinds of policy.**
+  - Residual-MLP PPO over a 720-feature observation, with an oracle critic.
+  - Event-sequence transformers that read the game as a token stream, Mortal-style.
+    Their self-play runs on a KV cache inside CUDA graphs, with a Triton decode
+    kernel.
+- **Honest evaluation.** Paired, seat-swapped matches on identical deals; league
+  tables; a live training dashboard.
 
-The 50-card path keeps all physical cards in the same 64-bit mask: `kStandardDeckMask` covers the 48 month cards and `kShinMatgoDeckMask` adds the two bonus cards.
+## Status
 
-### Bonus-aware turn integration
+As of October 2026:
 
-Hangame's official guide states that a stock-flipped bonus grants another flip and, if the eventual standard flip creates ppuk, the bonus card(s) go to the floor with that ppuk. `TurnState50` therefore carries a `pending_bonus_mask` during `RESOLVE` instead of capturing stock bonuses immediately.
+| Policy | Model | vs. `ppo_h1500_v3` (points per deal pair) |
+| --- | --- | --- |
+| `ppo_h1500_v3` | 3×512 residual MLP, PPO | reference |
+| `ppo_j` (paused at iteration 200) | 4×2048 residual MLP, PPO | +2.0 |
+| `seq_hybrid` (in training, iteration 200) | 4-layer transformer, events + 720 features | −171 |
+| `seq_events` (iteration 250) | 4-layer transformer, events only | −224 |
 
-If ppuk is created, each pending bonus is moved onto the floor and associated with that ppuk month through compact 12-bit metadata. When the three-card ppuk stack is later captured, its associated bonus card(s) are captured in the same transaction and the association metadata is cleared. This also allows more than one ppuk stack to exist without losing which stack owns a physical bonus card.
+Sequence models are trained from scratch and are still improving. The
+events-only variant plateaued well below the hybrid one.
 
-Playing a bonus card from hand remains a `PLAY`-phase action: the card is captured, one replacement card is drawn from stock, and the player receives another play opportunity. `play_bonus_for_turn50_with_pi_transfer()` can also apply the resulting one-card pi steal transactionally.
+## Requirements
 
-The older `TurnState48` engine remains intact as a regression/performance reference while the 50-card path is brought to full rule parity.
+- An NVIDIA GPU, and the CUDA Toolkit 13.x for the CUDA targets. The CPU tests build
+  without CUDA.
+- CMake 3.24 or later, Ninja, and a C++20 compiler (recent MSVC, GCC or Clang).
+- Python 3.12+ (developed on 3.14) with PyTorch 2.14 (`cu132` wheels), for training and evaluation.
+- Optional: Triton (`triton-windows` on Windows), for the sequence-model decode
+  kernel. Without it, a plain matrix-product path is used.
 
-### Persistent Gukjin role
+## Quick start
 
-Hangame documents Gukjin as an animal card that may instead be used as double-pi, but the public guide does not pin a mandatory conversion moment. Cugo therefore stores the current interpretation explicitly per player and exposes `set_persistent_gukjin_role50()` instead of guessing a hidden automatic timing rule.
-
-No extra SoA array is required: the two role bits use bits 12 and 13 of the existing `ppuk_owner1_months` 16-bit metadata word, while bits 0..11 remain the ppuk-owner month bits. `is_valid_persistent_turn_state50()` validates the packed role bits together with the existing 50-card state invariant; the legacy base validator remains unchanged for older regression code.
-
-`persistent_score_player50()` and the default pi-transfer path derive `ScoreOptions` from this persistent state. If Gukjin is currently double-pi and is physically stolen as a pi card, the role follows the card to its new owner. The new owner may later switch it back to animal through the same explicit role API.
-
-### Go/Stop game flow
-
-`GameState50` wraps the validated 50-card turn state with per-player Go counts, the base score recorded at the last Go, a pending decision actor, and a terminal winner. A player who completes a turn at 7 or more base points receives a Go/Stop decision. Stop records the winner immediately; Go records the current base score and hands play to the opponent.
-
-After a player has already called Go, Cugo opens that player's next decision only after their captured-card base score rises above the score recorded at the previous Go. This is the narrow engine interpretation of Hangame's public description that a Go player who fails to make additional points by the end produces nagari; it is kept explicit in state so the threshold can be changed without touching capture logic if a more specific provider rule is sourced.
-
-Go arithmetic follows Hangame's published formula: every Go adds one point, and starting with 3-Go each additional Go doubles the final Go-adjusted score. `go_adjusted_score50()` exposes this arithmetic separately from the still-deferred final settlement multipliers such as pi-bak, gwang-bak, meongtta, dokbak, bomb/shake, missions, and nagari carry-over.
-
-### Pi-transfer policy boundary
-
-Hangame's public guide pins the steal counts: opponent ppuk, jjok, ttadak, sweep, bomb, grenade, and a played Shin Matgo bonus steal one opponent pi card; capturing one's own ppuk steals two. The guide does not specify the physical-card priority when the victim owns more eligible pi cards than must be transferred.
-
-`pi_transfer.h` therefore separates rule-visible steal count from provider-specific card selection. If the victim has no more eligible physical pi cards than the requested count, all available cards move automatically. If there are extra candidates, the caller must provide an explicit `PiTransferSelection` mask. Missing/invalid selection leaves the complete resolve or hand-bonus action unchanged. A selected double-pi or 3-pi bonus card carries its full pi value with the physical card.
-
-This selection is an environment-policy boundary, not a new player decision. Once Hangame's exact automatic priority is pinned, the policy can be encoded without changing the resolver or transfer representation.
-
-### Measured RTX 5080 baseline
-
-The measured deal and draw kernels use zero local memory and reach 100% theoretical occupancy. Longer block-size measurements showed 256 and 512 threads/block effectively tied, so 256 remains the working default for the light phases.
-
-The base-48 capture resolver currently uses 72 registers/thread and zero local memory. Across three 1,048,576-game x 256-iteration measurements, 512 threads/block was consistently the fastest tested resolver configuration despite 33.3% theoretical occupancy, reaching roughly 7.5-7.9 billion resolve attempts/s. Phase-specific block sizes are therefore allowed; 512 is the current `RESOLVE` performance baseline while 256 remains the light-phase baseline.
-
-For the 21-node initialization + 20-draw sequence, CUDA Graph replay improved measured end-to-end wall time by about 1.11x-1.14x across three runs and reduced host submission time by roughly 65x-70x. CUDA Graph is therefore the current repeated-phase scheduling baseline; it can still be replaced later if real gameplay divergence makes another scheduler measurably better.
-
-### Rule correctness boundary
-
-Hangame's official guide is the source of truth. The pinned facts, implemented subset, internal card-ID convention, and intentionally deferred behavior are documented in `docs/rules.md`.
-
-## Build and test
+Build and run the engine tests:
 
 ```bash
-cmake -S . -B build -DBUILD_TESTING=ON -DCUGO_ENABLE_CUDA=ON
-cmake --build build --config Release -j
-ctest --test-dir build -C Release --output-on-failure
+cmake -S . -B build -G Ninja -DBUILD_TESTING=ON -DCUGO_ENABLE_CUDA=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-If CMake cannot find a CUDA compiler, it still builds and runs the CPU tests and prints that CUDA validation targets are disabled.
+On Windows, `scripts/windows_bootstrap.ps1` finds the MSVC/CMake/Ninja toolchain,
+builds and runs the suite.
 
-On Windows, `scripts/windows_bootstrap.ps1` discovers the installed MSVC/CMake/Ninja toolchain, performs a clean CUDA build, and runs the correctness suite.
+Set up Python. The CUDA extension compiles on first use, into
+`build/torch_extensions/`:
 
-## CUDA benchmarks
-
-After a CUDA build:
-
-```text
-build\cugo_cuda_deal_test.exe --benchmark
-build\cugo_cuda_state_test.exe --benchmark
-build\cugo_cuda_turn_test.exe --benchmark
+```bash
+python -m venv .venv-torch
+.venv-torch/Scripts/python -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu132
+.venv-torch/Scripts/python python/torch50_smoke.py --batch 32768 --warmup 1 --iters 3
 ```
 
-The deal benchmark generates 1,048,576 independent base-48 deals per launch, sweeps 128/256/512 threads per block, and uses 256 timed launches per block size to reduce short-run WDDM/clock noise.
+Train an MLP policy with PPO self-play, or a sequence policy:
 
-The resident-state benchmark keeps 1,048,576 game states in field-major SoA memory. It measures the 20 stock-draw kernels over a long window and compares manual host submission against CUDA Graph replay for the full 21-node initialization + 20-draw sequence. Graph setup cost is reported separately from replay.
+```bash
+python python/train_ppo50.py --checkpoint-dir build/checkpoints/my_run \
+    --reference build/checkpoints/hg_init/ppo_h1500_v3.pt
+python python/train_seq50.py --mode hybrid --checkpoint-dir build/checkpoints/seq_hybrid \
+    --wave 4096 --length-bucket 8 --reference build/checkpoints/hg_init/ppo_h1500_v3.pt
+```
 
-The base-48 turn-resolve benchmark prepares 1,048,576 deterministic first-turn states, times only the hot `load SoA -> resolve_turn -> status write -> store SoA` path, and sweeps 128/256/512 threads per block over 256 timed launches. It reports registers/thread, local bytes/thread, theoretical occupancy, games/s, average kernel time, and the resolved/choice-required status mix. Correctness-only invariant checks are deliberately excluded from the timed resolver kernel.
+To continue an MLP run, pass `train_ppo50.py --resume <checkpoint>`. The sequence
+trainer resumes with `--init <checkpoint>`.
+
+Evaluate and compare checkpoints:
+
+```bash
+python python/eval50.py --a-checkpoint A.pt --b-checkpoint B.pt --pairs 131072
+python python/league50.py A.pt B.pt C.pt --pairs 65536
+python python/dashboard50.py        # http://127.0.0.1:8765
+```
+
+Run the Python scripts with `PYTHONPATH=python`, or from inside `python/`.
+
+## How it fits together
+
+```
+include/cugo/core      cards, masks, RNG
+include/cugo/game      deal → turn → game → special → terminal → settlement
+                       rollout / policy / post-chance decisions
+                       torch50.h: 720-feature observation, 179-action space, event log
+python/csrc            CUDA extension: create / observe / step / clone / branch / events
+python/                PPO (MLP), sequence PPO, self-play, evaluation, dashboard
+tests/                 CPU tests and CPU/GPU differential tests
+tools/                 hg_replay50: replays recorded Hangame server games
+```
+
+A decision is one of: a primary action (play, bonus, shake, bomb, Go/Stop,
+Chongtong), a floor choice after a stock flip, or a Gukjin prompt. All of them share
+one 179-way action head with a legal-action mask.
+
+## Documentation
+
+| Topic | Document |
+| --- | --- |
+| Rules taken from the Hangame client | [docs/hangame50.md](docs/hangame50.md) |
+| Rules pinned from the public guide, card ids | [docs/rules.md](docs/rules.md) |
+| Special plays, terminal states, last turns, settlement | [special50](docs/special50.md), [terminal50](docs/terminal50.md), [last_card50](docs/last_card50.md), [settlement50](docs/settlement50.md) |
+| Rollouts, policy actions, post-chance decisions | [rollout50](docs/rollout50.md), [policy50](docs/policy50.md), [postchance50](docs/postchance50.md) |
+| Observation and action contract (v4) | [docs/torch50.md](docs/torch50.md) |
+| CUDA extension | [docs/torch_extension.md](docs/torch_extension.md) |
+| Event-sequence policies and GPU-resident self-play | [docs/seq50.md](docs/seq50.md) |
+| Paired evaluation | [docs/eval50.md](docs/eval50.md) |
+| Survey of training methods for imperfect-information games (Korean) | [reports/](reports/) |
+
+## Scope
+
+Cugo is an independent research project. It is not affiliated with or endorsed by
+NHN or Hangame.
+
+- The rule details were read from the game's offline rule server. The repository
+  holds no client code or assets.
+- Cugo does not connect to, read from or automate the live game client.
+- Money caps, fees and pushing stakes between games are not modelled.
+
+## License
+
+No license has been chosen yet; all rights reserved by the author.

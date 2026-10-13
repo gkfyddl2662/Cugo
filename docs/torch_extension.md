@@ -1,7 +1,7 @@
 # PyTorch CUDA extension baseline
 
 This layer is the first real neural-network integration over the frozen `TorchEnv50` contract.
-It lives entirely under `python/` and does not change the C++ engine or the 33 core CTest targets.
+It lives entirely under `python/` and does not change the C++ engine or its CTest targets.
 
 ## GPU-resident API
 
@@ -18,14 +18,14 @@ The JIT extension exposes three operations:
   - `status`: CUDA `int16 [N]`.
 - `step(states, actions) -> reward0, done, nagari, status, primary_committed`
   - mutates the opaque states in place.
-  - `actions` is CUDA `int64 [N]` in the unified 177-action space.
+  - `actions` is CUDA `int64 [N]` in the unified 179-action space.
   - `reward0` is from player 0's perspective and is non-zero on terminal settlement only.
 
 The kernels use PyTorch's current CUDA stream. Game state never has to cross PCIe during self-play.
 
 ## JIT build
 
-`python/cugo_torch50_ext.py` uses `torch.utils.cpp_extension.load()` with the repository `include/` directory and C++20/CUDA C++20 flags. The build cache is stored under `build/torch_extensions/cugo_torch50_ext`.
+`python/cugo_torch50_ext.py` uses `torch.utils.cpp_extension.load()` with the repository `include/` directory and C++20/CUDA C++20 flags. The build cache is stored under `build/torch_extensions/cugo_torch50_ext_v5`; the version suffix changes with the feature contract, so a running trainer that loaded an older build keeps working while a new one compiles.
 
 For the Windows CUDA 13.2 development machine, use a PyTorch CUDA 13.2 build. PyTorch 2.14.0 provides `cu132` wheels.
 
@@ -47,4 +47,4 @@ The sequence-policy self-play (`python/cugo_seq_attention50.py`) uses a Triton k
 - policy: 179 logits
 - value: scalar
 
-The policy logits are masked by the engine-generated 177-way legal mask before `argmax`. The script runs complete games until terminal or nagari and reports end-to-end games/s. This network is not a training architecture decision; it is a transport/inference baseline for measuring the CUDA-env/PyTorch boundary.
+The policy logits are masked by the engine-generated 179-way legal mask before `argmax`. The script runs complete games until terminal or nagari and reports end-to-end games/s. This network is not a training architecture decision; it is a transport/inference baseline for measuring the CUDA-env/PyTorch boundary.
