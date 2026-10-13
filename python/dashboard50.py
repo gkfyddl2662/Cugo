@@ -64,6 +64,12 @@ def parse_training_log(path: Path, mtime: float) -> dict:
         if line.startswith("iter="):
             pairs = KV.findall(line)
             iteration = int(pairs[0][1])
+            # Logs are appended across invocations. A run resumed from an earlier
+            # checkpoint replaces the iterations after it, and progress after a
+            # crash means the crash belonged to an earlier invocation.
+            if rows and iteration < max(rows):
+                rows = {i: r for i, r in rows.items() if i < iteration}
+            failed = finished = False
             row = rows.setdefault(iteration, {})
             for key, value in pairs[1:]:
                 parsed = number(value)
