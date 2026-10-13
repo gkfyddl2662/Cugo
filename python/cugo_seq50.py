@@ -178,6 +178,24 @@ class SeqNet(nn.Module):
         out = self.head(self.norm(h))
         return out.squeeze(-1) if out.shape[-1] == 1 else out
 
+    def _encode(self, x: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
+        """Pre-norm encoder stack over [B, T, d]; allowed [B, T, T] is True where a query may attend.
+
+        Same parameters and math as the nn.TransformerEncoder that holds them, but the
+        mask broadcasts over heads instead of being copied per head.
+        """
+        b, t, d = x.shape
+        heads = self.encoder.layers[0].self_attn.num_heads
+        mask = allowed.unsqueeze(1)
+        for layer in self.encoder.layers:
+            attn = layer.self_attn
+            q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
+            q, k, v = (z.reshape(b, t, heads, d // heads).transpose(1, 2) for z in (q, k, v))
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            x = x + attn.out_proj(a.transpose(1, 2).reshape(b, t, d))
+            x = x + layer.linear2(layer.activation(layer.linear1(layer.norm2(x))))
+        return x
+
     def forward(self, features: torch.Tensor, legal: torch.Tensor, hist: HistBatch,
                 opp_hand: torch.Tensor | None = None) -> torch.Tensor:
         """One decision per row: [opening, events seen so far, query].
@@ -189,22 +207,23 @@ class SeqNet(nn.Module):
         length = max(1, int(hist.count.max()))
         prefix, valid = self._prefix(hist, length, dtype)
         x = torch.cat((prefix, self._query(features, legal, opp_hand, dtype).unsqueeze(1)), 1)
-        ignore = torch.cat((torch.zeros_like(valid[:, :1]), ~valid, torch.zeros_like(valid[:, :1])), 1)
-        causal = torch.ones(length + 2, length + 2, dtype=torch.bool, device=x.device).triu(1)
-        h = self.encoder(x, mask=causal, src_key_padding_mask=ignore)
+        key_ok = torch.cat((torch.ones_like(valid[:, :1]), valid, torch.ones_like(valid[:, :1])), 1)
+        causal = torch.ones(length + 2, length + 2, dtype=torch.bool, device=x.device).tril()
+        h = self._encode(x, causal.unsqueeze(0) & key_ok.unsqueeze(1))
         return self._out(h[:, -1])
 
     def forward_games(self, hist: HistBatch, features: torch.Tensor, legal: torch.Tensor, seen: torch.Tensor,
-                      opp_hand: torch.Tensor | None = None) -> torch.Tensor:
+                      opp_hand: torch.Tensor | None = None, length: int | None = None) -> torch.Tensor:
         """Every decision of one (game, seat) at once: [opening, all events, queries...].
 
         hist.count is the game's full event count; features/legal/seen/opp_hand are
         [S, Q, ...] per decision, seen[s, q] = events visible at that decision. Each
         query sees the opening, events < seen and itself, so row q equals forward()
-        on that decision alone. Returns [S, Q, outputs].
+        on that decision alone. Returns [S, Q, outputs]. Passing length (>= the
+        largest event count) avoids reading it back from the GPU.
         """
         dtype = self._dtype()
-        length = max(1, int(hist.count.max()))
+        length = max(1, int(hist.count.max())) if length is None else max(1, length)
         prefix, _ = self._prefix(hist, length, dtype)
         q = seen.shape[1]
         x = torch.cat((prefix, self._query(features, legal, opp_hand, dtype)), 1)
@@ -216,9 +235,76 @@ class SeqNet(nn.Module):
         allowed[:, length + 1:, 1:length + 1] = torch.arange(length, device=dev).view(1, 1, -1) < seen.unsqueeze(-1)
         diag = torch.arange(length + 1, t, device=dev)
         allowed[:, diag, diag] = True
-        heads = self.encoder.layers[0].self_attn.num_heads
-        h = self.encoder(x, mask=(~allowed).repeat_interleave(heads, 0))
+        h = self._encode(x, allowed)
         return self._out(h[:, length + 1:])
+
+    # Incremental inference. Opening and event tokens only attend backwards, so their
+    # keys/values never change once computed: self-play caches them per (game, seat)
+    # and runs one new token per event and one query token per decision.
+
+    def start_token(self, start: torch.Tensor, seat: torch.Tensor) -> torch.Tensor:
+        dtype = self._dtype()
+        hb = HistBatch(start.new_zeros((start.shape[0], 1, EVENT_WORDS)), torch.zeros_like(seat), start, seat)
+        return self.start_in(encode_start(hb).to(dtype)) + self.position[0] + self.token_type[0]
+
+    def event_token(self, words: torch.Tensor, seat: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        """Token of one event per row; index = events before it (its position is 1 + index)."""
+        dtype = self._dtype()
+        hb = HistBatch(words.unsqueeze(1), torch.ones_like(seat), words.new_zeros((words.shape[0], START_WORDS)), seat)
+        tokens, _ = encode_events(hb, 1, dtype)
+        position = self.position.index_select(0, 1 + index.clamp_max(MAX_EVENTS - 1))
+        return self.event_in(tokens[:, 0]) + position + self.token_type[1]
+
+    def query_token(self, features: torch.Tensor, legal: torch.Tensor,
+                    opp_hand: torch.Tensor | None = None) -> torch.Tensor:
+        return self._query(features, legal, opp_hand, self._dtype())
+
+    def readout(self, h: torch.Tensor) -> torch.Tensor:
+        return self._out(h)
+
+    def cached_step(self, cache: "KVCache", x: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
+        """Run one token per row (x [N, d]); its key/value go to slot cache.length[row].
+
+        Each token attends slots <= its own: everything cached plus itself. The caller
+        advances cache.length for tokens that stay (events); a query does not, so the
+        next event overwrites its slot. rows=None means every cache row in order.
+        Returns the final hidden state [N, d].
+        """
+        n, d = x.shape
+        heads = self.encoder.layers[0].self_attn.num_heads
+        length = cache.length if rows is None else cache.length.index_select(0, rows)
+        pos = length.clamp_max(cache.slots - 1)
+        mask = (cache.slot_ids.view(1, -1) <= pos.view(-1, 1)).view(n, 1, 1, cache.slots)
+        at = cache.row_ids if rows is None else rows
+        for i, layer in enumerate(self.encoder.layers):
+            attn = layer.self_attn
+            q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
+            kc, vc = cache.k[i], cache.v[i]
+            kc.index_put_((at, pos), k.to(kc.dtype))
+            vc.index_put_((at, pos), v.to(vc.dtype))
+            keys = kc if rows is None else kc.index_select(0, rows)
+            values = vc if rows is None else vc.index_select(0, rows)
+            a = F.scaled_dot_product_attention(
+                q.reshape(n, heads, 1, d // heads),
+                keys.view(n, cache.slots, heads, d // heads).transpose(1, 2).to(q.dtype),
+                values.view(n, cache.slots, heads, d // heads).transpose(1, 2).to(q.dtype),
+                attn_mask=mask)
+            x = x + attn.out_proj(a.reshape(n, d))
+            x = x + layer.linear2(layer.activation(layer.linear1(layer.norm2(x))))
+        return x
+
+
+class KVCache:
+    """Per-row keys/values of the opening and event tokens for every layer (bf16)."""
+
+    def __init__(self, model: SeqNet, rows: int, device: torch.device) -> None:
+        layers, d = len(model.encoder.layers), model.position.shape[1]
+        self.slots = MAX_EVENTS + 2  # opening + events + one scratch slot for the query
+        self.k = torch.zeros((layers, rows, self.slots, d), dtype=torch.bfloat16, device=device)
+        self.v = torch.zeros_like(self.k)
+        self.length = torch.zeros(rows, dtype=torch.int64, device=device)
+        self.slot_ids = torch.arange(self.slots, device=device)
+        self.row_ids = torch.arange(rows, device=device)
 
 
 def stored_columns(mode: str) -> list[int] | None:

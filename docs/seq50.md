@@ -23,3 +23,9 @@ Two variants differ only in the query token:
 ```
 
 Checkpoints carry `config.algorithm = "seq-ppo-v1"`; `eval50.py` and `league50.py` load them next to MLP checkpoints and record event logs only when a sequence policy plays.
+
+## GPU-resident self-play
+
+`python/cugo_seq_selfplay50.py` plays in waves of `--wave` games (default 4,096). Opening and event tokens only attend backwards, so their per-layer keys/values never change: each (game, seat) keeps a KV cache, every committed event adds one token per seat and every decision runs one query token (`SeqNet.cached_step`). All tensors in a decision step have fixed shapes (finished games stay in the batch, masked), so the step - observe, policy query, Gumbel-max sampling, engine step, cache append - is captured once as a CUDA graph and replayed. The host checks every four steps whether the wave has finished and compacts the recorded decisions once per wave. Pool games are the first 20% of each wave; the opponent's weights are copied into a fixed module so the graph stays valid.
+
+The update reads every minibatch's padding sizes in one device-to-host copy, computes losses with validity masks instead of boolean indexing, runs GAE as a backward scan over decision columns and checks the KL early stop one update late, so its inner loop never waits on the host. `--length-bucket N` sorts each window of N minibatches by game length to cut padding. `--collector eager` keeps the previous per-decision implementation as a reference.
