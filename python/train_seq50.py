@@ -65,12 +65,6 @@ class SeqRollout:
     learner_score: float
 
 
-def history_rows(storage: SeqStorage, hist: History, idx: torch.Tensor) -> HistBatch:
-    games = storage.env_ids.index_select(0, idx)
-    return HistBatch(hist.events.index_select(0, games), storage.count.index_select(0, idx),
-                     hist.start.index_select(0, games), storage.seat.index_select(0, idx))
-
-
 def _act(model: nn.Module, features, legal, hist: HistBatch, greedy: bool):
     masked = policy_logits(model, features, legal, hist).masked_fill(~legal, -1.0e30)
     actions = masked.argmax(1) if greedy else torch.multinomial(torch.softmax(masked, 1), 1).squeeze(1)
@@ -162,29 +156,60 @@ def collect(ext: Any, actor: nn.Module, pool: list[nn.Module], games: int, seed_
     )
 
 
-def length_batches(count: torch.Tensor, size: int, shuffle: bool) -> list[torch.Tensor]:
-    """Minibatches of rows with similar event counts, so little padding is computed."""
-    n = count.numel()
-    perm = torch.randperm(n, device=count.device) if shuffle else torch.arange(n, device=count.device)
-    order = perm.index_select(0, torch.sort(count.index_select(0, perm), stable=True).indices)
-    batches = list(order.split(size))
-    if shuffle:
-        if len(batches) > 1 and batches[-1].numel() < size:
-            batches.pop()  # PPO epochs skip the ragged tail, as in train_ppo50
-        batches = [batches[i] for i in torch.randperm(len(batches)).tolist()]
-    return batches
+class GameRows:
+    """Decision rows grouped by (game, seat), in decision order: [S, Q] row ids, -1 = padding."""
+
+    def __init__(self, storage: SeqStorage, hist: History) -> None:
+        n = storage.size
+        key = storage.env_ids[:n] * 2 + storage.seat[:n]
+        order = torch.sort(key, stable=True).indices  # storage is step-major, so decisions stay in order
+        keys, inverse, counts = torch.unique_consecutive(key[order], return_inverse=True, return_counts=True)
+        first = torch.cumsum(counts, 0) - counts
+        within = torch.arange(n, device=key.device) - first[inverse]
+        self.rows = torch.full((keys.numel(), int(counts.max())), -1, dtype=torch.int64, device=key.device)
+        self.rows[inverse, within] = order
+        self.games, self.seat, self.decisions = keys // 2, keys % 2, counts
+        self.storage, self.hist = storage, hist
+
+    def __len__(self) -> int:
+        return self.rows.shape[0]
+
+    def batches(self, decisions: int, shuffle: bool) -> list[torch.Tensor]:
+        size = max(1, decisions * len(self) // max(1, self.storage.size))
+        order = torch.randperm(len(self), device=self.rows.device) if shuffle else torch.arange(
+            len(self), device=self.rows.device)
+        return list(order.split(size))
+
+    def take(self, seqs: torch.Tensor) -> tuple[HistBatch, torch.Tensor, torch.Tensor]:
+        """History of the chosen sequences, their [B, Q] row ids (padding -> 0) and validity."""
+        games = self.games.index_select(0, seqs)
+        rows = self.rows.index_select(0, seqs)
+        q = max(1, int(self.decisions.index_select(0, seqs).max()))
+        rows = rows[:, :q]
+        valid = rows >= 0
+        h = self.hist
+        return (HistBatch(h.events.index_select(0, games), h.count.index_select(0, games),
+                          h.start.index_select(0, games), self.seat.index_select(0, seqs)),
+                rows.clamp_min(0), valid)
+
+
+def run_games(model: nn.Module, g: GameRows, hb: HistBatch, rows: torch.Tensor, oracle: bool) -> torch.Tensor:
+    s = g.storage
+    return model.forward_games(hb, s.features[rows], s.legal[rows], s.count[rows],
+                               s.opp_hand[rows] if oracle else None)
 
 
 def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer, storage: SeqStorage,
            data: SeqRollout, args: argparse.Namespace, entropy_coef: float) -> TrainStats:
     n = storage.size
     s = storage
+    g = GameRows(storage, data.hist)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         critic.eval()
         values = torch.empty(n, device=s.device)
-        for idx in length_batches(s.count[:n], 32768, shuffle=False):
-            values[idx] = critic(s.features[idx], s.legal[idx], history_rows(s, data.hist, idx),
-                                 s.opp_hand[idx]).float()
+        for seqs in g.batches(4 * args.minibatch, shuffle=False):
+            hb, rows, valid = g.take(seqs)
+            values[rows[valid]] = run_games(critic, g, hb, rows, True)[valid].float()
     adv_all = gae_advantages(values, data.returns, s.env_ids[:n], s.seat[:n], args.gae_lambda)
     ret_all = adv_all + values
     explained_var = 1.0 - float((data.returns - values).var() / data.returns.var().clamp_min(1e-8))
@@ -195,12 +220,13 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
     sums = torch.zeros(8, device=s.device)
     updates, stop = 0, False
     for _ in range(args.epochs):
-        for idx in length_batches(s.count[:n], args.minibatch, shuffle=True):
-            feats, legal, hb = s.features[idx], s.legal[idx], history_rows(s, data.hist, idx)
-            adv, ret = adv_all[idx], ret_all[idx]
+        for seqs in g.batches(args.minibatch, shuffle=True):
+            hb, rows, valid = g.take(seqs)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = actor(feats, legal, hb).float()
-                value = critic(feats, legal, hb, s.opp_hand[idx]).float()
+                logits = run_games(actor, g, hb, rows, False)[valid].float()
+                value = run_games(critic, g, hb, rows, True)[valid].float()
+            idx = rows[valid]
+            legal, adv, ret = s.legal[idx], adv_all[idx], ret_all[idx]
             log_probs = torch.log_softmax(logits.masked_fill(~legal, -1.0e30), dim=1)
             log_ratio = log_probs.gather(1, s.actions[idx].unsqueeze(1)).squeeze(1) - s.logp[idx]
             ratio = log_ratio.exp()
@@ -215,10 +241,10 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
             updates += 1
             with torch.no_grad():
                 kl = ((ratio - 1) - log_ratio).mean()
-                g = (feats[:, DECISION_OFFSET + GOSTOP_KIND] > 0.5).float()
+                gs = (s.features[idx, DECISION_OFFSET + GOSTOP_KIND] > 0.5).float()
                 sums += torch.stack((policy_loss.detach(), value_loss.detach(), entropy_rows.mean().detach(), kl,
                                      ((ratio - 1).abs() > args.clip).float().mean(), torch.ones_like(kl),
-                                     (entropy_rows.detach() * g).sum(), g.sum()))
+                                     (entropy_rows.detach() * gs).sum(), gs.sum()))
             if args.target_kl > 0 and updates % 8 == 0 and float(kl) > 1.5 * args.target_kl:
                 stop = True
                 break
@@ -230,7 +256,7 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
     return TrainStats(policy_loss=t[0] / count, value_loss=t[1] / count, entropy=t[2] / count,
                       entropy_gostop=t[6] / t[7] if t[7] else float("nan"), kl=t[3] / count,
                       clipfrac=t[4] / count, explained_var=explained_var, updates=updates,
-                      epochs=updates / max(1, n // args.minibatch))
+                      epochs=updates / max(1, len(g.batches(args.minibatch, shuffle=False))))
 
 
 def frozen(model: nn.Module) -> nn.Module:
@@ -251,7 +277,7 @@ def main() -> None:
     parser.add_argument("--storage-per-game", type=int, default=24, help="decision rows reserved per game")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--minibatch", type=int, default=8192)
+    parser.add_argument("--minibatch", type=int, default=16384, help="decisions per update (whole games)")
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--entropy", type=float, default=0.03)
     parser.add_argument("--entropy-final", type=float, default=None)

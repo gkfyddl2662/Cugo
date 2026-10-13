@@ -152,24 +152,70 @@ class SeqNet(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, outputs))
 
-    def forward(self, features: torch.Tensor, legal: torch.Tensor, hist: HistBatch,
-                opp_hand: torch.Tensor | None = None) -> torch.Tensor:
-        dtype = self.event_in.weight.dtype if not torch.is_autocast_enabled() else torch.get_autocast_dtype("cuda")
-        length = max(1, int(hist.count.max()))
-        ev_tokens, valid = encode_events(hist, length, dtype)
-        query = features if self.mode == "hybrid" else features.index_select(1, self.context_index)
+    def _dtype(self) -> torch.dtype:
+        return torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else self.event_in.weight.dtype
+
+    def _query(self, features: torch.Tensor, legal: torch.Tensor, opp_hand: torch.Tensor | None,
+               dtype: torch.dtype) -> torch.Tensor:
+        query = features if self.mode == "hybrid" else features.index_select(-1, self.context_index)
         parts = [query.to(dtype), legal.to(dtype)]
         if self.oracle:
-            parts.append(card_plane(opp_hand, dtype))
+            parts.append(card_plane(opp_hand.reshape(-1), dtype).view(*opp_hand.shape, -1))
+        return self.query_in(torch.cat(parts, -1)) + self.token_type[2]
+
+    def _prefix(self, hist: HistBatch, length: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        ev_tokens, valid = encode_events(hist, length, dtype)
         x = torch.cat((
             (self.start_in(encode_start(hist).to(dtype)) + self.position[0] + self.token_type[0]).unsqueeze(1),
             self.event_in(ev_tokens) + self.position[1:length + 1] + self.token_type[1],
-            (self.query_in(torch.cat(parts, -1)) + self.token_type[2]).unsqueeze(1),
         ), 1)
-        ignore = torch.cat((torch.zeros_like(valid[:, :1]), ~valid, torch.zeros_like(valid[:, :1])), 1)
-        h = self.encoder(x, src_key_padding_mask=ignore)
-        out = self.head(self.norm(h[:, -1]))
+        return x, valid
+
+    def _out(self, h: torch.Tensor) -> torch.Tensor:
+        out = self.head(self.norm(h))
         return out.squeeze(-1) if out.shape[-1] == 1 else out
+
+    def forward(self, features: torch.Tensor, legal: torch.Tensor, hist: HistBatch,
+                opp_hand: torch.Tensor | None = None) -> torch.Tensor:
+        """One decision per row: [opening, events seen so far, query].
+
+        Causal attention plus key padding: event e sees the opening and events <= e,
+        the query sees every valid event. forward_games computes the same function.
+        """
+        dtype = self._dtype()
+        length = max(1, int(hist.count.max()))
+        prefix, valid = self._prefix(hist, length, dtype)
+        x = torch.cat((prefix, self._query(features, legal, opp_hand, dtype).unsqueeze(1)), 1)
+        ignore = torch.cat((torch.zeros_like(valid[:, :1]), ~valid, torch.zeros_like(valid[:, :1])), 1)
+        causal = torch.ones(length + 2, length + 2, dtype=torch.bool, device=x.device).triu(1)
+        h = self.encoder(x, mask=causal, src_key_padding_mask=ignore)
+        return self._out(h[:, -1])
+
+    def forward_games(self, hist: HistBatch, features: torch.Tensor, legal: torch.Tensor, seen: torch.Tensor,
+                      opp_hand: torch.Tensor | None = None) -> torch.Tensor:
+        """Every decision of one (game, seat) at once: [opening, all events, queries...].
+
+        hist.count is the game's full event count; features/legal/seen/opp_hand are
+        [S, Q, ...] per decision, seen[s, q] = events visible at that decision. Each
+        query sees the opening, events < seen and itself, so row q equals forward()
+        on that decision alone. Returns [S, Q, outputs].
+        """
+        dtype = self._dtype()
+        length = max(1, int(hist.count.max()))
+        prefix, _ = self._prefix(hist, length, dtype)
+        q = seen.shape[1]
+        x = torch.cat((prefix, self._query(features, legal, opp_hand, dtype)), 1)
+        t = length + 1 + q
+        dev = x.device
+        allowed = torch.zeros(seen.shape[0], t, t, dtype=torch.bool, device=dev)
+        allowed[:, :, 0] = True
+        allowed[:, 1:length + 1, 1:length + 1] = torch.ones(length, length, dtype=torch.bool, device=dev).tril()
+        allowed[:, length + 1:, 1:length + 1] = torch.arange(length, device=dev).view(1, 1, -1) < seen.unsqueeze(-1)
+        diag = torch.arange(length + 1, t, device=dev)
+        allowed[:, diag, diag] = True
+        heads = self.encoder.layers[0].self_attn.num_heads
+        h = self.encoder(x, mask=(~allowed).repeat_interleave(heads, 0))
+        return self._out(h[:, length + 1:])
 
 
 def seq_actor(mode: str, d_model: int, layers: int, heads: int) -> SeqNet:
@@ -181,7 +227,7 @@ def seq_critic(mode: str, d_model: int, layers: int, heads: int) -> SeqNet:
 
 
 def policy_logits(model: nn.Module, features: torch.Tensor, legal: torch.Tensor,
-                  hist: HistBatch | None, chunk: int = 16384) -> torch.Tensor:
+                  hist: HistBatch | None, chunk: int = 8192) -> torch.Tensor:
     """Logits from either kind of policy; sequence models run in row chunks."""
     if not getattr(model, "uses_history", False):
         out = model(features)

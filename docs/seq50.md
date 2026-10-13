@@ -15,7 +15,7 @@ Two variants differ only in the query token:
 | `hybrid` | all 720 Torch50 features + legal mask |
 | `events` | decision context only (pending public cards, selected pi, decision kind, choice scalars, Gukjin flag) + legal mask; the table state must be inferred from the events |
 
-`python/train_seq50.py` trains either variant with the same PPO objective as `train_ppo50.py` (oracle critic, GAE, actor EMA, snapshot pool). Every iteration keeps each game's event log; a decision row stores how many events it saw, so the update rebuilds exactly the sequence the policy acted on. Minibatches group rows of similar length to limit padding.
+`python/train_seq50.py` trains either variant with the same PPO objective as `train_ppo50.py` (oracle critic, GAE, actor EMA, snapshot pool). Every iteration keeps each game's event log; a decision row stores how many events it saw, so the update rebuilds exactly the sequence the policy acted on. Event tokens attend causally (opening and earlier events only), so the update can run each (game, seat) once with all of its decisions as query tokens (`SeqNet.forward_games`) and get the same outputs as the per-decision pass used while playing; minibatches are whole (game, seat) sequences.
 
 ```powershell
 .\.venv-torch\Scripts\python.exe python\train_seq50.py --mode events --checkpoint-dir build\checkpoints\seq_events `
