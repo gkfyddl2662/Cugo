@@ -10,3 +10,4 @@ CMakeUserPresets.json
 *.nsys-rep
 __pycache__/
 *.pyc
+/.claude/
