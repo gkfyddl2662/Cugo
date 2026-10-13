@@ -243,6 +243,8 @@ def policy_logits(model: nn.Module, features: torch.Tensor, legal: torch.Tensor,
     if hist is None:
         raise ValueError("sequence policy needs a history batch")
     n = features.shape[0]
+    if n == 0:  # e.g. every remaining game has the pool opponent to move
+        return features.new_zeros((0, legal.shape[1]), dtype=torch.float32)
     if n <= chunk:
         return model(features, legal, hist).float()
     outs = []
