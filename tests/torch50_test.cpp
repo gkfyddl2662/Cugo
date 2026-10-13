@@ -67,14 +67,20 @@ void verify_features(const TorchPacket50& packet) {
     require(features[i] >= 0.0f && features[i] <= 1.0f,
             "semantic feature must stay in [0, 1]");
   }
-  for (std::uint16_t i = kTorch50NeutralPpukOffset + core::kMonthCount;
-       i < kTorch50MissionPlaneOffset; ++i) {
-    require(features[i] == 0.0f, "padding features must be zero");
+  for (std::uint16_t i = kTorch50TableCountOffset; i < kTorch50MissionPlaneOffset; ++i) {
+    require(features[i] >= 0.0f && features[i] <= 1.0f, "table counts stay in [0, 1]");
   }
   constexpr std::uint16_t kHistoryEnd =
       kTorch50HistoryOffset + kTorch50HistoryPlaneCount * core::kShinMatgoCardCount;
-  for (std::uint16_t i = kHistoryEnd; i < kTorch50FeatureCount; ++i) {
+  for (std::uint16_t i = kTorch50RibbonCountOffset + 2; i < kTorch50FeatureCount; ++i) {
     require(features[i] == 0.0f, "trailing padding must be zero");
+  }
+  for (std::uint16_t card = 0; card < core::kShinMatgoCardCount; ++card) {
+    require(features[kTorch50ChoiceCardOffset + card] ==
+                (has_torch_action50(packet.legal_actions,
+                                    static_cast<std::uint16_t>(kTorch50ChoiceActionBegin + card))
+                     ? 1.0f : 0.0f),
+            "choice-card plane mirrors the legal floor choices");
   }
   for (std::uint16_t i = kTorch50HistoryOffset; i < kHistoryEnd; ++i) {
     require(features[i] == 0.0f || features[i] == 1.0f, "history planes are binary");
@@ -88,12 +94,25 @@ void verify_features(const TorchPacket50& packet) {
           "known opponent cards are neither public nor unseen");
   require((o.own_played & o.opponent_played) == 0, "a card is played by one side only");
 
+  // Every card is in exactly one place from the observer's seat.
+  const core::CardMask places[] = {o.own_hand, o.floor, o.own_captured, o.opponent_captured,
+                                   o.pending_public, o.unseen, o.opponent_known_hand};
+  core::CardMask seen = 0;
+  for (const core::CardMask place : places) {
+    require((seen & place) == 0, "a card is in one place only");
+    seen |= place;
+  }
+  require(seen == core::kShinMatgoDeckMask, "every card has a place");
+
+  // Kinds 1..5 are one-hot; slots 0 and 6 carry the first-player bit and the
+  // opponent's hand count (contract v4).
   std::uint16_t decision_hot = 0;
-  for (std::uint16_t i = 0; i < kTorch50DecisionCount; ++i) {
+  for (std::uint16_t i = 1; i <= 5; ++i) {
     decision_hot += static_cast<std::uint16_t>(
         features[kTorch50DecisionOffset + i] == 1.0f);
   }
-  if (packet.decision_kind < kTorch50DecisionCount) {
+  require(features[kTorch50OwnFirstIndex] == (o.own_first != 0 ? 1.0f : 0.0f), "first-player bit");
+  if (packet.decision_kind >= 1u && packet.decision_kind <= 5u) {
     require(decision_hot == 1, "decision kind must be one-hot");
     require(features[kTorch50DecisionOffset + packet.decision_kind] == 1.0f,
             "decision kind one-hot index");
@@ -171,6 +190,60 @@ void test_rollout_equivalence(std::uint64_t& primary_actions,
   }
 }
 
+// Random play: the v4 observation facts against ground truth tracked outside the
+// engine (first player, cards each hand has held, the stop settlement).
+void test_observation_facts(std::uint64_t& floor_choices, std::uint64_t& go_stops) {
+  std::uint64_t rng = 0x6f62736572766535ULL;
+  auto next = [&rng]() {
+    rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<std::uint32_t>(rng >> 33);
+  };
+  for (std::uint32_t g = 0; g < 8192; ++g) {
+    const std::uint8_t first = static_cast<std::uint8_t>(g & 1u);
+    TorchEnv50 env = make_torch_env50(0x9b05688c2b3e6c1fULL + 0x9e3779b97f4a7c15ULL * g, first);
+    if (env.game.mission_type == kMissionTriple50) {
+      require(env.game.mission_multi0 == 1 && env.game.mission_multi1 == 1,
+              "triple mission starts at 2^0");
+    }
+    const TurnState50& t0 = env.game.special.game.turn;
+    core::CardMask held[2] = {t0.hand0, t0.hand1};
+    for (std::uint16_t step = 0; step < 192 && env.done == 0; ++step) {
+      const TorchPacket50 packet = make_torch_packet50(env);
+      require(packet.status == ActionStatus50::kOk, "facts: packet");
+      const PolicyObservation50& o = packet.observation;
+      const std::uint8_t me = packet.decision_player;
+      const TurnState50& t = env.game.special.game.turn;
+      const core::CardMask opp_hand = me == 0 ? t.hand1 : t.hand0;
+      require(o.own_first == static_cast<std::uint8_t>(me == first), "facts: first player");
+      require(o.opponent_hand_count == core::card_count(opp_hand), "facts: opponent hand count");
+      require(o.own_played == (held[me] & ~o.own_hand), "facts: own played cards");
+      require(o.opponent_played == (held[me ^ 1u] & ~opp_hand), "facts: opponent played cards");
+      if (env.pending.active != 0) ++floor_choices;
+      if (packet.decision_kind == static_cast<std::uint8_t>(PolicyDecision50::kGoStop)) {
+        ++go_stops;
+        TerminalGameState50 stopped = env.game;
+        require(apply_terminal_go_stop_decision50(stopped, GoStopAction50::kStop) ==
+                    GoStopStatus50::kOk, "facts: stop applies");
+        const Settlement50 settled = settle_terminal50(stopped);
+        require(settled.winner == me && settled.final_points == o.own_stop_points,
+                "facts: stop points are the stop settlement");
+      } else {
+        require(o.own_stop_points == 0, "facts: stop points only at Go/Stop");
+      }
+
+      std::uint16_t legal[kTorch50ActionCount];
+      std::uint16_t n = 0;
+      for (std::uint16_t a = 0; a < kTorch50ActionCount; ++a)
+        if (has_torch_action50(packet.legal_actions, a)) legal[n++] = a;
+      require(n != 0, "facts: legal action");
+      const TorchStepResult50 r = torch_step50(env, legal[next() % n]);
+      require(r.status == ActionStatus50::kOk, "facts: step");
+      held[0] |= env.game.special.game.turn.hand0;
+      held[1] |= env.game.special.game.turn.hand1;
+    }
+  }
+}
+
 }  // namespace
 
 // Replaying the event log from the start record must reproduce the floor, both
@@ -239,6 +312,10 @@ int main() {
     std::uint64_t events = 0;
     test_event_log_replays_table(events);
     require(events > 4096 * 10, "event replay covers whole games");
+    std::uint64_t floor_choices = 0;
+    std::uint64_t go_stops = 0;
+    test_observation_facts(floor_choices, go_stops);
+    require(floor_choices > 1000 && go_stops > 1000, "facts cover floor choices and Go/Stop");
 
     require(choice_packets != 0, "must exercise post-chance packets");
     require(resolve_choices != 0, "must exercise resolve choices");

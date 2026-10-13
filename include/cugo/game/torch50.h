@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 #include "cugo/game/postchance50.h"
@@ -53,6 +54,25 @@ inline constexpr std::uint16_t kTorch50HistoryOffset =
 inline constexpr std::uint16_t kTorch50HistoryPlaneCount = 3;
 inline constexpr std::uint16_t kTorch50FeatureCount = 720;
 
+// Contract v4 keeps the v3 layout and width but reuses the slots v3 left dead
+// (Hangame steals pi automatically, so no pi choice ever opens) plus some padding.
+// Networks trained on v3 saw zeros there; zeroing their input weights for these
+// columns (python/cugo_contract50.py) keeps their behaviour.
+inline constexpr std::uint16_t kTorch50ContractVersion = 4;
+// v3 selected-pi plane -> floor cards selectable at the current floor choice.
+inline constexpr std::uint16_t kTorch50ChoiceCardOffset = kTorch50SelectedPiOffset;
+// v3 decision one-hot slots for kNone (never a live decision) and kPiCard.
+inline constexpr std::uint16_t kTorch50OwnFirstIndex = kTorch50DecisionOffset + 0;
+inline constexpr std::uint16_t kTorch50OpponentHandIndex = kTorch50DecisionOffset + 6;
+// v3 scalars s[18] (requested pi) and s[21] (selected pi count).
+inline constexpr std::uint16_t kTorch50StopPointsIndex = kTorch50ScalarOffset + 18;
+inline constexpr std::uint16_t kTorch50OwnPiIndex = kTorch50ScalarOffset + 21;
+// Padding after the neutral-ppuk plane: opponent pi, then bright/animal counts.
+inline constexpr std::uint16_t kTorch50TableCountOffset = kTorch50NeutralPpukOffset + core::kMonthCount;
+// Padding after the history planes: ribbon counts.
+inline constexpr std::uint16_t kTorch50RibbonCountOffset =
+    kTorch50HistoryOffset + kTorch50HistoryPlaneCount * core::kShinMatgoCardCount;
+
 static_assert(kTorch50PrimaryActionCount == 127);
 static_assert(kTorch50ActionCount == 179);
 static_assert(kTorch50GukjinActionBegin == kPolicyGukjinPi50);
@@ -63,6 +83,9 @@ static_assert((kTorch50FeatureCount % 16u) == 0u);
 static_assert(kTorch50NeutralPpukOffset + core::kMonthCount <= kTorch50MissionPlaneOffset);
 static_assert(kTorch50HistoryOffset + kTorch50HistoryPlaneCount * core::kShinMatgoCardCount <=
               kTorch50FeatureCount);
+static_assert(kTorch50TableCountOffset == 491 && kTorch50TableCountOffset + 5 == kTorch50MissionPlaneOffset);
+static_assert(kTorch50RibbonCountOffset == 710 && kTorch50RibbonCountOffset + 2 <= kTorch50FeatureCount);
+static_assert(kTorch50StopPointsIndex == 471 && kTorch50OwnPiIndex == 474);
 
 struct TorchActionMask50 {
   std::uint64_t word0;
@@ -345,11 +368,19 @@ CUGO_HD inline void encode_torch_packet50(const TorchPacket50& packet,
         month_planes[plane]);
   }
 
-  encode_torch_card_plane50(features, kTorch50SelectedPiOffset,
-                            packet.selected_pi);
-  if (packet.decision_kind < kTorch50DecisionCount) {
+  // Floor cards the current floor choice may take (their choice actions are legal).
+  for (std::uint16_t card = 0; card < core::kShinMatgoCardCount; ++card) {
+    features[kTorch50ChoiceCardOffset + card] =
+        has_torch_action50(packet.legal_actions,
+                           static_cast<std::uint16_t>(kTorch50ChoiceActionBegin + card))
+            ? 1.0f : 0.0f;
+  }
+  // One-hot over the live kinds 1..5; slots 0 and 6 carry v4 scalars.
+  if (packet.decision_kind >= 1u && packet.decision_kind <= 5u) {
     features[kTorch50DecisionOffset + packet.decision_kind] = 1.0f;
   }
+  features[kTorch50OwnFirstIndex] = o.own_first != 0 ? 1.0f : 0.0f;
+  features[kTorch50OpponentHandIndex] = torch_unit50(o.opponent_hand_count, 10);
 
   float* s = features + kTorch50ScalarOffset;
   s[0] = torch_unit50(o.turn_index, 32);
@@ -370,7 +401,11 @@ CUGO_HD inline void encode_torch_packet50(const TorchPacket50& packet,
   s[15] = torch_unit50(o.opponent_ppuk_streak <= 3u ? o.opponent_ppuk_streak : 0u, 3);
   s[16] = o.own_gukjin_double_pi != 0 ? 1.0f : 0.0f;
   s[17] = o.opponent_gukjin_double_pi != 0 ? 1.0f : 0.0f;
-  s[18] = torch_unit50(packet.requested_pi, 8);
+  // Final points if the observer stopped now, log-scaled (12 bits covers 4095 points).
+  {
+    const float bits = log2f(1.0f + static_cast<float>(o.own_stop_points)) / 12.0f;
+    s[18] = bits > 1.0f ? 1.0f : bits;
+  }
   s[19] = packet.primary_action < kPolicyActionCount50
       ? static_cast<float>(packet.primary_action + 1u) /
             static_cast<float>(kPolicyActionCount50)
@@ -379,8 +414,7 @@ CUGO_HD inline void encode_torch_packet50(const TorchPacket50& packet,
       ? static_cast<float>(packet.revealed_card + 1u) /
             static_cast<float>(core::kShinMatgoCardCount)
       : 0.0f;
-  s[21] = torch_unit50(
-      static_cast<std::uint32_t>(core::card_count(packet.selected_pi)), 50);
+  s[21] = torch_unit50(o.own_pi_units, 20);
   s[22] = torch_unit50(torch_choice_action_count50(packet.legal_actions), 50);
   s[23] = torch_unit50(
       static_cast<std::uint32_t>(core::card_count(o.own_hand)), 50);
@@ -417,6 +451,14 @@ CUGO_HD inline void encode_torch_packet50(const TorchPacket50& packet,
       ? 1.0f : 0.0f;
 
   encode_torch_month_plane50(features, kTorch50NeutralPpukOffset, o.neutral_ppuk_months);
+  float* t = features + kTorch50TableCountOffset;
+  t[0] = torch_unit50(o.opponent_pi_units, 20);
+  t[1] = torch_unit50(o.own_bright_count, 5);
+  t[2] = torch_unit50(o.opponent_bright_count, 5);
+  t[3] = torch_unit50(o.own_animal_count, 10);
+  t[4] = torch_unit50(o.opponent_animal_count, 10);
+  features[kTorch50RibbonCountOffset] = torch_unit50(o.own_ribbon_count, 10);
+  features[kTorch50RibbonCountOffset + 1] = torch_unit50(o.opponent_ribbon_count, 10);
   const core::CardMask history[kTorch50HistoryPlaneCount] = {
       o.own_played, o.opponent_played, o.opponent_known_hand};
   for (std::uint16_t plane = 0; plane < kTorch50HistoryPlaneCount; ++plane) {

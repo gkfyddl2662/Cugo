@@ -55,6 +55,9 @@ struct ResolveChoiceProbe50 {
   Resolve50Status status;
   PostChanceDecision50 decision;
   CardMask legal_cards;
+  // For kResolveDrawn: the turn with the played card already resolved (and any
+  // played-card choice applied), i.e. the table the player sees while choosing.
+  TurnState50 table;
 };
 
 struct PostChanceProbe50 {
@@ -65,7 +68,7 @@ struct PostChanceProbe50 {
   std::uint8_t requested_pi;
 };
 
-static_assert(sizeof(PostChancePacket50) <= 160,
+static_assert(sizeof(PostChancePacket50) <= 192,
               "post-chance packet should stay cache friendly");
 
 CUGO_HD inline PostChancePacket50 empty_postchance_packet50() noexcept {
@@ -149,7 +152,7 @@ CUGO_HD inline ResolveChoiceProbe50 probe_resolve_choices50(
     Resolve50Choices choices) noexcept {
   if (state.phase != Turn50Phase::kResolve) {
     return ResolveChoiceProbe50{Resolve50Status::kWrongPhase,
-                                PostChanceDecision50::kNone, 0};
+                                PostChanceDecision50::kNone, 0, state};
   }
 
   const CardId played = state.pending_played;
@@ -161,11 +164,11 @@ CUGO_HD inline ResolveChoiceProbe50 probe_resolve_choices50(
 
   if (same_month && played_match_count == 1 && !last_turn) {
     return ResolveChoiceProbe50{Resolve50Status::kOk,
-                                PostChanceDecision50::kNone, 0};
+                                PostChanceDecision50::kNone, 0, state};
   }
   if (same_month && (played_match_count == 0 || played_match_count == 2)) {
     return ResolveChoiceProbe50{Resolve50Status::kOk,
-                                PostChanceDecision50::kNone, 0};
+                                PostChanceDecision50::kNone, 0, state};
   }
 
   TurnState50 next = state;
@@ -176,24 +179,28 @@ CUGO_HD inline ResolveChoiceProbe50 probe_resolve_choices50(
       next, played, choices.played_match, result);
   if (status == Resolve50Status::kChoiceRequired) {
     return ResolveChoiceProbe50{status, PostChanceDecision50::kResolvePlayed,
-                                candidates};
+                                candidates, state};
   }
   if (status != Resolve50Status::kOk) {
-    return ResolveChoiceProbe50{status, PostChanceDecision50::kNone, 0};
+    return ResolveChoiceProbe50{status, PostChanceDecision50::kNone, 0, state};
   }
 
+  // The played card now sits on the floor or in the captured pile, so it is no
+  // longer pending.
+  next.pending_played = core::kInvalidCard;
+  const TurnState50 table = next;
   candidates = floor_matches50(next, drawn);
   status = resolve_card_against_floor50(
       next, drawn, choices.drawn_match, result);
   if (status == Resolve50Status::kChoiceRequired) {
     return ResolveChoiceProbe50{status, PostChanceDecision50::kResolveDrawn,
-                                candidates};
+                                candidates, table};
   }
   if (status != Resolve50Status::kOk) {
-    return ResolveChoiceProbe50{status, PostChanceDecision50::kNone, 0};
+    return ResolveChoiceProbe50{status, PostChanceDecision50::kNone, 0, state};
   }
   return ResolveChoiceProbe50{Resolve50Status::kOk,
-                              PostChanceDecision50::kNone, 0};
+                              PostChanceDecision50::kNone, 0, state};
 }
 
 CUGO_HD inline CardMask postchance_pi_candidates50(
@@ -279,6 +286,8 @@ CUGO_HD inline PostChanceProbe50 probe_regular_postchance50(
   const ResolveChoiceProbe50 choice = probe_resolve_choices50(
       staged.special.game.turn, pending.action.resolve_choices);
   if (choice.status == Resolve50Status::kChoiceRequired) {
+    // Observe the table as it stands at this choice (see ResolveChoiceProbe50::table).
+    staged.special.game.turn = choice.table;
     return PostChanceProbe50{ActionStatus50::kOk, choice.decision,
                              choice.legal_cards, revealed, 0};
   }
@@ -363,7 +372,8 @@ CUGO_HD inline PostChanceProbe50 probe_special_postchance50(
           special.credits1 + (grenade ? 1u : 2u));
       if (!grenade) ++special.bombs1;
     }
-    base_pi_steal = 1;
+    // Same as capture_special50: no pi is stolen on the last turn.
+    base_pi_steal = is_last_turn50(turn) ? 0u : 1u;
   } else if (pending.action.kind == ActionKind50::kBombCredit) {
     if (!special_ready50(special) || credits50(special, actor) == 0) {
       return PostChanceProbe50{ActionStatus50::kNotLegal,

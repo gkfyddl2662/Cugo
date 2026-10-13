@@ -103,6 +103,20 @@ struct PolicyObservation50 {
   CardMask opponent_played;
   // Opponent cards known from a shake declaration and still in their hand.
   CardMask opponent_known_hand;
+
+  // Contract v4: facts on the table a player reads directly.
+  std::uint8_t own_first;  // the observer is the first player of this game
+  std::uint8_t opponent_hand_count;
+  std::uint8_t own_pi_units;
+  std::uint8_t opponent_pi_units;
+  std::uint8_t own_bright_count;
+  std::uint8_t opponent_bright_count;
+  std::uint8_t own_animal_count;
+  std::uint8_t opponent_animal_count;
+  std::uint8_t own_ribbon_count;
+  std::uint8_t opponent_ribbon_count;
+  // At a Go/Stop decision: the final points stopping now would settle (else 0).
+  std::uint32_t own_stop_points;
 };
 
 struct PolicyPacket50 {
@@ -331,6 +345,25 @@ CUGO_HD inline CardMask pending_public_cards50(const TurnState50& turn) noexcept
   return cards;
 }
 
+// The first player moves on even turn indices; finishing a turn flips the actor and
+// advances the index together, so their parity sum is fixed for the whole game.
+CUGO_HD inline std::uint8_t first_player50(const TurnState50& turn) noexcept {
+  return static_cast<std::uint8_t>((turn.actor ^ turn.turn_index) & 1u);
+}
+
+CUGO_HD inline std::uint32_t stop_points50(const TerminalGameState50& state) noexcept {
+  if (policy_decision_kind50(state) != PolicyDecision50::kGoStop) return 0;
+  TerminalGameState50 stopped = state;
+  if (apply_terminal_go_stop_decision50(stopped, GoStopAction50::kStop) != GoStopStatus50::kOk ||
+      !terminal50_is_finished(stopped)) {
+    return 0;
+  }
+  const Settlement50 settlement = settle_terminal50(stopped);
+  if (settlement.status != SettlementStatus50::kOk) return 0;
+  return settlement.final_points > 0xffffffffull
+      ? 0xffffffffu : static_cast<std::uint32_t>(settlement.final_points);
+}
+
 CUGO_HD inline PolicyObservation50 pack_policy_observation50(
     const TerminalGameState50& state) noexcept {
   const TurnState50& turn = state.special.game.turn;
@@ -419,7 +452,18 @@ CUGO_HD inline PolicyObservation50 pack_policy_observation50(
       turn.neutral_ppuk_months,
       own_held & ~own_hand,
       opponent_held & ~opponent_hand,
-      opponent_known_hand};
+      opponent_known_hand,
+      static_cast<std::uint8_t>(first_player50(turn) == player),
+      static_cast<std::uint8_t>(core::card_count(opponent_hand)),
+      own_score.pi_units,
+      opponent_score.pi_units,
+      own_score.bright_count,
+      opponent_score.bright_count,
+      own_score.animal_count,
+      opponent_score.animal_count,
+      own_score.ribbon_count,
+      opponent_score.ribbon_count,
+      stop_points50(state)};
 }
 
 CUGO_HD inline PolicyPacket50 make_policy_packet50(
@@ -471,7 +515,18 @@ CUGO_HD inline bool equal_policy_observation50(
          a.round_multiplier == b.round_multiplier && a.last_turn == b.last_turn &&
          a.neutral_ppuk_months == b.neutral_ppuk_months &&
          a.own_played == b.own_played && a.opponent_played == b.opponent_played &&
-         a.opponent_known_hand == b.opponent_known_hand;
+         a.opponent_known_hand == b.opponent_known_hand &&
+         a.own_first == b.own_first &&
+         a.opponent_hand_count == b.opponent_hand_count &&
+         a.own_pi_units == b.own_pi_units &&
+         a.opponent_pi_units == b.opponent_pi_units &&
+         a.own_bright_count == b.own_bright_count &&
+         a.opponent_bright_count == b.opponent_bright_count &&
+         a.own_animal_count == b.own_animal_count &&
+         a.opponent_animal_count == b.opponent_animal_count &&
+         a.own_ribbon_count == b.own_ribbon_count &&
+         a.opponent_ribbon_count == b.opponent_ribbon_count &&
+         a.own_stop_points == b.own_stop_points;
 }
 
 CUGO_HD inline bool equal_policy_packet50(const PolicyPacket50& a,

@@ -127,7 +127,8 @@ final = (base + go) × go multiplier × 2^(shakes + bombs) × meongtta × missio
   - Normal missions pay their multiplier when one player owns every mission card. The
     actor is credited first.
   - No-condition missions credit both players.
-  - Triple missions pay 2^k, where k is the number of mission cards owned.
+  - Triple missions pay 2^k, where k is the number of mission cards owned. Both
+    players start at 2^0 = 1, as the server's EKGDFAHDPJD does with no cards.
 - Chongtong (10) and three-ppuk (7) are fixed scores times the round multiplier.
 - **Nagari carry-over**: `round_multiplier` scales the whole next game, side payments
   included. Training uses 1, which leaves the optimal policy unchanged because every
@@ -165,7 +166,12 @@ A shake shows the month's cards to the opponent (`NoticeShakeToC` lists them), a
 every card played from a hand is seen by both players. The observation carries the
 cards each side has played, the opponent cards known from a shake that are still in
 their hand (removed from the unseen plane), three- and four-card shakes alike, and
-neutral ppuk stacks as their own plane.
+neutral ppuk stacks as their own plane. Contract v4 (`torch50.md`) adds what a
+player reads off the table directly: who moved first, the opponent's hand size, each
+side's pi/bright/animal/ribbon counts, the points stopping now would settle, and the
+floor cards a floor choice may take. A bonus continuation after a hand-bonus
+Chongtong does not show the four cards here; the client gives no sign that it does,
+and the cards become public only through a later four-card shake.
 
 ## Known approximations
 

@@ -296,8 +296,15 @@ CUGO_HD inline TerminalGameState50 make_terminal_game_state50(
                             0,
                             0};
   if (missions) assign_mission50(state, deal.rng_state);
+  // The server starts every player's triple multiplier at 2^0 (EKGDFAHDPJD with no
+  // cards); other mission kinds ignore an empty acquisition.
+  update_missions50(state, 0, 0);
+  update_missions50(state, 1, 0);
   // Chongtong is judged on the dealt hands and the refilled floor.
   const TurnState50& turn = state.special.game.turn;
+  // held0/held1 are every card a hand has contained, starting with the deal.
+  state.held0 = turn.hand0;
+  state.held1 = turn.hand1;
   InitialDeal50 dealt = deal;
   dealt.floor = turn.floor;
   const InitialChongtong50 initial = detect_initial_chongtong50(dealt, first_player);

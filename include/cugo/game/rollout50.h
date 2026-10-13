@@ -228,16 +228,14 @@ CUGO_HD inline ActionResult50 action_error50(Action50 action,
   return ActionResult50{status, action.kind, actor, 0, 0, 0};
 }
 
-CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
-                                              Action50 action) noexcept {
+CUGO_HD inline ActionResult50 apply_action50_body(TerminalGameState50& state,
+                                                   Action50 action) noexcept {
   const std::uint8_t actor = state.special.game.turn.actor;
   if (terminal50_is_finished(state)) {
     return action_error50(action, ActionStatus50::kGameFinished, actor);
   }
 
   TerminalGameState50 next = state;
-  // Every card leaves a hand through an action, so recording the hands here keeps
-  // held0/held1 complete; replacements drawn into a hand are recorded before use.
   next.held0 |= next.special.game.turn.hand0;
   next.held1 |= next.special.game.turn.hand1;
 
@@ -384,6 +382,20 @@ CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
   }
 
   return action_error50(action, ActionStatus50::kInvalidAction, actor);
+}
+
+// held0/held1 hold every card a hand has contained (the deal, then replacements a
+// bonus play draws). Recording the hands again after each action keeps them
+// complete before the next decision, whose post-chance probe may play the
+// replacement before any further action is committed.
+CUGO_HD inline ActionResult50 apply_action50(TerminalGameState50& state,
+                                              Action50 action) noexcept {
+  const ActionResult50 result = apply_action50_body(state, action);
+  if (result.status == ActionStatus50::kOk) {
+    state.held0 |= state.special.game.turn.hand0;
+    state.held1 |= state.special.game.turn.hand1;
+  }
+  return result;
 }
 
 CUGO_HD inline ActionStatus50 canonicalize_regular_action50(

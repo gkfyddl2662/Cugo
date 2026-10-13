@@ -16,22 +16,34 @@ This means one network head can handle ordinary play, bonus play, shake/bomb/gre
 
 ## Dense feature layout
 
-`kTorch50FeatureCount = 720` floats (contract v3, extension `cugo_torch50_ext_v4`). The first 479 are semantic, 479..490 is the neutral-ppuk month plane and 491..495 stay zero (the legacy 496-wide block). The Hangame block follows: 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). 560..709 are three public-history card planes and 710..719 are zero. Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`. New inputs are added where a zero weight leaves an old network's output unchanged; `python/migrate_ppo50.py` widens 560-feature checkpoints that way.
+`kTorch50FeatureCount = 720` floats (contract v4, extension `cugo_torch50_ext_v5`). Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`. New inputs go where a zero weight leaves an old network's output unchanged: `python/migrate_ppo50.py` widens 560-feature checkpoints, and `python/cugo_contract50.py` upgrades v3 checkpoints to v4 when they are loaded.
 
 | Range | Size | Meaning |
 | --- | ---: | --- |
 | `0..299` | 300 | six 50-card planes: own hand, floor, own captured, opponent captured, pending public, unseen |
 | `300..395` | 96 | eight 12-month planes: own/opponent shaken, ppuk, own/opponent ppuk, bonus-2/bonus-3 ppuk, pending Chongtong |
-| `396..445` | 50 | already-selected physical pi cards during a multi-card pi choice |
-| `446..452` | 7 | one-hot decision kind: none, primary, Go/Stop, Chongtong, resolve-played, resolve-drawn, pi-card |
+| `396..445` | 50 | floor cards the current floor choice may take (v3: selected pi) |
+| `446` | 1 | the observer is the first player (v3: decision kind "none") |
+| `447..451` | 5 | one-hot decision kind: primary, Go/Stop, Chongtong, resolve-played, resolve-drawn |
+| `452` | 1 | opponent hand count / 10 (v3: decision kind "pi card") |
 | `453..478` | 26 | normalized scalar state and post-chance metadata |
 | `479..490` | 12 | neutral ppuk months (initial-floor stacks without an owner) |
-| `491..495` | 5 | zero padding |
+| `491..495` | 5 | opponent pi count / 20; own and opponent bright / 5; own and opponent animal / 10 (v3: padding) |
 | `496..559` | 64 | Hangame block: mission card plane (48) and 16 scalars |
 | `560..709` | 150 | own played cards, opponent played cards, opponent cards known from a shake |
-| `710..719` | 10 | zero padding |
+| `710..711` | 2 | own and opponent ribbon / 10 (v3: padding) |
+| `712..719` | 8 | zero padding |
 
-The scalar block contains turn/stock counts, both players' Go/base-score/bomb/credit/ppuk summaries, persistent Gukjin roles, requested pi count, primary action, revealed card, selected/legal choice counts, and compact hand/floor/unseen counts.
+The scalar block contains turn/stock counts, both players' Go/base-score/bomb/credit/ppuk summaries, persistent Gukjin roles, primary action, revealed card, the legal choice count and compact hand/floor/unseen counts. Two of its slots changed in v4: `s[18]` (471) holds the final points stopping now would settle, as `log2(1 + points) / 12` (zero outside Go/Stop), and `s[21]` (474) the observer's pi count / 20.
+
+### Contract v4
+
+v3 left 54 columns permanently zero: Hangame steals pi automatically, so the pi-choice plane, its counters and the "pi card" decision kind never fired, and the "none" kind never marks a live decision. v4 puts facts a player reads off the table there (table above) and fixes two observations:
+
+- `own_played` is complete at a floor choice on the opening play and after playing a bonus replacement (the engine now records the dealt hands and each replacement in `held0/held1` as they arrive).
+- At a floor choice for the drawn card, the observation shows the table after the played card was resolved (its captures, the player's earlier floor choice and the updated base score) instead of the state before the turn.
+
+The width and every other column are unchanged. A v3 network never received a non-zero value in the reused columns, so its input weights there were never trained; `cugo_contract50.upgrade_payload` zeroes them, which leaves the network's outputs exactly as they were on v3 inputs. Checkpoints written from v4 on carry `config.feature_contract = 4`.
 
 ## Environment state
 
