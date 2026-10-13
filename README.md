@@ -34,7 +34,7 @@ The repository contains a deterministic CPU reference path and CUDA differential
 - one-thread-per-game CUDA throughput baselines
 - CUDA Graph as the current repeated-phase scheduling baseline
 
-The 50-card path keeps all physical cards in the same 64-bit mask. `kFullDeckMask` remains the legacy 48-standard-card mask for regression tests; exact Shin Matgo work uses `kShinMatgoDeckMask`.
+The 50-card path keeps all physical cards in the same 64-bit mask: `kStandardDeckMask` covers the 48 month cards and `kShinMatgoDeckMask` adds the two bonus cards.
 
 ### Bonus-aware turn integration
 

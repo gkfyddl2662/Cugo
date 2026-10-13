@@ -51,7 +51,7 @@ Special physical IDs are:
 
 IDs `50..63` remain available for future nonstandard physical/synthetic cards if needed.
 
-`kStandardDeckMask` covers IDs `0..47`. `kShinMatgoDeckMask` covers IDs `0..49`. The legacy name `kFullDeckMask` intentionally remains an alias of the 48-card standard mask so old deterministic tests do not silently change meaning.
+`kStandardDeckMask` covers IDs `0..47`. `kShinMatgoDeckMask` covers IDs `0..49`.
 
 ## Pinned base scoring
 

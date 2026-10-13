@@ -24,7 +24,7 @@ __global__ void evaluate_scores(ScoreSample* samples,
   }
 
   cugo::core::SplitMix64 rng{seed + static_cast<std::uint64_t>(i)};
-  const std::uint64_t cards = rng.next_u64() & cugo::core::kFullDeckMask;
+  const std::uint64_t cards = rng.next_u64() & cugo::core::kStandardDeckMask;
   const cugo::game::ScoreOptions options{(i & 1) != 0};
   samples[i] = ScoreSample{cards, cugo::game::score_captured(cards, options)};
 }
@@ -95,7 +95,7 @@ int main() {
 
   for (int i = 0; i < kSamples; ++i) {
     cugo::core::SplitMix64 rng{kSeed + static_cast<std::uint64_t>(i)};
-    const std::uint64_t cards = rng.next_u64() & cugo::core::kFullDeckMask;
+    const std::uint64_t cards = rng.next_u64() & cugo::core::kStandardDeckMask;
     const cugo::game::ScoreOptions options{(i & 1) != 0};
     const auto cpu = cugo::game::score_captured(cards, options);
 

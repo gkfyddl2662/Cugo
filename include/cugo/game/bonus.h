@@ -3,7 +3,7 @@
 #include <cstdint>
 
 #include "cugo/core/card.h"
-#include "cugo/game/state.h"
+#include "cugo/game/deal.h"
 
 #if defined(__CUDACC__)
 #define CUGO_HOST_DEVICE __host__ __device__

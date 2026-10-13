@@ -16,7 +16,7 @@ This means one network head can handle ordinary play, bonus play, shake/bomb/gre
 
 ## Dense feature layout
 
-`kTorch50FeatureCount = 560` floats. The first 479 are semantic and 479..495 are zero padding (the legacy 496-wide block). Hangame features are appended so old networks can be widened with zero weights (`python/migrate_ppo50.py`): 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`.
+`kTorch50FeatureCount = 560` floats. The first 479 are semantic and 479..495 are zero padding (the legacy 496-wide block). Hangame features are appended so old networks could be widened with zero weights (done once by `migrate_ppo50.py`, removed after the migration): 496..543 is the mission card plane, and 544..559 are 16 scalars (mission type one-hot, multipliers, Gukjin prompt and lock flags, last-turn flag, side payment, round multiplier, ppuk-chain flags). Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`.
 
 | Range | Size | Meaning |
 | --- | ---: | --- |

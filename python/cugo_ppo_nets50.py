@@ -6,6 +6,13 @@ from torch import nn
 FEATURES = 560  # 496 legacy + Hangame mission plane (48) and scalars (16)
 ACTIONS = 179  # 177 legacy + Gukjin pi/animal
 ORACLE_FEATURES = 50  # opponent hidden hand plane, critic only
+SIGNED_GOLDEN = -7046029254386353131
+SEED_BASE = 0x243F6A8885A308D3
+
+
+def make_seeds(batch: int, offset: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    index = torch.arange(batch, dtype=torch.int64, device=device)
+    return index.mul(SIGNED_GOLDEN).add(SEED_BASE + offset), index.bitwise_and(1)
 
 
 def _norm(kind: str, hidden: int) -> nn.Module:

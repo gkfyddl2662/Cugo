@@ -19,7 +19,7 @@ void test_primary_card_classes() {
   assert(card_count(kRibbonMask) == 10);
   assert(card_count(kPlainPiMask) == 22);
   assert(card_count(kFixedDoublePiMask) == 2);
-  assert(kPrimaryClassMask == kFullDeckMask);
+  assert(kPrimaryClassMask == kStandardDeckMask);
 
   for (std::uint8_t month = 0; month < kMonthCount; ++month) {
     const CardMask primary = month_mask(month) & kPrimaryClassMask;
@@ -103,8 +103,8 @@ void test_gukjin_dual_use() {
   assert(converted.pi_units == 2);
   assert(pi_card_mask(gukjin, as_pi) == gukjin);
 
-  const auto full_default = score_captured(kFullDeckMask);
-  const auto full_converted = score_captured(kFullDeckMask, as_pi);
+  const auto full_default = score_captured(kStandardDeckMask);
+  const auto full_converted = score_captured(kStandardDeckMask, as_pi);
   assert(full_default.pi_units == 26);
   assert(full_default.total_points == 57);
   assert(full_converted.pi_units == 28);
@@ -117,7 +117,7 @@ void test_random_score_invariants() {
 
   SplitMix64 rng{0x73636f72655f3031ULL};
   for (int i = 0; i < 4096; ++i) {
-    const CardMask cards = rng.next_u64() & kFullDeckMask;
+    const CardMask cards = rng.next_u64() & kStandardDeckMask;
     const ScoreOptions options{(i & 1) != 0};
     const auto score = score_captured(cards, options);
     assert(score.bright_count <= 5);

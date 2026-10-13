@@ -265,7 +265,7 @@ Write-Step "Correctness tests"
 Invoke-Checked $ctest @("--test-dir", $BuildDir, "--output-on-failure")
 
 Write-Step "Direct test output"
-$coreTest = Join-Path $BuildDir "cugo_core_test.exe"
+$coreTest = Join-Path $BuildDir "cugo_turn50_test.exe"
 $cudaTest = Join-Path $BuildDir "cugo_cuda_core_test.exe"
 
 if (-not (Test-Path $coreTest)) {

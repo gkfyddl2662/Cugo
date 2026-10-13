@@ -24,7 +24,7 @@ __global__ void evaluate_samples(Sample* samples, int n, std::uint64_t seed) {
 
   using namespace cugo::core;
   SplitMix64 rng{seed + static_cast<std::uint64_t>(i)};
-  const std::uint64_t bits = rng.next_u64() & kFullDeckMask;
+  const std::uint64_t bits = rng.next_u64() & kStandardDeckMask;
   samples[i] = Sample{bits, rng.next_u64(), first_card(bits), card_count(bits)};
 }
 
@@ -65,7 +65,7 @@ int main() {
 
   for (int i = 0; i < kSamples; ++i) {
     SplitMix64 rng{kSeed + static_cast<std::uint64_t>(i)};
-    const std::uint64_t bits = rng.next_u64() & kFullDeckMask;
+    const std::uint64_t bits = rng.next_u64() & kStandardDeckMask;
     const Sample cpu{bits, rng.next_u64(), first_card(bits), card_count(bits)};
     const Sample& actual = gpu[i];
     if (actual.mask != cpu.mask || actual.rng != cpu.rng || actual.first != cpu.first ||

@@ -6,35 +6,8 @@ import time
 import torch
 from torch import nn
 
+from cugo_ppo_nets50 import PpoActor, make_seeds
 from cugo_torch50_ext import load_extension
-
-
-SIGNED_GOLDEN = -7046029254386353131
-SEED_BASE = 0x243F6A8885A308D3
-
-
-class PolicyValueNet(nn.Module):
-    def __init__(self, features: int, actions: int, hidden: int) -> None:
-        super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(features, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-        )
-        self.policy = nn.Linear(hidden, actions)
-        self.value = nn.Linear(hidden, 1)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.trunk(x)
-        return self.policy(h), self.value(h).squeeze(-1)
-
-
-def make_seeds(batch: int, offset: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    index = torch.arange(batch, dtype=torch.int64, device=device)
-    seeds = index.mul(SIGNED_GOLDEN).add(SEED_BASE + offset)
-    first = index.bitwise_and(1)
-    return seeds, first
 
 
 def run_games(ext, model: nn.Module, batch: int, seed_offset: int, max_steps: int) -> dict[str, float]:
@@ -58,7 +31,7 @@ def run_games(ext, model: nn.Module, batch: int, seed_offset: int, max_steps: in
             raise RuntimeError("an active environment has no legal actions")
 
         x = features.to(dtype=torch.float16)
-        logits, _value = model(x)
+        logits = model(x)
         masked_logits = logits.masked_fill(~legal, torch.finfo(logits.dtype).min)
         actions = masked_logits.argmax(dim=1).to(dtype=torch.int64)
 
@@ -112,7 +85,7 @@ def main() -> None:
 
     torch.manual_seed(12345)
     torch.cuda.manual_seed_all(12345)
-    model = PolicyValueNet(int(ext.FEATURE_COUNT), int(ext.ACTION_COUNT), args.hidden)
+    model = PpoActor(args.hidden, blocks=1, norm="none")
     model = model.cuda().half().eval()
     params = sum(p.numel() for p in model.parameters())
     print(f"network hidden={args.hidden} params={params} dtype=fp16")

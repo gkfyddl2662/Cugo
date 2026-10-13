@@ -6,21 +6,15 @@ For every seed, the evaluator creates two copies of the same initial game. Polic
 
 Games that are already terminal before the first policy decision (for example an initial Chongtong resolution) are excluded from W/L and confidence statistics. Their two seat-swapped outcomes are policy-independent and would cancel in paired score, while the current Torch environment observation API does not expose their terminal reward directly.
 
-Supported checkpoints:
-
-- legacy `train50.py`: `--*-policy legacy` or `auto`
-- NFSP BR network: `--*-policy br`
-- NFSP historical average network: `--*-policy average` or `auto`
+Supported checkpoints are PPO checkpoints from `train_ppo50.py`. `--*-policy ppo` (or `auto`) uses the actor EMA when the checkpoint has one; `ppo_raw` uses the trained actor.
 
 Example:
 
 ```powershell
 .\.venv-torch\Scripts\python.exe python\eval50.py `
-  --a-checkpoint build\checkpoints\nfsp16\iter_000010.pt `
-  --a-policy average `
-  --b-checkpoint build\checkpoints\nfsp64\iter_000010.pt `
-  --b-policy average `
+  --a-checkpoint build\checkpoints\ppo_h\iter_001500.pt `
+  --b-checkpoint build\checkpoints\ppo_h\iter_001000.pt `
   --pairs 131072
 ```
 
-`python/eval50_smoke.py` checks two invariants: a policy against itself must cancel exactly under seat swap, and an NFSP average policy initialized from the BR policy must also cancel exactly before training.
+For more than two checkpoints, `python/league50.py` plays every pair the same way.

@@ -9,9 +9,7 @@ import time
 import torch
 from torch import nn
 
-from cugo_nfsp50 import AveragePolicyNet
-from cugo_ppo_nets50 import PpoActor
-from cugo_train50 import PolicyValueNet, make_seeds
+from cugo_ppo_nets50 import PpoActor, make_seeds
 
 
 @dataclass
@@ -83,39 +81,18 @@ def load_policy_checkpoint(
     if policy == "auto":
         if "actor" in payload:
             policy = "ppo"
-        elif "average_model" in payload:
-            policy = "average"
-        elif "model" in payload:
-            policy = "legacy"
-        elif "br_model" in payload:
-            policy = "br"
         else:
             raise ValueError(f"cannot infer policy kind from checkpoint {path}")
 
-    if policy == "average":
-        state = payload.get("average_model")
-        if state is None:
-            raise ValueError(f"checkpoint {path} has no average_model")
-        model: nn.Module = AveragePolicyNet(496, 177, hidden)
-    elif policy == "br":
-        state = payload.get("br_model")
-        if state is None:
-            raise ValueError(f"checkpoint {path} has no br_model")
-        model = PolicyValueNet(496, 177, hidden)
-    elif policy in ("ppo", "ppo_raw"):
+    if policy in ("ppo", "ppo_raw"):
         # "ppo" is the release policy: the weight EMA when the checkpoint has one.
         state = payload.get("actor_ema") if policy == "ppo" and "actor_ema" in payload else payload.get("actor")
         if state is None:
             raise ValueError(f"checkpoint {path} has no actor")
         config = payload.get("config", {})
-        model = PpoActor(hidden, int(config.get("blocks", 3)), config.get("norm", "layer"))
-    elif policy == "legacy":
-        state = payload.get("model")
-        if state is None:
-            raise ValueError(f"checkpoint {path} has no legacy model")
-        model = PolicyValueNet(496, 177, hidden)
+        model: nn.Module = PpoActor(hidden, int(config.get("blocks", 3)), config.get("norm", "layer"))
     else:
-        raise ValueError("policy must be one of auto, average, br, legacy, ppo, ppo_raw")
+        raise ValueError("policy must be one of auto, ppo, ppo_raw")
 
     model.load_state_dict(state, strict=True)
     model.to(device)

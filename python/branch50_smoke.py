@@ -7,16 +7,8 @@ from typing import Any
 
 import torch
 
+from cugo_ppo_nets50 import make_seeds
 from cugo_torch50_ext import load_extension
-
-
-SIGNED_GOLDEN = -7046029254386353131
-SEED_BASE = 0x243F6A8885A308D3
-
-
-def make_seeds(count: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    index = torch.arange(count, dtype=torch.int64, device=device)
-    return index.mul(SIGNED_GOLDEN).add(SEED_BASE), index.bitwise_and(1)
 
 
 def require_equal(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -89,7 +81,7 @@ def main() -> None:
 
     device = torch.device("cuda")
     ext = load_extension(verbose=args.verbose_build)
-    seeds, first = make_seeds(args.parents, device)
+    seeds, first = make_seeds(args.parents, 0, device)
     parents = ext.create(seeds, first)
 
     # Move away from identical fresh-deal structure before equivalence checks.

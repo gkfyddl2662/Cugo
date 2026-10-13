@@ -15,8 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cugo_ppo_nets50 import ACTIONS, FEATURES, card_plane
-from cugo_train50 import make_seeds
+from cugo_ppo_nets50 import ACTIONS, FEATURES, card_plane, make_seeds
 
 GOSTOP_KIND = 2  # decision-kind one-hot index for Go/Stop
 DECISION_OFFSET = 446

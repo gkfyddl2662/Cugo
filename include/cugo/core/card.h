@@ -19,7 +19,6 @@ inline constexpr int kCardsPerMonth = 4;
 inline constexpr int kStandardCardCount = kMonthCount * kCardsPerMonth;
 inline constexpr int kBonusCardCount = 2;
 inline constexpr int kShinMatgoCardCount = kStandardCardCount + kBonusCardCount;
-inline constexpr int kCardCount = kStandardCardCount;
 inline constexpr CardId kBonusTwoPi = static_cast<CardId>(kStandardCardCount);
 inline constexpr CardId kBonusThreePi = static_cast<CardId>(kStandardCardCount + 1);
 inline constexpr CardId kInvalidCard = 0xff;
@@ -29,11 +28,6 @@ inline constexpr CardMask kBonusCardMask =
     (CardMask{1} << kBonusTwoPi) | (CardMask{1} << kBonusThreePi);
 inline constexpr CardMask kShinMatgoDeckMask =
     (CardMask{1} << kShinMatgoCardCount) - 1;
-inline constexpr CardMask kFullDeckMask = kStandardDeckMask;
-
-CUGO_HOST_DEVICE constexpr bool is_valid_card(CardId card) noexcept {
-  return card < kStandardCardCount;
-}
 
 CUGO_HOST_DEVICE constexpr bool is_standard_card(CardId card) noexcept {
   return card < kStandardCardCount;

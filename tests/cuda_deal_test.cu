@@ -13,7 +13,7 @@
 
 namespace {
 
-using cugo::game::InitialDeal48;
+using cugo::game::InitialDeal50;
 
 constexpr int kFieldCount = 5;
 constexpr int kHand0Field = 0;
@@ -30,7 +30,7 @@ __global__ void deal_kernel(std::uint64_t* fields, int games, std::uint64_t mast
 
   const std::uint64_t seed =
       cugo::core::derive_seed(master_seed, static_cast<std::uint64_t>(game));
-  const InitialDeal48 deal = cugo::game::deal_base_48(seed);
+  const InitialDeal50 deal = cugo::game::deal_shin_matgo_50(seed);
   const std::size_t stride = static_cast<std::size_t>(games);
   const std::size_t index = static_cast<std::size_t>(game);
 
@@ -96,7 +96,7 @@ int run_differential() {
   for (int game = 0; game < kGames; ++game) {
     const std::uint64_t seed =
         cugo::core::derive_seed(kMasterSeed, static_cast<std::uint64_t>(game));
-    const InitialDeal48 cpu = cugo::game::deal_base_48(seed);
+    const InitialDeal50 cpu = cugo::game::deal_shin_matgo_50(seed);
     if (!cugo::game::is_valid_initial_deal(cpu)) {
       std::cerr << "CPU invariant failure at game " << game << '\n';
       return 2;
