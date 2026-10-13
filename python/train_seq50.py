@@ -22,7 +22,7 @@ from torch import nn
 from cugo_eval50 import evaluate_paired, load_policy_checkpoint
 from cugo_ppo50 import DECISION_OFFSET, GOSTOP_KIND, TrainStats, gae_advantages
 from cugo_ppo_nets50 import ACTIONS, FEATURES, make_seeds
-from cugo_seq50 import History, HistBatch, policy_logits, seq_actor, seq_critic
+from cugo_seq50 import History, HistBatch, policy_logits, seq_actor, seq_critic, stored_columns
 from cugo_torch50_ext import load_extension
 
 EVAL_SEED_OFFSET = 900000000
@@ -33,13 +33,19 @@ class SeqStorage:
 
     NAMES = ("features", "legal", "actions", "logp", "opp_hand", "env_ids", "seat", "count")
 
-    def __init__(self, capacity: int, device: torch.device) -> None:
+    def __init__(self, capacity: int, device: torch.device, columns: list[int] | None = None) -> None:
+        # Events-mode policies read only a few feature columns; storing just those
+        # saves ~1.7 GB at 65,536 games per iteration.
         self.device, self.capacity, self.size = device, 0, 0
+        self.columns = None if columns is None else torch.tensor(columns, device=device)
+        self.width = FEATURES if columns is None else len(columns)
+        gostop = DECISION_OFFSET + GOSTOP_KIND
+        self.gostop_column = gostop if columns is None else columns.index(gostop)
         self._allocate(capacity)
 
     def _allocate(self, capacity: int) -> None:
         d = self.device
-        shapes = {"features": ((capacity, FEATURES), torch.bfloat16), "legal": ((capacity, ACTIONS), torch.bool),
+        shapes = {"features": ((capacity, self.width), torch.bfloat16), "legal": ((capacity, ACTIONS), torch.bool),
                   "logp": ((capacity,), torch.float32)}
         for name in self.NAMES:
             shape, dtype = shapes.get(name, ((capacity,), torch.int64))
@@ -124,7 +130,8 @@ def collect(ext: Any, actor: nn.Module, pool: list[nn.Module], games: int, seed_
             a, logp = _act(actor, f, l, hb, False)
             actions.index_copy_(0, rows, a)
             hands = ext.hands_indexed(states, env_rows)
-            storage.append(features=f, legal=l, actions=a, logp=logp,
+            kept = f if storage.columns is None else f.index_select(1, storage.columns)
+            storage.append(features=kept, legal=l, actions=a, logp=logp,
                            opp_hand=hands.gather(1, (1 - seat).unsqueeze(1)).squeeze(1),
                            env_ids=env_rows, seat=seat, count=hb.count)
 
@@ -247,7 +254,7 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
             updates += 1
             with torch.no_grad():
                 kl = ((ratio - 1) - log_ratio).mean()
-                gs = (s.features[idx, DECISION_OFFSET + GOSTOP_KIND] > 0.5).float()
+                gs = (s.features[idx, s.gostop_column] > 0.5).float()
                 sums += torch.stack((policy_loss.detach(), value_loss.detach(), entropy_rows.mean().detach(), kl,
                                      ((ratio - 1).abs() > args.clip).float().mean(), torch.ones_like(kl),
                                      (entropy_rows.detach() * gs).sum(), gs.sum()))
@@ -316,7 +323,7 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     ext = load_extension()
-    storage = SeqStorage(args.games * args.storage_per_game, device)
+    storage = SeqStorage(args.games * args.storage_per_game, device, stored_columns(args.mode))
 
     actor = seq_actor(args.mode, args.d_model, args.layers, args.heads).to(device)
     critic = seq_critic(args.mode, args.d_model, args.layers, args.heads).to(device)

@@ -157,7 +157,10 @@ class SeqNet(nn.Module):
 
     def _query(self, features: torch.Tensor, legal: torch.Tensor, opp_hand: torch.Tensor | None,
                dtype: torch.dtype) -> torch.Tensor:
-        query = features if self.mode == "hybrid" else features.index_select(-1, self.context_index)
+        # Events-mode callers may pass the 720 features or only the stored CONTEXT_INDEX columns.
+        if self.mode == "events" and features.shape[-1] == FEATURES:
+            features = features.index_select(-1, self.context_index)
+        query = features
         parts = [query.to(dtype), legal.to(dtype)]
         if self.oracle:
             parts.append(card_plane(opp_hand.reshape(-1), dtype).view(*opp_hand.shape, -1))
@@ -216,6 +219,11 @@ class SeqNet(nn.Module):
         heads = self.encoder.layers[0].self_attn.num_heads
         h = self.encoder(x, mask=(~allowed).repeat_interleave(heads, 0))
         return self._out(h[:, length + 1:])
+
+
+def stored_columns(mode: str) -> list[int] | None:
+    """Feature columns a rollout must keep for this mode (None = all 720)."""
+    return None if mode == "hybrid" else CONTEXT_INDEX
 
 
 def seq_actor(mode: str, d_model: int, layers: int, heads: int) -> SeqNet:
