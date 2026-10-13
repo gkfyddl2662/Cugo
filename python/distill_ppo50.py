@@ -46,11 +46,13 @@ def main() -> None:
     parser.add_argument("--eval-pairs", type=int, default=131072)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=11)
+    parser.add_argument("--memory-fraction", type=float, default=0.85,
+                        help="cap on PyTorch's share of dedicated VRAM")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
-    torch.cuda.set_per_process_memory_fraction(0.85)
+    torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     ext = load_extension()
     teacher_actor, teacher_critic, teacher_config = load_pair(args.teacher, device)
     reward_scale = float(teacher_config.get("reward_scale", 32.0))
