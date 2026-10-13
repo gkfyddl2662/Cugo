@@ -9,6 +9,7 @@ import time
 import torch
 from torch import nn
 
+from cugo_contract50 import load_checkpoint
 from cugo_ppo_nets50 import PpoActor, make_seeds
 from cugo_seq50 import History, policy_logits, seq_actor
 
@@ -71,9 +72,7 @@ def load_policy_checkpoint(
     policy: str,
     device: torch.device,
 ) -> LoadedPolicy:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError(f"checkpoint {path} did not contain a dictionary")
+    payload = load_checkpoint(path, "cpu")  # older feature contracts are upgraded on load
 
     hidden = _checkpoint_hidden(payload)
     iteration_value = payload.get("iteration")

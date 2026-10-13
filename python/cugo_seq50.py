@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from cugo_contract50 import CONTEXT_INDEX
 from cugo_ppo_nets50 import ACTIONS, FEATURES, ORACLE_FEATURES, card_plane
 from cugo_seq_attention50 import decode_attention
 
@@ -34,10 +35,10 @@ KINDS = 12  # ActionKind50
 EVENT_SLOTS = 8  # played, own drawn, flipped, my gain, opp gain, my loss, opp loss, shown
 EVENT_IN = EVENT_SLOTS * 50 + KINDS + 2
 START_IN = 5 * 50 + 12 + 8 + 4
-# Decision context inside the 720 features: pending public cards, selected pi,
-# decision one-hot, post-chance scalars (requested pi .. legal choice count) and
-# the Gukjin prompt flag.
-CONTEXT_INDEX = [*range(200, 250), *range(396, 453), *range(471, 476), 552]
+# Events-mode query columns (contract v4, see cugo_contract50): the decision
+# context (pending public cards, floor-choice cards, decision kind, first-player
+# bit, opponent hand count, post-chance scalars, Gukjin prompt flag), own hand,
+# capture counts and the round multiplier.
 
 _BITS: dict[torch.device, torch.Tensor] = {}
 
@@ -263,8 +264,11 @@ class SeqNet(nn.Module):
     def readout(self, h: torch.Tensor) -> torch.Tensor:
         return self._out(h)
 
-    def cached_step(self, cache: "KVCache", x: torch.Tensor, slots: int | None = None) -> torch.Tensor:
-        """Run one token per cache row (x [rows, d]); its key/value go to slot cache.length[row].
+    def cached_step(self, cache: "KVCache", x: torch.Tensor, slots: int | None = None,
+                    rows: torch.Tensor | None = None) -> torch.Tensor:
+        """Run one token per cache row (x [n, d]); its key/value go to slot cache.length[row].
+
+        `rows` [n] names each token's cache row (default: every row, in order).
 
         Each token attends slots <= its own: everything cached plus itself. The caller
         advances cache.length for tokens that stay (events); a query does not, so the
@@ -278,8 +282,9 @@ class SeqNet(nn.Module):
         heads = cache.heads
         dh = d // heads
         t = cache.slots if slots is None else min(slots, cache.slots)
-        pos = cache.length.clamp_max(t - 1)
-        flat_rows = (cache.row_ids.view(n, 1) * heads + cache.head_ids.view(1, heads)).flatten()
+        row_ids = cache.row_ids if rows is None else rows
+        pos = cache.length.index_select(0, row_ids).clamp_max(t - 1) if rows is not None             else cache.length.clamp_max(t - 1)
+        flat_rows = (row_ids.view(n, 1) * heads + cache.head_ids.view(1, heads)).flatten()
         flat_pos = pos.repeat_interleave(heads)
         for i, layer in enumerate(self.encoder.layers):
             attn = layer.self_attn
@@ -287,7 +292,7 @@ class SeqNet(nn.Module):
             kc, vc = cache.k[i], cache.v[i]  # [rows, heads, slots, dh]
             kc.view(-1, cache.slots, dh).index_put_((flat_rows, flat_pos), k.reshape(n * heads, dh).to(kc.dtype))
             vc.view(-1, cache.slots, dh).index_put_((flat_rows, flat_pos), v.reshape(n * heads, dh).to(vc.dtype))
-            a = decode_attention(q.reshape(n, heads, dh), kc, vc, pos, cache.use_triton)
+            a = decode_attention(q.reshape(n, heads, dh), kc, vc, pos, cache.use_triton, row_ids)
             x = x + attn.out_proj(a.reshape(n, d))
             x = x + layer.linear2(layer.activation(layer.linear1(layer.norm2(x))))
         return x

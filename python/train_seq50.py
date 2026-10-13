@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from cugo_contract50 import CONTRACT, load_checkpoint
 from cugo_eval50 import load_policy_checkpoint
 from cugo_ppo50 import DECISION_OFFSET, GOSTOP_KIND, TrainStats
 from cugo_ppo_nets50 import ACTIONS, FEATURES, make_seeds
@@ -418,7 +419,7 @@ def main() -> None:
     optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5, fused=True)
     start_iteration = 0
     if args.init is not None:
-        payload = torch.load(args.init, map_location=device, weights_only=False)
+        payload = load_checkpoint(args.init, device)
         actor.load_state_dict(payload["actor"])
         critic.load_state_dict(payload["critic"])
         ema_actor.load_state_dict(payload["actor_ema"])
@@ -427,17 +428,17 @@ def main() -> None:
     ema_params, actor_params = list(ema_actor.parameters()), list(actor.parameters())
     snapshots: list[nn.Module] = []
     if args.init is not None and args.pool_every > 0:
-        # A snapshot taken at iteration k is the actor saved in that iteration's checkpoint.
+        # A snapshot taken at iteration k is the EMA actor saved in that iteration's checkpoint.
         for k in range(args.pool_every, start_iteration + 1, args.pool_every):
             path = args.init.parent / f"iter_{k:06d}.pt"
             if path.exists():
-                snapshots.append(frozen(actor, args, torch.load(path, map_location=device,
-                                                                 weights_only=False)["actor"]))
+                snapshots.append(frozen(actor, args, load_checkpoint(path, device)["actor_ema"]))
         del snapshots[:-args.pool_size]
     if args.compile:
-        # Only the encoders: event/query counts vary per batch and are read on the host.
+        # Only the encoder stack (every training forward goes through _encode); event and
+        # query counts vary per batch. The self-play graph uses cached_step and stays eager.
         for model in (actor, critic):
-            model.encoder.compile(dynamic=True)
+            model._encode = torch.compile(model._encode, dynamic=True)
     reference = load_policy_checkpoint(args.reference, "auto", device).model if args.reference else None
     collector = None
     log = None
@@ -457,7 +458,7 @@ def main() -> None:
           f"reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g} pool_fraction={args.pool_fraction:g} "
           f"compile={int(args.compile)} start_iteration={start_iteration} pool={len(snapshots)} "
           f"collector={args.collector} wave={args.wave} length_bucket={args.length_bucket}")
-    config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()} | {"algorithm": algorithm}
+    config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()} | {"algorithm": algorithm, "feature_contract": CONTRACT}
 
     total_games = 0
     for iteration in range(start_iteration + 1, args.iterations + 1):
@@ -499,7 +500,8 @@ def main() -> None:
               flush=True)
 
         if args.pool_every > 0 and iteration % args.pool_every == 0:
-            snapshots.append(frozen(actor, args))
+            # The EMA is the release policy; the raw actor can swing between updates.
+            snapshots.append(frozen(ema_actor, args))
             del snapshots[:-args.pool_size]
 
         if args.checkpoint_every > 0 and (iteration % args.checkpoint_every == 0 or iteration == args.iterations):

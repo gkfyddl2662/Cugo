@@ -8,12 +8,15 @@ from pathlib import Path
 
 import torch
 
-from cugo_eval50 import evaluate_paired, load_policy_checkpoint
+from cugo_contract50 import CONTRACT, load_checkpoint
+from cugo_eval50 import load_policy_checkpoint
 from cugo_ppo50 import PpoUpdater, RolloutStorage, collect
 from cugo_ppo_nets50 import OracleCritic, PpoActor
 from cugo_torch50_ext import load_extension
+from league50 import match
 
 EVAL_SEED_OFFSET = 900000000
+EVAL_CHUNK = 8192
 
 
 def frozen(model: torch.nn.Module) -> torch.nn.Module:
@@ -24,7 +27,7 @@ def frozen(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def load_ppo(path: Path, device: torch.device) -> dict:
-    return torch.load(path, map_location=device, weights_only=False)
+    return load_checkpoint(path, device)
 
 
 def main() -> None:
@@ -56,7 +59,11 @@ def main() -> None:
     parser.add_argument("--opponent-policy", default="auto")
     parser.add_argument("--exploiter", action="store_true",
                         help="train only against --opponent: every game, no self snapshots")
-    parser.add_argument("--init", type=Path, default=None, help="initialize actor/critic from a PPO checkpoint")
+    parser.add_argument("--init", type=Path, default=None,
+                        help="initialize actor/critic weights from a PPO checkpoint (a fresh run)")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="continue a run from its checkpoint: weights, EMA, optimizer, iteration, "
+                             "and the snapshot pool from the checkpoints beside it")
     parser.add_argument("--reference", type=Path, default=None, help="checkpoint for periodic paired eval")
     parser.add_argument("--reference-policy", default="auto")
     parser.add_argument("--eval-every", type=int, default=50)
@@ -80,16 +87,19 @@ def main() -> None:
 
     actor = PpoActor(args.hidden, args.blocks, args.norm).to(device)
     critic = OracleCritic(args.hidden, args.blocks, args.norm).to(device)
+    if args.init is not None and args.resume is not None:
+        raise SystemExit("--init starts a fresh run from weights; --resume continues one. Pick one.")
     start_iteration = 0
-    if args.init is not None:
-        payload = load_ppo(args.init, device)
+    source = args.resume or args.init
+    payload = load_ppo(source, device) if source is not None else None
+    if payload is not None:
         actor.load_state_dict(payload["actor"])
         critic.load_state_dict(payload["critic"])
     # Exponential moving average of actor weights: the release/eval policy. Greedy play
     # flips on near-tied actions, so single updates occasionally crashed raw checkpoints
     # (e.g. -12.5 pts at one eval); averaging ~1/(1-decay) iterations smooths that out.
     ema_actor = frozen(actor)
-    if args.init is not None and "actor_ema" in payload:
+    if payload is not None and "actor_ema" in payload:
         ema_actor.load_state_dict(payload["actor_ema"])
     ema_params, actor_params = list(ema_actor.parameters()), list(actor.parameters())
     optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5,
@@ -97,6 +107,18 @@ def main() -> None:
 
     fixed_pool = [load_policy_checkpoint(p, args.opponent_policy, device).model for p in args.opponent]
     snapshots: list[torch.nn.Module] = []
+    if args.resume is not None:
+        optimizer.load_state_dict(payload["optimizer"])
+        start_iteration = int(payload["iteration"])
+        if not args.exploiter and args.pool_every > 0:
+            # A snapshot taken at iteration k is the EMA actor saved in that iteration's checkpoint.
+            for k in range(args.pool_every, start_iteration + 1, args.pool_every):
+                path = args.resume.parent / f"iter_{k:06d}.pt"
+                if path.exists():
+                    snapshot = PpoActor(args.hidden, args.blocks, args.norm).to(device)
+                    snapshot.load_state_dict(load_ppo(path, device)["actor_ema"])
+                    snapshots.append(frozen(snapshot))
+            del snapshots[:-args.pool_size]
     if args.exploiter and not fixed_pool:
         raise SystemExit("--exploiter needs at least one --opponent")
     pool_fraction = 1.0 if args.exploiter else args.pool_fraction
@@ -113,7 +135,7 @@ def main() -> None:
     print(f"lr={args.lr:g} epochs={args.epochs} minibatch={args.minibatch} clip={args.clip:g} "
           f"entropy={args.entropy:g} entropy_final={args.entropy_final if args.entropy_final is not None else args.entropy:g} "
           f"target_kl={args.target_kl:g} reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g}")
-    config = vars(args) | {"algorithm": "ppo-oracle-critic-v1"}
+    config = vars(args) | {"algorithm": "ppo-oracle-critic-v1", "feature_contract": CONTRACT}
     config = {k: (str(v) if isinstance(v, Path) or (isinstance(v, list) and v and isinstance(v[0], Path)) else v)
               for k, v in config.items()}
 
@@ -157,18 +179,11 @@ def main() -> None:
               f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}")
 
         if not args.exploiter and args.pool_every > 0 and iteration % args.pool_every == 0:
-            snapshots.append(frozen(actor))
+            # The EMA is the release policy; the raw actor can swing between updates.
+            snapshots.append(frozen(ema_actor))
             del snapshots[:-args.pool_size]
 
-        if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):
-            for tag, model in (("ref", ema_actor), ("raw", actor.eval())):
-                s = evaluate_paired(ext=ext, model_a=model, model_b=reference, pairs=args.eval_pairs,
-                                    seed_offset=EVAL_SEED_OFFSET, max_steps=128, use_amp=True)
-                print(f"iter={iteration} eval_{tag}_score={s.mean_pair_score_a:.4f} "
-                      f"eval_{tag}_ci_low={s.pair_score_ci95_low:.4f} "
-                      f"eval_{tag}_ci_high={s.pair_score_ci95_high:.4f} "
-                      f"eval_{tag}_win_pct={100.0 * s.a_wins / max(1, s.evaluated_games):.3f}")
-
+        # Checkpoint first: a failed evaluation must not lose the iteration.
         if args.checkpoint_every > 0 and (iteration % args.checkpoint_every == 0 or iteration == args.iterations):
             path = args.checkpoint_dir / f"iter_{iteration:06d}.pt"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +191,13 @@ def main() -> None:
                         "actor_ema": ema_actor.state_dict(),
                         "optimizer": optimizer.state_dict(), "config": config}, path)
             print(f"checkpoint={path}")
+
+        if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):
+            for tag, model in (("ref", ema_actor), ("raw", actor.eval())):
+                r = match(ext, model, reference, args.eval_pairs, EVAL_CHUNK, EVAL_SEED_OFFSET, False)
+                print(f"iter={iteration} eval_{tag}_score={r['score']:.4f} "
+                      f"eval_{tag}_ci_low={r['lo']:.4f} eval_{tag}_ci_high={r['hi']:.4f} "
+                      f"eval_{tag}_win_pct={r['win']:.3f}")
 
     print(f"ppo training PASS iterations={args.iterations} total_games={total_games}")
 

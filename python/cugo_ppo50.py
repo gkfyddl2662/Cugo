@@ -124,6 +124,9 @@ def collect(
     active = torch.arange(games, device=device)
     storage.size = 0
     steps = 0
+    # Error checks accumulate on the GPU and are read once after the loop; each
+    # per-step read would stall the CPU until the GPU caught up.
+    bad = torch.zeros((), dtype=torch.int64, device=device)
 
     actor.eval()
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -137,8 +140,8 @@ def collect(
                     t.index_select(0, rows) for t in (active, features, legal, players)
                 )
                 started.index_fill_(0, active, True)
-            elif not bool(keep.all()):
-                raise RuntimeError("active game has no legal action or bad status")
+            else:
+                bad += (~keep).sum()
             if active.numel() == 0:
                 break
             steps += 1
@@ -166,8 +169,7 @@ def collect(
                     actions.index_copy_(0, rows, a)
 
             reward0, new_done, nagari, step_status, _ = ext.step_indexed(states, active, actions)
-            if not bool((step_status == int(ext.STATUS_OK)).all()):
-                raise RuntimeError("step returned a non-OK status")
+            bad += (step_status != int(ext.STATUS_OK)).sum()
             final_reward0.index_copy_(0, active, torch.where(new_done, reward0, 0.0))
             final_nagari.index_copy_(0, active, new_done & nagari)
             active = active.index_select(0, torch.nonzero(~new_done).squeeze(1))
@@ -175,6 +177,8 @@ def collect(
                 break
         else:
             raise RuntimeError(f"games did not finish within {max_steps} steps")
+    if int(bad):
+        raise RuntimeError("an active game had no legal action, a bad status or a failed step")
 
     features, legal, actions, logp, opp_hand, env_ids, seat = storage.views()
     reward = final_reward0.index_select(0, env_ids)
@@ -307,13 +311,26 @@ class PpoUpdater:
             return
         if self.graph is None:
             saved = self.sums.clone()
+            weights = [p.detach().clone() for p in self.params]
+            moments = {p: {k: v.clone() for k, v in self.optimizer.state[p].items() if torch.is_tensor(v)}
+                       for p in self.params if p in self.optimizer.state}
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
-                for _ in range(3):  # warm-up updates are real updates on the current minibatch
+                for _ in range(3):
                     self.optimizer.zero_grad(set_to_none=True)
                     self._step()
             torch.cuda.current_stream().wait_stream(side)
+            # Undo the warm-up updates (in place: the graph keeps these tensors), so the
+            # minibatch is applied once, by the replay below.
+            with torch.no_grad():
+                for p, w in zip(self.params, weights):
+                    p.copy_(w)
+                for p in self.params:
+                    before = moments.get(p)
+                    for k, v in self.optimizer.state[p].items():
+                        if torch.is_tensor(v):
+                            v.copy_(before[k]) if before is not None else v.zero_()
             self.optimizer.zero_grad(set_to_none=True)
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):

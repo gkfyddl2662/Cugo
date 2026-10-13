@@ -117,21 +117,15 @@ __device__ void write_invalid_step(float* reward,
   *primary_committed = false;
 }
 
+// TorchEnv50 is trivially copyable: plain assignment lets the compiler move it in
+// wide words instead of one byte at a time.
 __device__ void copy_state_bytes(const TorchEnv50& source,
                                  TorchEnv50& target) {
-  const auto* source_bytes =
-      reinterpret_cast<const std::uint8_t*>(&source);
-  auto* target_bytes = reinterpret_cast<std::uint8_t*>(&target);
-  for (std::uint32_t i = 0; i < sizeof(TorchEnv50); ++i) {
-    target_bytes[i] = source_bytes[i];
-  }
+  target = source;
 }
 
 __device__ void clear_state_bytes(TorchEnv50& target) {
-  auto* target_bytes = reinterpret_cast<std::uint8_t*>(&target);
-  for (std::uint32_t i = 0; i < sizeof(TorchEnv50); ++i) {
-    target_bytes[i] = 0;
-  }
+  target = TorchEnv50{};
 }
 
 __global__ void create_kernel(TorchEnv50* envs,

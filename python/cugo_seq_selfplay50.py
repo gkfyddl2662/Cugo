@@ -40,9 +40,10 @@ class WaveCollector:
     """
 
     def __init__(self, ext: Any, actor: SeqNet, opponent: SeqNet, wave: int, pool_games: int,
-                 columns: list[int] | None, max_steps: int = 48) -> None:
-        if max_steps + 2 > MAX_EVENTS + 2:
-            raise ValueError("max_steps exceeds the KV-cache slots")
+                 columns: list[int] | None, max_steps: int = 64) -> None:
+        # Steps count every decision, floor choices included (games so far took at most
+        # 43); only committed actions become events, and those are checked against
+        # MAX_EVENTS (the cache slots) after each wave.
         device = next(actor.parameters()).device
         self.ext, self.actor, self.opponent = ext, actor, opponent
         self.w, self.p, self.max_steps = wave, pool_games, max_steps
@@ -111,11 +112,9 @@ class WaveCollector:
         self.bad += (active & ((status != self.ok) | ~legal.any(1))).sum()
         player = players.long()
 
-        # Queries run on both seats' cache rows (the non-mover's is discarded): reading
-        # every row in order is cheaper than gathering the movers' rows.
-        hidden = actor.cached_step(self.cache, actor.query_token(features, legal).repeat(2, 1))
-        logits = actor.readout(hidden.view(2, w, -1).gather(
-            0, player.view(1, w, 1).expand(1, w, hidden.shape[1])).squeeze(0)).float()
+        # One query per game, on the mover's cache row (row = seat * w + game).
+        hidden = actor.cached_step(self.cache, actor.query_token(features, legal), rows=(player & 1) * w + ids)
+        logits = actor.readout(hidden).float()
         learner_move = torch.ones_like(active)
         if pool:
             opp_logits = opponent.readout(opponent.cached_step(

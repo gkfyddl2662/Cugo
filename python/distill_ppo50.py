@@ -14,6 +14,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from cugo_contract50 import CONTRACT, load_checkpoint
 from cugo_eval50 import evaluate_paired
 from cugo_ppo50 import RolloutStorage, _critic_input, collect
 from cugo_ppo_nets50 import OracleCritic, PpoActor
@@ -21,11 +22,12 @@ from cugo_torch50_ext import load_extension
 
 
 def load_pair(path: Path, device: torch.device):
-    payload = torch.load(path, map_location=device, weights_only=False)
+    payload = load_checkpoint(path, device)
     config = payload.get("config", {})
     shape = (int(config.get("hidden", 512)), int(config.get("blocks", 3)), config.get("norm", "layer"))
     actor, critic = PpoActor(*shape).to(device), OracleCritic(*shape).to(device)
-    actor.load_state_dict(payload["actor"])
+    # Distill the release policy (the weight EMA) when the teacher has one.
+    actor.load_state_dict(payload.get("actor_ema", payload["actor"]))
     critic.load_state_dict(payload["critic"])
     for model in (actor, critic):
         model.eval().requires_grad_(False)
@@ -108,16 +110,17 @@ def main() -> None:
         print(f"iter={iteration} train_s={t2 - t1:.4f} distill_kl={kl_m / count:.6f} "
               f"distill_value_mse={v_m / count:.6f} distill_top1_agree={agree_m / count:.4f}")
 
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    config = {"hidden": args.hidden, "blocks": args.blocks, "norm": "none", "reward_scale": reward_scale,
+              "algorithm": "ppo-distill-v1", "teacher": str(args.teacher), "feature_contract": CONTRACT}
+    # The student starts its PPO run with its EMA equal to the distilled weights.
+    torch.save({"iteration": 0, "actor": actor.state_dict(), "actor_ema": actor.state_dict(),
+                "critic": critic.state_dict(), "config": config}, args.out)
+    print(f"checkpoint={args.out}")
     s = evaluate_paired(ext=ext, model_a=actor.eval(), model_b=teacher_actor, pairs=args.eval_pairs,
                         seed_offset=900000000, max_steps=128, use_amp=True)
     print(f"iter={args.iterations} eval_ref_score={s.mean_pair_score_a:.4f} "
           f"eval_ref_ci_low={s.pair_score_ci95_low:.4f} eval_ref_ci_high={s.pair_score_ci95_high:.4f}")
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    config = {"hidden": args.hidden, "blocks": args.blocks, "norm": "none", "reward_scale": reward_scale,
-              "algorithm": "ppo-distill-v1", "teacher": str(args.teacher)}
-    torch.save({"iteration": 0, "actor": actor.state_dict(), "critic": critic.state_dict(), "config": config},
-               args.out)
-    print(f"checkpoint={args.out}")
     print(f"distill training PASS iterations={args.iterations}")
 
 
