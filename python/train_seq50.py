@@ -9,7 +9,6 @@ update can rebuild exactly the sequence the policy acted on.
 from __future__ import annotations
 
 import argparse
-import copy
 import math
 import time
 from dataclasses import dataclass
@@ -266,11 +265,14 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
                       epochs=updates / max(1, len(g.batches(args.minibatch, shuffle=False))))
 
 
-def frozen(model: nn.Module) -> nn.Module:
-    model = copy.deepcopy(model).eval()
-    for p in model.parameters():
+def frozen(model: nn.Module, args: argparse.Namespace, state: dict | None = None) -> nn.Module:
+    """Eager, gradient-free copy of an actor (a fresh module, so compiled wrappers are not copied)."""
+    copy_ = seq_actor(args.mode, args.d_model, args.layers, args.heads).to(next(model.parameters()).device)
+    copy_.load_state_dict(model.state_dict() if state is None else state)
+    copy_.eval()
+    for p in copy_.parameters():
         p.requires_grad_(False)
-    return model
+    return copy_
 
 
 def main() -> None:
@@ -305,6 +307,8 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--memory-fraction", type=float, default=0.85)
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the transformer stacks (dynamic shapes; needs triton)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -316,7 +320,7 @@ def main() -> None:
 
     actor = seq_actor(args.mode, args.d_model, args.layers, args.heads).to(device)
     critic = seq_critic(args.mode, args.d_model, args.layers, args.heads).to(device)
-    ema_actor = frozen(actor)
+    ema_actor = frozen(actor, args)
     optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5, fused=True)
     start_iteration = 0
     if args.init is not None:
@@ -328,6 +332,18 @@ def main() -> None:
         start_iteration = int(payload["iteration"])
     ema_params, actor_params = list(ema_actor.parameters()), list(actor.parameters())
     snapshots: list[nn.Module] = []
+    if args.init is not None and args.pool_every > 0:
+        # A snapshot taken at iteration k is the actor saved in that iteration's checkpoint.
+        for k in range(args.pool_every, start_iteration + 1, args.pool_every):
+            path = args.init.parent / f"iter_{k:06d}.pt"
+            if path.exists():
+                snapshots.append(frozen(actor, args, torch.load(path, map_location=device,
+                                                                 weights_only=False)["actor"]))
+        del snapshots[:-args.pool_size]
+    if args.compile:
+        # Only the encoders: event/query counts vary per batch and are read on the host.
+        for model in (actor, critic):
+            model.encoder.compile(dynamic=True)
     reference = load_policy_checkpoint(args.reference, "auto", device).model if args.reference else None
 
     algorithm = "seq-ppo-v1"
@@ -337,7 +353,8 @@ def main() -> None:
           f"critic_params={sum(p.numel() for p in critic.parameters())}")
     print(f"iterations={args.iterations} games_per_iter={args.games} lr={args.lr:g} epochs={args.epochs} "
           f"minibatch={args.minibatch} entropy={args.entropy:g} target_kl={args.target_kl:g} "
-          f"reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g} pool_fraction={args.pool_fraction:g}")
+          f"reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g} pool_fraction={args.pool_fraction:g} "
+          f"compile={int(args.compile)} start_iteration={start_iteration} pool={len(snapshots)}")
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()} | {"algorithm": algorithm}
 
     total_games = 0
@@ -372,7 +389,7 @@ def main() -> None:
               flush=True)
 
         if args.pool_every > 0 and iteration % args.pool_every == 0:
-            snapshots.append(frozen(actor))
+            snapshots.append(frozen(actor, args))
             del snapshots[:-args.pool_size]
 
         if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):
