@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from cugo_ppo_nets50 import ACTIONS, FEATURES, ORACLE_FEATURES, card_plane
+from cugo_seq_attention50 import decode_attention
 
 EVENT_WORDS = 9
 START_WORDS = 8
@@ -262,49 +263,51 @@ class SeqNet(nn.Module):
     def readout(self, h: torch.Tensor) -> torch.Tensor:
         return self._out(h)
 
-    def cached_step(self, cache: "KVCache", x: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
-        """Run one token per row (x [N, d]); its key/value go to slot cache.length[row].
+    def cached_step(self, cache: "KVCache", x: torch.Tensor, slots: int | None = None) -> torch.Tensor:
+        """Run one token per cache row (x [rows, d]); its key/value go to slot cache.length[row].
 
         Each token attends slots <= its own: everything cached plus itself. The caller
         advances cache.length for tokens that stay (events); a query does not, so the
-        next event overwrites its slot. rows=None means every cache row in order.
-        Returns the final hidden state [N, d].
+        next event overwrites its slot. `slots` bounds the slots read (it must exceed
+        every row's length). Returns the final hidden state [rows, d].
+
+        Attention is a single-query decode kernel (cugo_seq_attention50); fused
+        training kernels tile queries by 64 and waste most of their work here.
         """
         n, d = x.shape
-        heads = self.encoder.layers[0].self_attn.num_heads
-        length = cache.length if rows is None else cache.length.index_select(0, rows)
-        pos = length.clamp_max(cache.slots - 1)
-        mask = (cache.slot_ids.view(1, -1) <= pos.view(-1, 1)).view(n, 1, 1, cache.slots)
-        at = cache.row_ids if rows is None else rows
+        heads = cache.heads
+        dh = d // heads
+        t = cache.slots if slots is None else min(slots, cache.slots)
+        pos = cache.length.clamp_max(t - 1)
+        flat_rows = (cache.row_ids.view(n, 1) * heads + cache.head_ids.view(1, heads)).flatten()
+        flat_pos = pos.repeat_interleave(heads)
         for i, layer in enumerate(self.encoder.layers):
             attn = layer.self_attn
             q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
-            kc, vc = cache.k[i], cache.v[i]
-            kc.index_put_((at, pos), k.to(kc.dtype))
-            vc.index_put_((at, pos), v.to(vc.dtype))
-            keys = kc if rows is None else kc.index_select(0, rows)
-            values = vc if rows is None else vc.index_select(0, rows)
-            a = F.scaled_dot_product_attention(
-                q.reshape(n, heads, 1, d // heads),
-                keys.view(n, cache.slots, heads, d // heads).transpose(1, 2).to(q.dtype),
-                values.view(n, cache.slots, heads, d // heads).transpose(1, 2).to(q.dtype),
-                attn_mask=mask)
+            kc, vc = cache.k[i], cache.v[i]  # [rows, heads, slots, dh]
+            kc.view(-1, cache.slots, dh).index_put_((flat_rows, flat_pos), k.reshape(n * heads, dh).to(kc.dtype))
+            vc.view(-1, cache.slots, dh).index_put_((flat_rows, flat_pos), v.reshape(n * heads, dh).to(vc.dtype))
+            a = decode_attention(q.reshape(n, heads, dh), kc, vc, pos, cache.use_triton)
             x = x + attn.out_proj(a.reshape(n, d))
             x = x + layer.linear2(layer.activation(layer.linear1(layer.norm2(x))))
         return x
 
 
 class KVCache:
-    """Per-row keys/values of the opening and event tokens for every layer (bf16)."""
+    """Per-row keys/values of the opening and event tokens for every layer (bf16, head-major)."""
 
     def __init__(self, model: SeqNet, rows: int, device: torch.device) -> None:
         layers, d = len(model.encoder.layers), model.position.shape[1]
+        self.heads = model.encoder.layers[0].self_attn.num_heads
         self.slots = MAX_EVENTS + 2  # opening + events + one scratch slot for the query
-        self.k = torch.zeros((layers, rows, self.slots, d), dtype=torch.bfloat16, device=device)
+        self.k = torch.zeros((layers, rows, self.heads, self.slots, d // self.heads), dtype=torch.bfloat16,
+                             device=device)
         self.v = torch.zeros_like(self.k)
         self.length = torch.zeros(rows, dtype=torch.int64, device=device)
         self.slot_ids = torch.arange(self.slots, device=device)
         self.row_ids = torch.arange(rows, device=device)
+        self.head_ids = torch.arange(self.heads, device=device)
+        self.use_triton = True
 
 
 def stored_columns(mode: str) -> list[int] | None:

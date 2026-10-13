@@ -41,6 +41,8 @@ class WaveCollector:
 
     def __init__(self, ext: Any, actor: SeqNet, opponent: SeqNet, wave: int, pool_games: int,
                  columns: list[int] | None, max_steps: int = 48) -> None:
+        if max_steps + 2 > MAX_EVENTS + 2:
+            raise ValueError("max_steps exceeds the KV-cache slots")
         device = next(actor.parameters()).device
         self.ext, self.actor, self.opponent = ext, actor, opponent
         self.w, self.p, self.max_steps = wave, pool_games, max_steps
@@ -73,7 +75,7 @@ class WaveCollector:
         self.bad = torch.zeros((), dtype=torch.int64, device=device)
         self.ok = int(ext.STATUS_OK)
         self.graph: torch.cuda.CUDAGraph | None = None
-        self.graph_pool = False
+        self.graph_pool: bool | None = None
 
     # -- one wave ---------------------------------------------------------------
 
@@ -93,12 +95,12 @@ class WaveCollector:
         self.step_index.zero_()
         self.rec_valid.zero_()
         self.cache.length.zero_()
-        self.actor.cached_step(self.cache, self.actor.start_token(self.start.repeat(2, 1), self.seats2))
+        self.actor.cached_step(self.cache, self.actor.start_token(self.start.repeat(2, 1), self.seats2), 1)
         self.cache.length.fill_(1)
         if pool:
             self.opp_cache.length.zero_()
             opp_seat = 1 - self.learner_seat[:p]
-            self.opponent.cached_step(self.opp_cache, self.opponent.start_token(self.start[:p], opp_seat))
+            self.opponent.cached_step(self.opp_cache, self.opponent.start_token(self.start[:p], opp_seat), 1)
             self.opp_cache.length.fill_(1)
 
     def _step(self, pool: bool) -> None:
@@ -109,8 +111,11 @@ class WaveCollector:
         self.bad += (active & ((status != self.ok) | ~legal.any(1))).sum()
         player = players.long()
 
-        logits = actor.readout(actor.cached_step(self.cache, actor.query_token(features, legal),
-                                                 player * w + ids)).float()
+        # Queries run on both seats' cache rows (the non-mover's is discarded): reading
+        # every row in order is cheaper than gathering the movers' rows.
+        hidden = actor.cached_step(self.cache, actor.query_token(features, legal).repeat(2, 1))
+        logits = actor.readout(hidden.view(2, w, -1).gather(
+            0, player.view(1, w, 1).expand(1, w, hidden.shape[1])).squeeze(0)).float()
         learner_move = torch.ones_like(active)
         if pool:
             opp_logits = opponent.readout(opponent.cached_step(
@@ -164,7 +169,7 @@ class WaveCollector:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
-            for _ in range(2):  # warm-up (cuBLAS handles, autocast) outside the capture
+            for _ in range(2):  # warm-up (cuBLAS handles, Triton JIT, autocast) outside the capture
                 self._step(pool)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()

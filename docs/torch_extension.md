@@ -36,6 +36,8 @@ py -m pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu1
 py python/torch50_smoke.py --batch 32768 --warmup 1 --iters 3
 ```
 
+The sequence-policy self-play (`python/cugo_seq_attention50.py`) uses a Triton kernel when Triton is importable (`py -m pip install --no-deps triton-windows==3.8.0.post29` on Windows; it falls back to plain matrix products otherwise). Triton writes its kernel cache to `%USERPROFILE%\.triton`; set `TRITON_CACHE_DIR` when that directory is not writable.
+
 ## Baseline network
 
 `python/torch50_smoke.py` creates a deliberately small FP16 policy/value MLP:
