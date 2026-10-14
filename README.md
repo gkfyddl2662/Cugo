@@ -36,12 +36,14 @@ As of October 2026:
 | Policy | Model | vs. `ppo_h1500_v3` (points per deal pair) |
 | --- | --- | --- |
 | `ppo_h1500_v3` | 3×512 residual MLP, PPO | reference |
-| `ppo_j` (paused at iteration 200) | 4×2048 residual MLP, PPO | +2.0 |
-| `seq_hybrid` (in training, iteration 650) | 4-layer transformer, events + 720 features | −49 |
+| `ppo_j` (in training, iteration 400) | 4×2048 residual MLP, PPO | +2.3 |
+| `seq_hybrid` (paused at iteration 3000) | 4-layer transformer, events + 720 features | −3.8 |
 | `seq_events` (retired at iteration 300) | 4-layer transformer, events only | −218 |
 
-Sequence models are trained from scratch and are still improving. The
-events-only variant plateaued well below the hybrid one.
+League of 131,072 deal pairs per match. Head to head, `ppo_j` at 400 beats
+`seq_hybrid` at 3000 by 5.2 points per pair [3.3, 7.1]. The sequence model, trained
+from scratch, closed most of its gap (−49 at 650) and is paused while the MLP
+trains; the events-only variant plateaued well below the hybrid one.
 
 ## Requirements
 

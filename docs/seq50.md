@@ -68,6 +68,17 @@ A/B from the hybrid run's iteration 550, 100 iterations each, same seeds (65,536
 
 Head to head at 650 (131,072 deal pairs) the new options scored −0.17 [−1.96, +1.63] points per pair: no difference in strength yet, with a clearly better critic, and the run continues with them.
 
+The MLP trainer (`train_ppo50.py`) takes the same `--value-bins`, `--value-top`, `--critic-stock`, `--belief-coef` (with `--belief-width`, default 512) and `--critic-warmup`. A/B from `ppo_j` at iteration 200 (4×2048 MLP, 65,536 games per iteration), 200 iterations each:
+
+| | Baseline | `--value-bins 151 --critic-stock --belief-coef 0.1 --critic-warmup 10` |
+| --- | ---: | ---: |
+| vs. `ppo_h1500_v3` at 400 (league) | +2.25 [+0.62, +3.89] | +2.61 [+0.90, +4.32] |
+| critic explained variance, iterations 351-400 | 0.329 | 0.364 |
+| update time per iteration | 6.58 s | 6.82 s |
+| peak reserved memory | 10.9 GB | 12.9 GB |
+
+Head to head at 400 the new options scored −1.35 [−2.84, +0.15] points per pair. Again no strength gain, at 2 GB more memory, so `ppo_j` continues from the baseline arm.
+
 Learning rates are GPU tensors, so the replayed Adam steps of `--update-graphs` read the current value and the warm-up switch needs no recapture. The optimizer has two groups (actor; critic and belief head) and gradients are clipped per network. Older single-group checkpoints are mapped by parameter name.
 
 The critic's value pre-pass runs in length-sorted batches (1.20 s to 0.93 s per iteration); it is GPU-bound, so capturing it as CUDA graphs gained nothing.
