@@ -111,6 +111,19 @@ From `ppo_j`/1600, 150 iterations per arm with `--all-actions`, same seeds; leag
 
 Every pair of arms is within ±0.6 points of each other: none of these knobs moves the plateau at this horizon. The reference no longer separates checkpoints (`ppo_j` 1100 through 2000 all score +4.2 to +4.6 against it); head to head, 2000 beats 1600 by +0.46 [−1.06, +1.98], 1100 by +1.33 [−0.38, +3.03] and 600 by +2.66 [+0.99, +4.33], so progress continues at roughly +0.3 per 100 iterations. `ppo_j` continues past 2000 with plain PPO (no all-action, 8.8 s per iteration), since nothing measured favoured the slower variant.
 
+### Gradient signal
+
+Head to head, `ppo_j` at 2000 does not beat 1400 (1400 scores +0.26 [−1.28, +1.80]). To see why, the actor gradient was computed at ratio 1 on independent rollouts of 65,536 games (1.4 M decisions) from `ppo_j`/2000 and compared pairwise (8 rollouts, 28 pairs):
+
+| Policy-gradient estimate | Mean cosine between rollouts |
+| --- | ---: |
+| GAE(0.95) advantage, oracle critic | 0.027 |
+| All-action, critic Q (4 rollouts) | 0.024 |
+| All-action, Q from greedy play to the end of each branch, with the (return − Q) term | 0.021 |
+| Same, Q term only | 0.034 |
+
+A full iteration's gradient is ~97% noise, and the minibatches of 32,768 decisions are 40 times noisier. Exploiters trained at lr 1e-4 against a fixed greedy target, even the weak `ppo_h1500_v3` and even with Monte-Carlo advantages, lost ground in their own training score (−8.8 to −15 points per game over 350 iterations against `ppo_j`/2000) and were flat at lr 4e-5: a larger step only drifts. Playing branches to the end with shared luck (the cloned state keeps the stock order) did not help, at 3.4 times the self-play cost (21.7 s), so the noise is not the luck of future flips but how much an action's value depends on the hidden cards. The rollout variant was measured and not kept. An exploiter that finds nothing at this signal level says nothing about exploitability.
+
 ### Exploiter
 
 `--exploiter --opponent T --init T --reference T` trains a copy of T against T alone; its margin over T is a lower bound on T's exploitability. Pass `--pool-greedy` so T plays greedy, as it is deployed: against a sampling T (about 8 points weaker) the exploiter learned that weaker policy's leaks and lost 2.3 points to greedy T after 200 iterations. With `--pool-greedy` and lr 4e-5, 200 iterations against `ppo_j` at 900 peaked at +0.56 [−0.71, +1.82] and ended at −0.17 [−1.59, +1.24]: no weakness found at that budget, which is a weak bound, not proof of none.
