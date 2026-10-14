@@ -85,6 +85,9 @@ def main() -> None:
                         help="branch every legal action one step and learn from the critic's Q of each")
     parser.add_argument("--mc-coef", type=float, default=1.0,
                         help="all-action mode: weight of the sampled action's (return - Q) term (1 = unbiased)")
+    parser.add_argument("--q-source", choices=("critic", "worlds"), default="critic",
+                        help="all-action mode: Q from the oracle critic, or greedy play to the end in redealt worlds")
+    parser.add_argument("--worlds", type=int, default=4, help="--q-source worlds: redealt worlds per decision")
     parser.add_argument("--policy-target", choices=("pg", "improve"), default="pg",
                         help="all-action mode: unbiased all-action gradient, or MPO-style pi_old*exp(A/tau) target")
     parser.add_argument("--improve-kl", type=float, default=0.02,
@@ -185,7 +188,8 @@ def main() -> None:
     print(f"value_bins={args.value_bins} value_top={args.value_top:g} critic_stock={int(args.critic_stock)} "
           f"belief_coef={args.belief_coef:g} critic_warmup={args.critic_warmup} "
           f"critic_restarted={','.join(restarted) or 'none'} memory_fraction={args.memory_fraction:g} "
-          f"all_actions={int(args.all_actions)} mc_coef={args.mc_coef:g} policy_target={args.policy_target} "
+          f"all_actions={int(args.all_actions)} q_source={args.q_source} worlds={args.worlds} "
+          f"mc_coef={args.mc_coef:g} policy_target={args.policy_target} "
           f"improve_kl={args.improve_kl:g} branch_min_prob={args.branch_min_prob:g} "
           f"branch_max_top={args.branch_max_top:g}")
     if args.reference is not None:  # every invocation, so a resumed log records the reference it evaluates against
@@ -211,7 +215,8 @@ def main() -> None:
                        pool_fraction=pool_fraction if opponent is not None else 0.0, pool_greedy=args.pool_greedy,
                        reward_scale=args.reward_scale, storage=storage,
                        critic=critic if args.all_actions else None,
-                       branch_min_prob=args.branch_min_prob, branch_max_top=args.branch_max_top)
+                       branch_min_prob=args.branch_min_prob, branch_max_top=args.branch_max_top,
+                       q_source=args.q_source, worlds=args.worlds)
         if opponent is not None and not any(opponent is m for m in fixed_pool):
             opponent.cpu()
         torch.cuda.synchronize()

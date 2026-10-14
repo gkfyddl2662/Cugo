@@ -14,6 +14,15 @@ probability >= branch_min_prob, at decisions whose top action is below
 branch_max_top, plus the sampled action there (a policy-gradient term scales
 with the action's probability, so a 0.1% action's Q barely registers).
 
+Q comes from the oracle critic (q_source="critic"), or (q_source="worlds") from K redealt
+worlds: the opponent's unrevealed hand and the stock are dealt anew among the cards the
+learner cannot see and the stock order is reseeded; a world is kept only if the learner's
+features and legal actions are bit-identical to the real state's. Each branch is played to
+the end greedily by both seats (the pool opponent plays its seat in pool games) and Q(a) is
+the mean final score over the worlds. Measured at ppo_j/2000, the batch-gradient cosine
+between independent rollouts rose from 0.027 to 0.20 with K=4 and mc_coef=0: most of the
+noise is how much an action's value depends on the hidden cards.
+
 Two ways to learn from the Qs ("policy_target"):
 - "pg": the clipped surrogate in expectation over the branched actions with
   A(a) = Q(a) - (their pi_old-weighted mean), plus the sampled action's
@@ -97,6 +106,110 @@ def action_values(ext: Any, critic: nn.Module, states: torch.Tensor, env_rows: t
     return q
 
 
+# int64 words of the 248-byte TorchEnv50 a redeal touches (offsetof, cugo/game/torch50.h).
+_HAND0, _HAND1, _STOCK, _RNG, _HELD0, _HELD1, _REV0, _REV1 = 0, 1, 3, 6, 20, 21, 22, 23
+_STATE_BYTES = 248
+_BITS: dict[torch.device, torch.Tensor] = {}
+ROLLOUT_STEPS = 96  # a deal has ~33 decisions
+
+
+def _card_bits(device: torch.device) -> torch.Tensor:
+    if device not in _BITS:
+        _BITS[device] = torch.arange(50, device=device)
+    return _BITS[device]
+
+
+def _redeal(words: torch.Tensor, seat: torch.Tensor) -> None:
+    """In place on [N, 31] int64 state words: the observer's opponent gets a uniform new
+    unrevealed hand from the cards the observer cannot see, the rest is the stock, and the
+    stock order is reseeded. held (every card ever in hand) follows the new hand."""
+    bits = _card_bits(words.device)
+    n = words.shape[0]
+    s0 = seat == 0
+    hand = torch.where(s0, words[:, _HAND1], words[:, _HAND0])
+    fixed = hand & torch.where(s0, words[:, _REV1], words[:, _REV0])  # shown by a shake
+    held = torch.where(s0, words[:, _HELD1], words[:, _HELD0])
+    free = hand & ~fixed
+    unknown = free | words[:, _STOCK]
+    count = ((free.unsqueeze(-1) >> bits) & 1).sum(-1)
+    is_unknown = ((unknown.unsqueeze(-1) >> bits) & 1).bool()
+    keys = torch.rand(n, 50, device=words.device).masked_fill(~is_unknown, 2.0)
+    rank = torch.empty_like(keys, dtype=torch.int64).scatter_(1, keys.argsort(1), bits.expand(n, 50).contiguous())
+    new_free = ((is_unknown & (rank < count.unsqueeze(1))).long() << bits).sum(1)
+    new_hand = fixed | new_free
+    new_held = (held & ~hand) | new_hand
+    words[:, _STOCK] = unknown & ~new_free
+    words[:, _HAND1] = torch.where(s0, new_hand, words[:, _HAND1])
+    words[:, _HAND0] = torch.where(s0, words[:, _HAND0], new_hand)
+    words[:, _HELD1] = torch.where(s0, new_held, words[:, _HELD1])
+    words[:, _HELD0] = torch.where(s0, words[:, _HELD0], new_held)
+    words[:, _RNG] = torch.randint(-2**62, 2**62, (n,), device=words.device)
+
+
+def redeal_worlds(ext: Any, states: torch.Tensor, env_rows: torch.Tensor, seat: torch.Tensor,
+                  worlds: int, tries: int = 8) -> torch.Tensor:
+    """[worlds * R, STATE_BYTES] copies of the rows, world-major, each redealt so the observer's
+    features and legal actions are unchanged; a row that fails `tries` times keeps the real deal
+    (a pending flip already revealed a stock card ~3% of the time)."""
+    if states.shape[1] != _STATE_BYTES:
+        raise RuntimeError("TorchEnv50 layout changed: update the redeal word offsets")
+    base = states.index_select(0, env_rows)
+    f0, l0, _, _, _ = ext.observe_indexed(base, torch.arange(base.shape[0], device=base.device))
+    out = base.repeat(worlds, 1)
+    seat_k, ref_f, ref_l = seat.repeat(worlds), f0.repeat(worlds, 1), l0.repeat(worlds, 1)
+    todo = torch.arange(out.shape[0], device=base.device)
+    for _ in range(tries):
+        if todo.numel() == 0:
+            break
+        cand = out.index_select(0, todo)
+        cand.copy_(base.repeat(worlds, 1).index_select(0, todo))
+        _redeal(cand.view(torch.int64), seat_k.index_select(0, todo))
+        f, l, _, _, _ = ext.observe_indexed(cand, torch.arange(cand.shape[0], device=cand.device))
+        good = (f == ref_f.index_select(0, todo)).all(1) & (l == ref_l.index_select(0, todo)).all(1)
+        rows = torch.nonzero(good).squeeze(1)
+        out.index_copy_(0, todo.index_select(0, rows), cand.index_select(0, rows))
+        todo = todo.index_select(0, torch.nonzero(~good).squeeze(1))
+    return out
+
+
+def _greedy_to_end(ext: Any, actor: nn.Module, opponent: nn.Module | None, child: torch.Tensor,
+                   reward0: torch.Tensor, done: torch.Tensor, me: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
+    final = torch.where(done, reward0, 0.0)
+    ids = torch.nonzero(~done).squeeze(1)
+    for _ in range(ROLLOUT_STEPS):
+        if ids.numel() == 0:
+            return final
+        features, legal, players, _, _ = ext.observe_indexed(child, ids)
+        step = _act(actor, features, legal, True)[0]
+        if opponent is not None:
+            other = torch.nonzero(pool.index_select(0, ids) & (players.to(torch.int64) != me.index_select(0, ids))).squeeze(1)
+            if other.numel():
+                step.index_copy_(0, other, _act(opponent, features.index_select(0, other),
+                                                legal.index_select(0, other), True)[0])
+        reward, new_done, _, _, _ = ext.step_indexed(child, ids, step)
+        final.index_copy_(0, ids, torch.where(new_done, reward, 0.0))
+        ids = ids.index_select(0, torch.nonzero(~new_done).squeeze(1))
+    raise RuntimeError(f"rollout did not finish within {ROLLOUT_STEPS} steps")
+
+
+def world_values(ext: Any, actor: nn.Module, opponent: nn.Module | None, states: torch.Tensor,
+                 env_rows: torch.Tensor, seat: torch.Tensor, vs_pool: torch.Tensor, branch: torch.Tensor,
+                 reward_scale: float, worlds: int) -> torch.Tensor:
+    """[R, ACTIONS] fp16 Q of each branched action, averaged over redealt worlds (NaN elsewhere)."""
+    w = redeal_worlds(ext, states, env_rows, seat, worlds)
+    seat_k, pool_k, branch_k = seat.repeat(worlds), vs_pool.repeat(worlds), branch.repeat(worlds, 1)
+    rows, acts = torch.nonzero(branch_k, as_tuple=True)
+    q = torch.zeros(branch_k.shape, device=branch.device)
+    for i in range(0, rows.numel(), Q_CHUNK):
+        r, a = rows[i:i + Q_CHUNK], acts[i:i + Q_CHUNK]
+        me, pool = seat_k.index_select(0, r), pool_k.index_select(0, r)
+        child, reward0, done = ext.branch_indexed(w, r, a)[:3]
+        final = _greedy_to_end(ext, actor, opponent, child, reward0, done, me, pool)
+        q[r, a] = torch.where(me == 0, final, -final) / reward_scale
+    q = q.view(worlds, *branch.shape).mean(0)
+    return torch.where(branch, q, float("nan")).to(torch.float16)
+
+
 class RolloutStorage:
     """Fixed transition buffers reused every iteration.
 
@@ -159,10 +272,12 @@ def collect(
     critic: nn.Module | None = None,
     branch_min_prob: float = 0.0,
     branch_max_top: float = 2.0,
+    q_source: str = "critic",
+    worlds: int = 4,
 ) -> Rollout:
-    """Self-play games; with critic (and storage.all_actions) also every action's Q."""
-    if storage.all_actions and critic is None:
-        raise ValueError("all-action storage needs the critic")
+    """Self-play games; with storage.all_actions also the Q of the branched actions."""
+    if storage.all_actions and q_source == "critic" and critic is None:
+        raise ValueError("critic Q needs the critic")
     device = torch.device("cuda")
     seeds, first = make_seeds(games, seed_offset, device)
     states = ext.create(seeds, first)
@@ -224,8 +339,12 @@ def collect(
                 open_ = probs.max(1).values < branch_max_top
                 branch = own_legal & (probs >= branch_min_prob) & open_.unsqueeze(1)
                 branch.scatter_(1, a.unsqueeze(1), branch.gather(1, a.unsqueeze(1)) | open_.unsqueeze(1))
-                extra = (action_values(ext, critic, states, env_rows, seat, branch, reward_scale),
-                         log_probs.clamp_min(-60.0).to(torch.float16))
+                if q_source == "worlds":
+                    q = world_values(ext, actor, opponent_model, states, env_rows, seat,
+                                     opp.index_select(0, rows) >= 0, branch, reward_scale, worlds)
+                else:
+                    q = action_values(ext, critic, states, env_rows, seat, branch, reward_scale)
+                extra = (q, log_probs.clamp_min(-60.0).to(torch.float16))
             storage.append(features.index_select(0, rows), own_legal,
                            a, logp, opp_hand, env_rows, seat, ext.stock_indexed(states, env_rows), *extra)
 
