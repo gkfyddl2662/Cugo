@@ -34,6 +34,16 @@ from league50 import match
 
 EVAL_SEED_OFFSET = 900000000
 EVAL_CHUNK = 8192
+PHASES: dict[str, float] | None = None  # set to {} to time update() phases (synchronizes the GPU)
+
+
+def _phase(name: str, since: float) -> float:
+    if PHASES is None:
+        return since
+    torch.cuda.synchronize()
+    now = time.perf_counter()
+    PHASES[name] = PHASES.get(name, 0.0) + now - since
+    return now
 
 
 class SeqStorage:
@@ -441,18 +451,23 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
            graphs: "UpdateGraphs | None" = None) -> TrainStats:
     n = storage.size
     s = storage
+    t = _phase("start", time.perf_counter())
     g = GameRows(storage, data.hist)
+    t = _phase("rows", t)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         critic.eval()
         values = s.logp.new_zeros(n + 1)
-        for seqs, length, q in g.batches(4 * args.minibatch, shuffle=False):
+        # Length-sorted batches pad far less (this pass is GPU-bound, so padding is its cost).
+        for seqs, length, q in g.batches(4 * args.minibatch, shuffle=False, bucket=len(g)):
             hb, rows, valid = g.take(seqs, q)
             at = torch.where(valid, rows, n).flatten()
             values.index_copy_(0, at, run_games(critic, g, hb, rows, True, length).float().flatten())
         values = values[:n]
+    t = _phase("values", t)
     adv_all = g.advantages(values, data.returns, args.gae_lambda)
     ret_all = adv_all + values
     explained_var = 1.0 - float((data.returns - values).var() / data.returns.var().clamp_min(1e-8))
+    t = _phase("advantages", t)
 
     params = [*actor.parameters(), *critic.parameters()]
     gostop = s.features[:n, s.gostop_column] > 0.5
@@ -466,6 +481,7 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
     else:
         graphs.load(g, adv_all, ret_all, gostop, plan, entropy_coef)
         sums, kl = graphs.sums, graphs.kl
+    t = _phase("plan", t)
     kl_host = torch.zeros(1, pin_memory=True)
     kl_ready: torch.cuda.Event | None = None
     updates, stop = 0, False
@@ -493,6 +509,7 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
         if stop:
             break
 
+    _phase("loop", t)
     t = sums.tolist()
     count = max(1.0, t[5])
     return TrainStats(policy_loss=t[0] / count, value_loss=t[1] / count, entropy=t[2] / count,
