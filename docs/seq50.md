@@ -98,6 +98,19 @@ Branching only actions that can move the policy (`--branch-min-prob 0.01 --branc
 
 `--policy-target improve` (cross-entropy toward π_old·exp(A/τ), τ set so KL(target ‖ π_old) averages `--improve-kl`, every action branched) failed: from `ppo_j`/1300 with `--improve-kl 0.1`, entropy doubled (0.32 to 0.64) within 100 iterations and at 1500 it lost 25.1 [23.1, 27.1] points per pair to the `pg` arm. The critic's Q is too noisy (explained variance ~0.37) for an exponential reweighting: noise lifts low-probability actions it cannot also push down. The `pg` arm itself gained nothing over 1300 in those 200 iterations (+0.02 [−1.42, +1.45]).
 
+### Entropy and learning-rate sweep (MLP)
+
+From `ppo_j`/1600, 150 iterations per arm with `--all-actions`, same seeds; league of 131,072 deal pairs per match:
+
+| Arm | Final entropy | vs. `ppo_j`/1600 | vs. `ppo_h1500_v3` |
+| --- | ---: | ---: | ---: |
+| entropy 0.02, lr 4e-5 (baseline) | 0.318 | −0.27 [−1.53, +1.00] | +4.78 |
+| entropy 0.01 | 0.238 | +0.08 [−1.24, +1.39] | +4.61 |
+| entropy 0.005 | 0.195 | −0.50 [−1.83, +0.83] | +4.32 |
+| lr 1.5e-5 | 0.322 | −0.14 [−1.37, +1.09] | +5.02 |
+
+Every pair of arms is within ±0.6 points of each other: none of these knobs moves the plateau at this horizon. The reference no longer separates checkpoints (`ppo_j` 1100 through 2000 all score +4.2 to +4.6 against it); head to head, 2000 beats 1600 by +0.46 [−1.06, +1.98], 1100 by +1.33 [−0.38, +3.03] and 600 by +2.66 [+0.99, +4.33], so progress continues at roughly +0.3 per 100 iterations. `ppo_j` continues past 2000 with plain PPO (no all-action, 8.8 s per iteration), since nothing measured favoured the slower variant.
+
 ### Exploiter
 
 `--exploiter --opponent T --init T --reference T` trains a copy of T against T alone; its margin over T is a lower bound on T's exploitability. Pass `--pool-greedy` so T plays greedy, as it is deployed: against a sampling T (about 8 points weaker) the exploiter learned that weaker policy's leaks and lost 2.3 points to greedy T after 200 iterations. With `--pool-greedy` and lr 4e-5, 200 iterations against `ppo_j` at 900 peaked at +0.56 [−0.71, +1.82] and ended at −0.17 [−1.59, +1.24]: no weakness found at that budget, which is a weak bound, not proof of none.
