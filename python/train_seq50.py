@@ -23,11 +23,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cugo_contract50 import CONTRACT, load_checkpoint
+from cugo_contract50 import CONTRACT, load_checkpoint, stop_points
 from cugo_eval50 import load_policy_checkpoint
 from cugo_ppo50 import DECISION_OFFSET, GOSTOP_KIND, TrainStats
-from cugo_ppo_nets50 import ACTIONS, FEATURES, make_seeds
-from cugo_seq50 import MAX_EVENTS, History, HistBatch, policy_logits, seq_actor, seq_critic, stored_columns
+from cugo_ppo_nets50 import ACTIONS, FEATURES, card_plane, make_seeds
+from cugo_seq50 import (MAX_EVENTS, BeliefHead, History, HistBatch, policy_logits, seq_actor, seq_critic,
+                        stored_columns, two_hot)
 from cugo_seq_selfplay50 import GameLog, WaveCollector, make_opponent_slot
 from cugo_torch50_ext import load_extension
 from league50 import match
@@ -49,7 +50,7 @@ def _phase(name: str, since: float) -> float:
 class SeqStorage:
     """Reused per-decision buffers (see RolloutStorage) plus the event-count column."""
 
-    NAMES = ("features", "legal", "actions", "logp", "opp_hand", "env_ids", "seat", "count")
+    NAMES = ("features", "legal", "actions", "logp", "opp_hand", "stock", "stop_points", "env_ids", "seat", "count")
 
     def __init__(self, capacity: int, device: torch.device, columns: list[int] | None = None) -> None:
         # Events-mode policies read only a few feature columns; storing just those
@@ -151,6 +152,7 @@ def collect_eager(ext: Any, actor: nn.Module, pool: list[nn.Module], games: int,
             kept = f if storage.columns is None else f.index_select(1, storage.columns)
             storage.append(features=kept, legal=l, actions=a, logp=logp,
                            opp_hand=hands.gather(1, (1 - seat).unsqueeze(1)).squeeze(1),
+                           stock=ext.stock_indexed(states, env_rows), stop_points=stop_points(f),
                            env_ids=env_rows, seat=seat, count=hb.count)
 
             if opponent_model is not None:
@@ -285,21 +287,51 @@ def run_games(model: nn.Module, g: GameRows, hb: HistBatch, rows: torch.Tensor, 
               length: int) -> torch.Tensor:
     s = g.storage
     return model.forward_games(hb, s.features[rows], s.legal[rows], s.count[rows],
-                               s.opp_hand[rows] if oracle else None, length=length)
+                               s.opp_hand[rows] if oracle else None, length=length,
+                               stock=s.stock[rows] if getattr(model, "stock", False) else None)
 
 
-def ppo_minibatch(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer, params: list,
-                  s: SeqStorage, hb: HistBatch, rows: torch.Tensor, valid: torch.Tensor, length: int,
+@dataclass
+class Nets:
+    """What the update trains. The optimizer has two groups, the actor and then the
+    critic plus the belief head, so a critic warm-up can hold the actor (lr 0).
+    Gradients are clipped per network."""
+    actor: nn.Module
+    critic: nn.Module
+    belief: nn.Module | None
+    optimizer: torch.optim.Optimizer
+
+    @property
+    def clip_groups(self) -> list[list[torch.Tensor]]:
+        groups = [list(self.actor.parameters()), list(self.critic.parameters())]
+        return groups + ([list(self.belief.parameters())] if self.belief is not None else [])
+
+    @property
+    def params(self) -> list[torch.Tensor]:
+        return [p for group in self.optimizer.param_groups for p in group["params"]]
+
+
+STAT_SLOTS = 9  # policy, value, entropy, kl, clipfrac, updates, gostop entropy, gostop rows, belief
+
+
+def ppo_minibatch(nets: Nets, s: SeqStorage, hb: HistBatch, rows: torch.Tensor, valid: torch.Tensor, length: int,
                   adv_all: torch.Tensor, ret_all: torch.Tensor, gostop: torch.Tensor,
                   args: argparse.Namespace, entropy_coef: torch.Tensor, sums: torch.Tensor,
                   kl_out: torch.Tensor) -> None:
     """One PPO step on [B, q] decision rows (valid marks real ones); accumulates stats into sums."""
+    actor, critic, belief = nets.actor, nets.critic, nets.belief
     w = valid.float()
     total = w.sum().clamp_min(1.0)
     with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
-        logits = actor.forward_games(hb, s.features[rows], s.legal[rows], s.count[rows], length=length).float()
-        value = critic.forward_games(hb, s.features[rows], s.legal[rows], s.count[rows], s.opp_hand[rows],
-                                     length=length).float()
+        f, l, c = s.features[rows], s.legal[rows], s.count[rows]
+        if belief is not None:
+            logits, hidden = actor.forward_games(hb, f, l, c, length=length, hidden=True)
+            belief_logits = belief(hidden).float()
+        else:
+            logits = actor.forward_games(hb, f, l, c, length=length)
+        logits = logits.float()
+        value = critic.forward_games(hb, f, l, c, s.opp_hand[rows], length=length,
+                                     stock=s.stock[rows] if critic.stock else None).float()
     legal, adv, ret = s.legal[rows], adv_all[rows], ret_all[rows]
     log_probs = torch.log_softmax(logits.masked_fill(~legal, -1.0e30), dim=-1)
     log_ratio = (log_probs.gather(-1, s.actions[rows].unsqueeze(-1)).squeeze(-1) - s.logp[rows]) * w
@@ -307,19 +339,32 @@ def ppo_minibatch(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Op
     policy_loss = -(torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv) * w).sum() / total
     entropy_rows = -(log_probs.exp() * log_probs).sum(dim=-1)
     entropy = (entropy_rows * w).sum() / total
-    value_loss = (F.smooth_l1_loss(value, ret, reduction="none") * w).sum() / total
+    if critic.value_bins:  # cross-entropy against the two-hot return (mean-preserving bins)
+        value_rows = -(two_hot(ret, critic.support) * torch.log_softmax(value, -1)).sum(-1)
+    else:
+        value_rows = F.smooth_l1_loss(value, ret, reduction="none")
+    value_loss = (value_rows * w).sum() / total
     loss = policy_loss - entropy_coef * entropy + args.value_coef * value_loss
-    optimizer.zero_grad(set_to_none=True)
+    if belief is not None:
+        hand = card_plane(s.opp_hand[rows].reshape(-1), torch.float32).view(*rows.shape, -1)
+        belief_rows = F.binary_cross_entropy_with_logits(belief_logits, hand, reduction="none").mean(-1)
+        belief_loss = (belief_rows * w).sum() / total
+        loss = loss + args.belief_coef * belief_loss
+    else:
+        belief_loss = torch.zeros((), device=w.device)
+    nets.optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    nn.utils.clip_grad_norm_(params, args.grad_clip, foreach=True)
-    optimizer.step()
+    for group in nets.clip_groups:
+        nn.utils.clip_grad_norm_(group, args.grad_clip, foreach=True)
+    nets.optimizer.step()
     with torch.no_grad():
         kl = (((ratio - 1) - log_ratio) * w).sum() / total
         kl_out.copy_(kl)
         gs = gostop[rows].float() * w
         sums += torch.stack((policy_loss.detach(), value_loss.detach(), entropy.detach(), kl,
                              ((((ratio - 1).abs() > args.clip).float()) * w).sum() / total,
-                             torch.ones_like(kl), (entropy_rows.detach() * gs).sum(), gs.sum()))
+                             torch.ones_like(kl), (entropy_rows.detach() * gs).sum(), gs.sum(),
+                             belief_loss.detach()))
 
 
 class UpdateGraphs:
@@ -336,11 +381,10 @@ class UpdateGraphs:
 
     QUANTUM = 4
 
-    def __init__(self, actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer,
-                 storage: SeqStorage, log: GameLog, args: argparse.Namespace, max_decisions: int = 64) -> None:
-        self.actor, self.critic, self.optimizer, self.storage, self.log, self.args = (
-            actor, critic, optimizer, storage, log, args)
-        self.params = [*actor.parameters(), *critic.parameters()]
+    def __init__(self, nets: Nets, storage: SeqStorage, log: GameLog, args: argparse.Namespace,
+                 max_decisions: int = 64) -> None:
+        self.nets, self.optimizer, self.storage, self.log, self.args = nets, nets.optimizer, storage, log, args
+        self.params = nets.params
         dev = storage.device
         self.dummy = 2 * log.count.shape[0]  # one past the last (game, seat) sequence: all padding
         self.max_q = max_decisions
@@ -349,7 +393,7 @@ class UpdateGraphs:
         self.seat = torch.zeros(self.dummy + 1, dtype=torch.int64, device=dev)
         self.batch = torch.zeros(0, dtype=torch.int64, device=dev)
         self.entropy_coef = torch.zeros((), device=dev)
-        self.sums = torch.zeros(8, device=dev)
+        self.sums = torch.zeros(STAT_SLOTS, device=dev)
         self.kl = torch.zeros((), device=dev)
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.pool = None
@@ -393,9 +437,8 @@ class UpdateGraphs:
         h = self.log
         hb = HistBatch(h.events.index_select(0, games), h.count.index_select(0, games),
                        h.start.index_select(0, games), self.seat.index_select(0, seqs))
-        ppo_minibatch(self.actor, self.critic, self.optimizer, self.params, self.storage, hb, rows.clamp_min(0),
-                      rows >= 0, length, self.adv, self.ret, self.gostop, self.args, self.entropy_coef,
-                      self.sums, self.kl)
+        ppo_minibatch(self.nets, self.storage, hb, rows.clamp_min(0), rows >= 0, length, self.adv, self.ret,
+                      self.gostop, self.args, self.entropy_coef, self.sums, self.kl)
 
     def _capture(self, length: int, q: int) -> torch.cuda.CUDAGraph:
         # Warm up eagerly (cuBLAS, compiled kernels for this shape), then undo that
@@ -446,9 +489,9 @@ class UpdateGraphs:
         graph.replay()
 
 
-def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer, storage: SeqStorage,
-           data: SeqRollout, args: argparse.Namespace, entropy_coef: float,
+def update(nets: Nets, storage: SeqStorage, data: SeqRollout, args: argparse.Namespace, entropy_coef: float,
            graphs: "UpdateGraphs | None" = None) -> TrainStats:
+    actor, critic = nets.actor, nets.critic
     n = storage.size
     s = storage
     t = _phase("start", time.perf_counter())
@@ -461,21 +504,28 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
         for seqs, length, q in g.batches(4 * args.minibatch, shuffle=False, bucket=len(g)):
             hb, rows, valid = g.take(seqs, q)
             at = torch.where(valid, rows, n).flatten()
-            values.index_copy_(0, at, run_games(critic, g, hb, rows, True, length).float().flatten())
+            values.index_copy_(0, at, critic.value(run_games(critic, g, hb, rows, True, length)).flatten())
         values = values[:n]
     t = _phase("values", t)
     adv_all = g.advantages(values, data.returns, args.gae_lambda)
     ret_all = adv_all + values
     explained_var = 1.0 - float((data.returns - values).var() / data.returns.var().clamp_min(1e-8))
+    gostop = s.features[:n, s.gostop_column] > 0.5
+    if args.gostop_baseline:
+        # At Go/Stop the value of stopping is known: the points it settles now. Measured
+        # against it, a stop has (almost) zero advantage and a go the return it earned
+        # beyond stopping; the critic's error at these states drops out. It does not
+        # depend on the action taken, so the policy gradient stays unbiased. (Side
+        # payments made earlier in the game, e.g. ppuk, sit outside it.)
+        stop_value = s.stop_points[:n].float() / args.reward_scale
+        adv_all = torch.where(gostop & (s.stop_points[:n] > 0), ret_all - stop_value, adv_all)
     t = _phase("advantages", t)
 
-    params = [*actor.parameters(), *critic.parameters()]
-    gostop = s.features[:n, s.gostop_column] > 0.5
     actor.train()
     critic.train()
     plan = g.batches(args.minibatch, shuffle=True, bucket=args.length_bucket)
     if graphs is None:
-        sums = torch.zeros(8, device=s.device)
+        sums = torch.zeros(STAT_SLOTS, device=s.device)
         kl = torch.zeros((), device=s.device)
         coef = torch.full((), entropy_coef, device=s.device)
     else:
@@ -489,8 +539,7 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
         for seqs, length, q in plan:
             if graphs is None:
                 hb, rows, valid = g.take(seqs, q)
-                ppo_minibatch(actor, critic, optimizer, params, s, hb, rows, valid, length, adv_all, ret_all,
-                              gostop, args, coef, sums, kl)
+                ppo_minibatch(nets, s, hb, rows, valid, length, adv_all, ret_all, gostop, args, coef, sums, kl)
             else:
                 graphs.run(seqs, length, q)
             updates += 1
@@ -515,7 +564,82 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
     return TrainStats(policy_loss=t[0] / count, value_loss=t[1] / count, entropy=t[2] / count,
                       entropy_gostop=t[6] / t[7] if t[7] else float("nan"), kl=t[3] / count,
                       clipfrac=t[4] / count, explained_var=explained_var, updates=updates,
-                      epochs=updates / max(1, len(plan)))
+                      epochs=updates / max(1, len(plan)), belief_loss=t[8] / count)
+
+
+def _fit(old: torch.Tensor, new: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Old tensor reshaped onto the new one: equal shapes pass, a matrix that gained input
+    columns (new oracle inputs, appended last) is zero-padded, anything else restarts at
+    zero. Returns (tensor, whether it was kept whole)."""
+    if old.shape == new.shape:
+        return old, True
+    if old.dim() == 2 and new.dim() == 2 and old.shape[0] == new.shape[0] and old.shape[1] < new.shape[1]:
+        out = new.new_zeros(new.shape, dtype=old.dtype)
+        out[:, :old.shape[1]] = old
+        return out, True
+    return torch.zeros_like(new, dtype=old.dtype), False
+
+
+def fit_state(saved: dict, module: nn.Module) -> tuple[dict, list[str]]:
+    """A checkpoint's state dict fitted to `module` (see _fit); names the tensors that restarted."""
+    out, restarted = {}, []
+    for name, tensor in module.state_dict().items():
+        if name not in saved:
+            out[name] = tensor
+            restarted.append(name)
+            continue
+        out[name], kept = _fit(saved[name], tensor)
+        if not kept:
+            restarted.append(name)
+    return out, restarted
+
+
+def optimizer_names(nets: Nets) -> list[list[str]]:
+    actor = [f"actor.{n}" for n, _ in nets.actor.named_parameters()]
+    rest = [f"critic.{n}" for n, _ in nets.critic.named_parameters()]
+    if nets.belief is not None:
+        rest += [f"belief.{n}" for n, _ in nets.belief.named_parameters()]
+    return [actor, rest]
+
+
+def fit_optimizer(payload: dict, nets: Nets) -> dict:
+    """The checkpoint's Adam state laid out for this optimizer's groups, matched by
+    parameter name. Checkpoints before the actor/critic split had one group in
+    actor-then-critic order. New parameters start without state; reshaped ones as _fit
+    says, with their step count reset when they restart."""
+    saved = payload["optimizer"]
+    names = payload.get("optimizer_names")
+    if names is None:
+        critic_names = [f"critic.{n}" for n in payload["critic"] if not n.startswith("support")]
+        names = [[f"actor.{n}" for n, _ in nets.actor.named_parameters()] + critic_names]
+    old_ids = [i for group in saved["param_groups"] for i in group["params"]]
+    flat = [name for group in names for name in group]
+    by_name = {name: saved["state"].get(i) for name, i in zip(flat, old_ids)}
+    current = {f"actor.{n}": p for n, p in nets.actor.named_parameters()}
+    current |= {f"critic.{n}": p for n, p in nets.critic.named_parameters()}
+    if nets.belief is not None:
+        current |= {f"belief.{n}": p for n, p in nets.belief.named_parameters()}
+    state, groups, k = {}, [], 0
+    for g, group_names in enumerate(optimizer_names(nets)):
+        ids = []
+        for name in group_names:
+            old = by_name.get(name)
+            if old is not None:
+                fitted, whole = {}, True
+                for key, value in old.items():
+                    if torch.is_tensor(value) and value.dim() > 0:
+                        value, kept = _fit(value, current[name])
+                        whole &= kept
+                    fitted[key] = value
+                if not whole and torch.is_tensor(fitted.get("step")):
+                    fitted["step"] = torch.zeros_like(fitted["step"])
+                state[k] = fitted
+            ids.append(k)
+            k += 1
+        group = dict(saved["param_groups"][min(g, len(saved["param_groups"]) - 1)])
+        group["params"] = ids
+        groups.append(group)
+    return {"state": state, "param_groups": groups}
 
 
 def frozen(model: nn.Module, args: argparse.Namespace, state: dict | None = None) -> nn.Module:
@@ -569,6 +693,18 @@ def main() -> None:
                         help="replay the PPO minibatch step as CUDA graphs (needs --collector graph)")
     parser.add_argument("--length-bucket", type=int, default=0,
                         help="sort each window of N minibatches by game length (0 = off)")
+    parser.add_argument("--attention", choices=("sdpa", "math"), default="sdpa",
+                        help="training attention kernel; math lets torch.compile fuse it")
+    parser.add_argument("--gostop-baseline", action="store_true",
+                        help="measure Go/Stop advantages against the known value of stopping")
+    parser.add_argument("--value-bins", type=int, default=0,
+                        help="distributional critic over N symlog-spaced bins (0 = smooth L1 regression)")
+    parser.add_argument("--value-top", type=float, default=640.0, help="largest |scaled return| the bins reach")
+    parser.add_argument("--critic-stock", action="store_true", help="the critic also sees the next 8 stock draws")
+    parser.add_argument("--belief-coef", type=float, default=0.0,
+                        help="weight of the actor's opponent-hand prediction loss (0 = no belief head)")
+    parser.add_argument("--critic-warmup", type=int, default=0,
+                        help="first N iterations of this invocation train only the critic and belief head")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -579,19 +715,29 @@ def main() -> None:
     storage = SeqStorage(args.games * args.storage_per_game, device, stored_columns(args.mode))
 
     actor = seq_actor(args.mode, args.d_model, args.layers, args.heads).to(device)
-    critic = seq_critic(args.mode, args.d_model, args.layers, args.heads).to(device)
+    critic = seq_critic(args.mode, args.d_model, args.layers, args.heads, stock=args.critic_stock,
+                        value_bins=args.value_bins, value_top=args.value_top).to(device)
+    belief = BeliefHead(args.d_model).to(device) if args.belief_coef > 0 else None
     ema_actor = frozen(actor, args)
-    optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5, fused=True,
-                                 capturable=args.update_graphs)
+    optimizer = torch.optim.Adam(
+        [{"params": list(actor.parameters())},
+         {"params": [*critic.parameters(), *(belief.parameters() if belief is not None else [])]}],
+        lr=args.lr, eps=1e-5, fused=True, capturable=args.update_graphs)
+    nets = Nets(actor, critic, belief, optimizer)
     start_iteration = 0
+    restarted: list[str] = []
     if args.init is not None:
         payload = load_checkpoint(args.init, device)
         actor.load_state_dict(payload["actor"])
-        critic.load_state_dict(payload["critic"])
+        critic_state, restarted = fit_state(payload["critic"], critic)
+        critic.load_state_dict(critic_state)
+        if belief is not None and "belief" in payload:
+            belief.load_state_dict(payload["belief"])
         ema_actor.load_state_dict(payload["actor_ema"])
-        optimizer.load_state_dict(payload["optimizer"])
-        for group in optimizer.param_groups:  # the checkpoint's setting would override ours
+        optimizer.load_state_dict(fit_optimizer(payload, nets))
+        for group in optimizer.param_groups:  # the checkpoint's settings would override ours
             group["capturable"] = args.update_graphs
+            group["lr"] = args.lr
         start_iteration = int(payload["iteration"])
     ema_params, actor_params = list(ema_actor.parameters()), list(actor.parameters())
     snapshots: list[nn.Module] = []
@@ -602,6 +748,15 @@ def main() -> None:
             if path.exists():
                 snapshots.append(frozen(actor, args, load_checkpoint(path, device)["actor_ema"]))
         del snapshots[:-args.pool_size]
+    for model in (actor, critic):
+        model.attention = args.attention
+    # Learning rates live on the GPU: the captured Adam steps read them on every replay
+    # (a float would be baked into each graph), so the warm-up switch needs no recapture.
+    for group in optimizer.param_groups:
+        group["lr"] = torch.tensor(float(group["lr"]), device=device)
+    warm_until = start_iteration + args.critic_warmup
+    if args.critic_warmup > 0:
+        optimizer.param_groups[0]["lr"].fill_(0.0)  # hold the actor while the critic catches up
     if args.compile:
         # Only the encoder stack (every training forward goes through _encode); event and
         # query counts vary per batch. The self-play graph uses cached_step and stays eager.
@@ -617,7 +772,7 @@ def main() -> None:
         log = GameLog(args.games, device)
     if args.update_graphs and log is None:
         raise SystemExit("--update-graphs needs --collector graph (its event log stays at one address)")
-    graphs = UpdateGraphs(actor, critic, optimizer, storage, log, args) if args.update_graphs else None
+    graphs = UpdateGraphs(nets, storage, log, args) if args.update_graphs else None
 
     algorithm = "seq-ppo-v1"
     print(f"torch={torch.__version__} device={torch.cuda.get_device_name(0)}")
@@ -630,6 +785,9 @@ def main() -> None:
           f"compile={int(args.compile)} start_iteration={start_iteration} pool={len(snapshots)} "
           f"collector={args.collector} wave={args.wave} length_bucket={args.length_bucket} "
           f"update_graphs={int(args.update_graphs)}")
+    print(f"attention={args.attention} gostop_baseline={int(args.gostop_baseline)} value_bins={args.value_bins} "
+          f"value_top={args.value_top:g} critic_stock={int(args.critic_stock)} belief_coef={args.belief_coef:g} "
+          f"critic_warmup={args.critic_warmup} critic_restarted={','.join(restarted) or 'none'}")
     if args.reference:  # every invocation, so a resumed log records the reference it evaluates against
         print(f"reference={args.reference.as_posix()} reference_policy=auto")
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()} | {"algorithm": algorithm, "feature_contract": CONTRACT}
@@ -650,9 +808,11 @@ def main() -> None:
         else:
             data = collect_eager(ext, actor, snapshots, args.games, seed_offset,
                                  args.pool_fraction if snapshots else 0.0, False, args.reward_scale, storage)
+        if args.critic_warmup > 0 and iteration == warm_until + 1:
+            optimizer.param_groups[0]["lr"].fill_(args.lr)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        stats = update(actor, critic, optimizer, storage, data, args, entropy_coef, graphs)
+        stats = update(nets, storage, data, args, entropy_coef, graphs)
         with torch.no_grad():
             torch._foreach_lerp_(ema_params, actor_params, 1.0 - args.ema_decay)
         torch.cuda.synchronize()
@@ -671,6 +831,8 @@ def main() -> None:
               f"ppo_entropy_gostop={stats.entropy_gostop:.6f} ppo_kl={stats.kl:.6f} "
               f"ppo_clipfrac={stats.clipfrac:.4f} ppo_explained_var={stats.explained_var:.4f} "
               f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}"
+              + (f" belief_loss={stats.belief_loss:.5f}" if belief is not None else "")
+              + (" critic_warmup=1" if iteration <= warm_until else "")
               + ("" if graphs is None else f" update_graphs={len(graphs.graphs)}"), flush=True)
 
         if args.pool_every > 0 and iteration % args.pool_every == 0:
@@ -683,7 +845,8 @@ def main() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"iteration": iteration, "actor": actor.state_dict(), "critic": critic.state_dict(),
                         "actor_ema": ema_actor.state_dict(), "optimizer": optimizer.state_dict(),
-                        "config": config}, path)
+                        "optimizer_names": optimizer_names(nets), "config": config}
+                       | ({"belief": belief.state_dict()} if belief is not None else {}), path)
             print(f"checkpoint={path}", flush=True)
 
         if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):

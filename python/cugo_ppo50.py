@@ -208,6 +208,7 @@ class TrainStats:
     explained_var: float
     updates: int
     epochs: float
+    belief_loss: float = float("nan")
 
 
 def _critic_input(features: torch.Tensor, opp_hand: torch.Tensor) -> torch.Tensor:

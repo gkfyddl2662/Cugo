@@ -37,8 +37,8 @@ As of October 2026:
 | --- | --- | --- |
 | `ppo_h1500_v3` | 3×512 residual MLP, PPO | reference |
 | `ppo_j` (paused at iteration 200) | 4×2048 residual MLP, PPO | +2.0 |
-| `seq_hybrid` (in training, iteration 200) | 4-layer transformer, events + 720 features | −171 |
-| `seq_events` (iteration 250) | 4-layer transformer, events only | −224 |
+| `seq_hybrid` (in training, iteration 650) | 4-layer transformer, events + 720 features | −49 |
+| `seq_events` (retired at iteration 300) | 4-layer transformer, events only | −218 |
 
 Sequence models are trained from scratch and are still improving. The
 events-only variant plateaued well below the hybrid one.

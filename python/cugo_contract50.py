@@ -27,12 +27,18 @@ from typing import Any
 import torch
 
 CONTRACT = 4
+STOP_POINTS_COLUMN = 471  # log2(1 + points stopping now would settle) / 12, at Go/Stop
 V4_REUSED = [*range(396, 447), 452, 471, 474, *range(491, 496), 710, 711]
 CONTEXT_V3 = [*range(200, 250), *range(396, 453), *range(471, 476), 552]
 # Events-mode query columns: the v3 decision context, then own hand, table counts
 # and the round multiplier.
 CONTEXT_INDEX = [*CONTEXT_V3, *range(0, 50), *range(491, 496), 557, 710, 711]
 _FEATURES = 720
+
+
+def stop_points(features: torch.Tensor) -> torch.Tensor:
+    """Exact settled points of stopping now from the fp32 features (0 off Go/Stop)."""
+    return torch.round(torch.exp2(12.0 * features[:, STOP_POINTS_COLUMN].float()) - 1.0).long()
 
 
 def checkpoint_contract(payload: dict[str, Any]) -> int:

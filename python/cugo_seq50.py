@@ -35,12 +35,40 @@ KINDS = 12  # ActionKind50
 EVENT_SLOTS = 8  # played, own drawn, flipped, my gain, opp gain, my loss, opp loss, shown
 EVENT_IN = EVENT_SLOTS * 50 + KINDS + 2
 START_IN = 5 * 50 + 12 + 8 + 4
+STOCK_DRAWS = 8  # stock_indexed packs the next 8 draws, one card id per byte
+STOCK_FEATURES = STOCK_DRAWS * 50
 # Events-mode query columns (contract v4, see cugo_contract50): the decision
 # context (pending public cards, floor-choice cards, decision kind, first-player
 # bit, opponent hand count, post-chance scalars, Gukjin prompt flag), own hand,
 # capture counts and the round multiplier.
 
 _BITS: dict[torch.device, torch.Tensor] = {}
+
+
+def stock_planes(stock: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """[..., 8 * 50] one-hot of the next 8 stock draws (packed by ext.stock_indexed)."""
+    shifts = torch.arange(0, 8 * STOCK_DRAWS, 8, device=stock.device)
+    cards = (stock.unsqueeze(-1) >> shifts) & 0xFF
+    planes = cards.unsqueeze(-1) == torch.arange(50, device=stock.device)  # 0xFF matches no card
+    return planes.flatten(-2).to(dtype)
+
+
+def value_support(bins: int, top: float) -> torch.Tensor:
+    """Bin centers spaced evenly in symlog space over [-top, top] (scaled return units)."""
+    u = torch.linspace(-1.0, 1.0, bins, dtype=torch.float64) * torch.log1p(torch.tensor(top, dtype=torch.float64))
+    return (torch.sign(u) * torch.expm1(u.abs())).float()
+
+
+def two_hot(y: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    """Target distribution over the bins whose mean is exactly y (clamped to the support)."""
+    y = torch.minimum(torch.maximum(y, support[0]), support[-1])  # tensor bounds: no host sync in graphs
+    hi = torch.searchsorted(support, y.contiguous()).clamp(1, support.numel() - 1)
+    lo = hi - 1
+    w_hi = ((y - support[lo]) / (support[hi] - support[lo])).clamp(0.0, 1.0)
+    target = y.new_zeros(*y.shape, support.numel())
+    target.scatter_(-1, lo.unsqueeze(-1), (1.0 - w_hi).unsqueeze(-1))
+    target.scatter_add_(-1, hi.unsqueeze(-1), w_hi.unsqueeze(-1))
+    return target
 
 
 def _bits(x: torch.Tensor, width: int = 50) -> torch.Tensor:
@@ -133,13 +161,22 @@ class SeqNet(nn.Module):
     uses_history = True
 
     def __init__(self, mode: str, outputs: int, d_model: int = 256, layers: int = 4, heads: int = 8,
-                 oracle: bool = False) -> None:
+                 oracle: bool = False, stock: bool = False, value_bins: int = 0, value_top: float = 40.0) -> None:
         super().__init__()
         if mode not in ("hybrid", "events"):
             raise ValueError("mode must be hybrid or events")
-        self.mode, self.oracle = mode, oracle
+        if stock and not oracle:
+            raise ValueError("the stock order is an oracle input")
+        self.mode, self.oracle, self.stock = mode, oracle, stock
+        # "math" spells attention out so torch.compile fuses it (training only: it
+        # materializes the scores, which costs memory at inference batch sizes).
+        self.attention = "sdpa"
         query_in = (FEATURES if mode == "hybrid" else len(CONTEXT_INDEX)) + ACTIONS
-        query_in += ORACLE_FEATURES if oracle else 0
+        query_in += (ORACLE_FEATURES if oracle else 0) + (STOCK_FEATURES if stock else 0)
+        if value_bins:
+            outputs = value_bins
+            self.register_buffer("support", value_support(value_bins, value_top), persistent=False)
+        self.value_bins = value_bins
         self.register_buffer("context_index", torch.tensor(CONTEXT_INDEX), persistent=False)
         self.event_in = nn.Linear(EVENT_IN, d_model)
         self.start_in = nn.Linear(START_IN, d_model)
@@ -158,7 +195,7 @@ class SeqNet(nn.Module):
         return torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else self.event_in.weight.dtype
 
     def _query(self, features: torch.Tensor, legal: torch.Tensor, opp_hand: torch.Tensor | None,
-               dtype: torch.dtype) -> torch.Tensor:
+               dtype: torch.dtype, stock: torch.Tensor | None = None) -> torch.Tensor:
         # Events-mode callers may pass the 720 features or only the stored CONTEXT_INDEX columns.
         if self.mode == "events" and features.shape[-1] == FEATURES:
             features = features.index_select(-1, self.context_index)
@@ -166,6 +203,8 @@ class SeqNet(nn.Module):
         parts = [query.to(dtype), legal.to(dtype)]
         if self.oracle:
             parts.append(card_plane(opp_hand.reshape(-1), dtype).view(*opp_hand.shape, -1))
+        if self.stock:
+            parts.append(stock_planes(stock, dtype))
         return self.query_in(torch.cat(parts, -1)) + self.token_type[2]
 
     def _prefix(self, hist: HistBatch, length: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
@@ -180,6 +219,12 @@ class SeqNet(nn.Module):
         out = self.head(self.norm(h))
         return out.squeeze(-1) if out.shape[-1] == 1 else out
 
+    def value(self, out: torch.Tensor) -> torch.Tensor:
+        """Critic output -> expected scaled return (the mean of the bin distribution)."""
+        if not self.value_bins:
+            return out.float()
+        return (torch.softmax(out.float(), -1) * self.support).sum(-1)  # elementwise: stays fp32 under autocast
+
     def _encode(self, x: torch.Tensor, allowed: torch.Tensor) -> torch.Tensor:
         """Pre-norm encoder stack over [B, T, d]; allowed [B, T, T] is True where a query may attend.
 
@@ -193,7 +238,12 @@ class SeqNet(nn.Module):
             attn = layer.self_attn
             q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, -1)
             q, k, v = (z.reshape(b, t, heads, d // heads).transpose(1, 2) for z in (q, k, v))
-            a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            if self.attention == "math":
+                s = (q @ k.transpose(-1, -2)) * (d // heads) ** -0.5
+                s = s.masked_fill(~mask, float("-inf"))
+                a = torch.softmax(s.float(), -1).to(q.dtype) @ v
+            else:
+                a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
             x = x + attn.out_proj(a.transpose(1, 2).reshape(b, t, d))
             x = x + layer.linear2(layer.activation(layer.linear1(layer.norm2(x))))
         return x
@@ -215,20 +265,22 @@ class SeqNet(nn.Module):
         return self._out(h[:, -1])
 
     def forward_games(self, hist: HistBatch, features: torch.Tensor, legal: torch.Tensor, seen: torch.Tensor,
-                      opp_hand: torch.Tensor | None = None, length: int | None = None) -> torch.Tensor:
+                      opp_hand: torch.Tensor | None = None, length: int | None = None,
+                      stock: torch.Tensor | None = None, hidden: bool = False):
         """Every decision of one (game, seat) at once: [opening, all events, queries...].
 
         hist.count is the game's full event count; features/legal/seen/opp_hand are
         [S, Q, ...] per decision, seen[s, q] = events visible at that decision. Each
         query sees the opening, events < seen and itself, so row q equals forward()
         on that decision alone. Returns [S, Q, outputs]. Passing length (>= the
-        largest event count) avoids reading it back from the GPU.
+        largest event count) avoids reading it back from the GPU. hidden=True also
+        returns the final hidden states [S, Q, d] (for auxiliary heads).
         """
         dtype = self._dtype()
         length = max(1, int(hist.count.max())) if length is None else max(1, length)
         prefix, _ = self._prefix(hist, length, dtype)
         q = seen.shape[1]
-        x = torch.cat((prefix, self._query(features, legal, opp_hand, dtype)), 1)
+        x = torch.cat((prefix, self._query(features, legal, opp_hand, dtype, stock)), 1)
         t = length + 1 + q
         dev = x.device
         allowed = torch.zeros(seen.shape[0], t, t, dtype=torch.bool, device=dev)
@@ -236,8 +288,8 @@ class SeqNet(nn.Module):
         allowed[:, 1:length + 1, 1:length + 1] = torch.ones(length, length, dtype=torch.bool, device=dev).tril()
         allowed[:, length + 1:, 1:length + 1] = torch.arange(length, device=dev).view(1, 1, -1) < seen.unsqueeze(-1)
         allowed[:, length + 1:, length + 1:] = torch.eye(q, dtype=torch.bool, device=dev)
-        h = self._encode(x, allowed)
-        return self._out(h[:, length + 1:])
+        h = self._encode(x, allowed)[:, length + 1:]
+        return (self._out(h), h) if hidden else self._out(h)
 
     # Incremental inference. Opening and event tokens only attend backwards, so their
     # keys/values never change once computed: self-play caches them per (game, seat)
@@ -323,8 +375,23 @@ def seq_actor(mode: str, d_model: int, layers: int, heads: int) -> SeqNet:
     return SeqNet(mode, ACTIONS, d_model, layers, heads)
 
 
-def seq_critic(mode: str, d_model: int, layers: int, heads: int) -> SeqNet:
-    return SeqNet(mode, 1, d_model, layers, heads, oracle=True)
+def seq_critic(mode: str, d_model: int, layers: int, heads: int, stock: bool = False,
+               value_bins: int = 0, value_top: float = 40.0) -> SeqNet:
+    return SeqNet(mode, 1, d_model, layers, heads, oracle=True, stock=stock, value_bins=value_bins,
+                  value_top=value_top)
+
+
+class BeliefHead(nn.Module):
+    """Auxiliary actor head: which cards the opponent holds, from the decision's hidden
+    state. Trained against the true hand so the shared trunk learns to track it."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, d_model), nn.GELU(),
+                                 nn.Linear(d_model, ORACLE_FEATURES))
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h)
 
 
 def policy_logits(model: nn.Module, features: torch.Tensor, legal: torch.Tensor,

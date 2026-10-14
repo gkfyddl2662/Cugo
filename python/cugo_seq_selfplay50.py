@@ -19,6 +19,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from cugo_contract50 import stop_points
 from cugo_ppo_nets50 import ACTIONS, make_seeds
 from cugo_seq50 import EVENT_WORDS, MAX_EVENTS, START_WORDS, KVCache, SeqNet
 
@@ -66,7 +67,7 @@ class WaveCollector:
         self.rec_legal = torch.zeros((s, w, ACTIONS), dtype=torch.bool, device=device)
         self.rec_logp = torch.zeros((s, w), dtype=torch.float32, device=device)
         self.rec_long = {name: torch.zeros((s, w), dtype=torch.int64, device=device)
-                         for name in ("actions", "opp_hand", "seat", "count")}
+                         for name in ("actions", "opp_hand", "stock", "stop_points", "seat", "count")}
         self.rec_valid = torch.zeros((s, w), dtype=torch.bool, device=device)
         self.step_index = torch.zeros(1, dtype=torch.int64, device=device)
         self.final_reward0 = torch.zeros(w, device=device)
@@ -129,13 +130,15 @@ class WaveCollector:
         logp = torch.log_softmax(masked, 1).gather(1, actions.unsqueeze(1)).squeeze(1)
 
         hands = self.ext.hands_indexed(self.states, ids)
+        stock = self.ext.stock_indexed(self.states, ids)
         kept = features if self.columns is None else features.index_select(1, self.columns)
         at = self.step_index
         self.rec_features.index_copy_(0, at, kept.to(torch.bfloat16).unsqueeze(0))
         self.rec_legal.index_copy_(0, at, legal.unsqueeze(0))
         self.rec_logp.index_copy_(0, at, logp.unsqueeze(0))
         for name, value in (("actions", actions), ("seat", player), ("count", self.count),
-                            ("opp_hand", hands.gather(1, (1 - player).unsqueeze(1)).squeeze(1))):
+                            ("opp_hand", hands.gather(1, (1 - player).unsqueeze(1)).squeeze(1)),
+                            ("stock", stock), ("stop_points", stop_points(features))):
             self.rec_long[name].index_copy_(0, at, value.unsqueeze(0))
         self.rec_valid.index_copy_(0, at, (active & learner_move).unsqueeze(0))
 
@@ -218,7 +221,9 @@ class WaveCollector:
                 s_idx, g_idx = at[:, 0], at[:, 1]
                 storage.append(features=self.rec_features[s_idx, g_idx], legal=self.rec_legal[s_idx, g_idx],
                                actions=self.rec_long["actions"][s_idx, g_idx], logp=self.rec_logp[s_idx, g_idx],
-                               opp_hand=self.rec_long["opp_hand"][s_idx, g_idx], env_ids=offset + g_idx,
+                               opp_hand=self.rec_long["opp_hand"][s_idx, g_idx],
+                               stock=self.rec_long["stock"][s_idx, g_idx],
+                               stop_points=self.rec_long["stop_points"][s_idx, g_idx], env_ids=offset + g_idx,
                                seat=self.rec_long["seat"][s_idx, g_idx],
                                count=self.rec_long["count"][s_idx, g_idx])
                 log.events[part] = self.events
