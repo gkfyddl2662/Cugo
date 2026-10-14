@@ -172,30 +172,61 @@ def redeal_worlds(ext: Any, states: torch.Tensor, env_rows: torch.Tensor, seat: 
     return out
 
 
+ROLLOUT_CHECK = 4  # steps between host reads of how many rollouts are still running
+
+
 def _greedy_to_end(ext: Any, actor: nn.Module, opponent: nn.Module | None, child: torch.Tensor,
                    reward0: torch.Tensor, done: torch.Tensor, me: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
+    """Final score (seat 0) of each child after greedy play to the end.
+
+    A finished game ignores further actions and keeps reporting its final score, so the
+    batch keeps its shape for ROLLOUT_CHECK steps between host reads and is compacted
+    only when under 60% of it is still running."""
     final = torch.where(done, reward0, 0.0)
     ids = torch.nonzero(~done).squeeze(1)
-    for _ in range(ROLLOUT_STEPS):
-        if ids.numel() == 0:
-            return final
-        features, legal, players, _, _ = ext.observe_indexed(child, ids)
-        step = _act(actor, features, legal, True)[0]
-        if opponent is not None:
-            other = torch.nonzero(pool.index_select(0, ids) & (players.to(torch.int64) != me.index_select(0, ids))).squeeze(1)
-            if other.numel():
-                step.index_copy_(0, other, _act(opponent, features.index_select(0, other),
-                                                legal.index_select(0, other), True)[0])
-        reward, new_done, _, _, _ = ext.step_indexed(child, ids, step)
-        final.index_copy_(0, ids, torch.where(new_done, reward, 0.0))
-        ids = ids.index_select(0, torch.nonzero(~new_done).squeeze(1))
-    raise RuntimeError(f"rollout did not finish within {ROLLOUT_STEPS} steps")
+    steps = 0
+    while ids.numel():
+        # rows of pool games, where the pool opponent plays its own seat
+        pool_rows = torch.nonzero(pool.index_select(0, ids)).squeeze(1) if opponent is not None else None
+        pool_me = me.index_select(0, ids).index_select(0, pool_rows) if pool_rows is not None else None
+        for _ in range(ROLLOUT_CHECK):
+            features, legal, players, _, _ = ext.observe_indexed(child, ids)
+            step = _act(actor, features, legal, True)[0]
+            if pool_rows is not None and pool_rows.numel():
+                f, l = features.index_select(0, pool_rows), legal.index_select(0, pool_rows)
+                theirs = players.index_select(0, pool_rows).to(torch.int64) != pool_me
+                step.index_copy_(0, pool_rows, torch.where(theirs, _act(opponent, f, l, True)[0],
+                                                           step.index_select(0, pool_rows)))
+            reward, new_done, _, _, _ = ext.step_indexed(child, ids, step)
+            final.index_copy_(0, ids, reward)
+        steps += ROLLOUT_CHECK
+        running = int((~new_done).sum())
+        if running == 0:
+            break
+        if steps >= ROLLOUT_STEPS:
+            raise RuntimeError(f"rollout did not finish within {ROLLOUT_STEPS} steps")
+        if running < 0.6 * ids.numel():
+            ids = ids.index_select(0, torch.nonzero(~new_done).squeeze(1))
+    return final
 
 
-def world_values(ext: Any, actor: nn.Module, opponent: nn.Module | None, states: torch.Tensor,
-                 env_rows: torch.Tensor, seat: torch.Tensor, vs_pool: torch.Tensor, branch: torch.Tensor,
-                 reward_scale: float, worlds: int) -> torch.Tensor:
-    """[R, ACTIONS] fp16 Q of each branched action, averaged over redealt worlds (NaN elsewhere)."""
+def _child_values(ext: Any, critic: nn.Module, child: torch.Tensor, reward0: torch.Tensor, done: torch.Tensor,
+                  me: torch.Tensor, reward_scale: float) -> torch.Tensor:
+    """Scaled value for `me` of each child one step in: final score, else the oracle critic."""
+    ids = torch.arange(child.shape[0], device=child.device)
+    features, _, players, _, _ = ext.observe_indexed(child, ids)
+    mover = players.to(torch.int64)
+    opp_hand = ext.hands_indexed(child, ids).gather(1, (1 - mover).unsqueeze(1)).squeeze(1)
+    stock = ext.stock_indexed(child, ids) if critic.stock else None
+    v = critic.value(critic(_critic_input(features, opp_hand, stock)))
+    v = torch.where(mover == me, v, -v)
+    return torch.where(done, torch.where(me == 0, reward0, -reward0) / reward_scale, v)
+
+
+def _world_q(ext: Any, actor: nn.Module, opponent: nn.Module | None, critic: nn.Module | None,
+             states: torch.Tensor, env_rows: torch.Tensor, seat: torch.Tensor, vs_pool: torch.Tensor,
+             branch: torch.Tensor, reward_scale: float, worlds: int, depth: int) -> torch.Tensor:
+    """[worlds, R, ACTIONS] fp32 Q per redealt world (0 where not branched)."""
     w = redeal_worlds(ext, states, env_rows, seat, worlds)
     seat_k, pool_k, branch_k = seat.repeat(worlds), vs_pool.repeat(worlds), branch.repeat(worlds, 1)
     rows, acts = torch.nonzero(branch_k, as_tuple=True)
@@ -204,9 +235,38 @@ def world_values(ext: Any, actor: nn.Module, opponent: nn.Module | None, states:
         r, a = rows[i:i + Q_CHUNK], acts[i:i + Q_CHUNK]
         me, pool = seat_k.index_select(0, r), pool_k.index_select(0, r)
         child, reward0, done = ext.branch_indexed(w, r, a)[:3]
-        final = _greedy_to_end(ext, actor, opponent, child, reward0, done, me, pool)
-        q[r, a] = torch.where(me == 0, final, -final) / reward_scale
-    q = q.view(worlds, *branch.shape).mean(0)
+        if depth == 1:
+            q[r, a] = _child_values(ext, critic, child, reward0, done, me, reward_scale)
+        else:
+            final = _greedy_to_end(ext, actor, opponent, child, reward0, done, me, pool)
+            q[r, a] = torch.where(me == 0, final, -final) / reward_scale
+    return q.view(worlds, *branch.shape)
+
+
+def world_values(ext: Any, actor: nn.Module, opponent: nn.Module | None, states: torch.Tensor,
+                 env_rows: torch.Tensor, seat: torch.Tensor, vs_pool: torch.Tensor, branch: torch.Tensor,
+                 reward_scale: float, worlds: int, critic: nn.Module | None = None, depth: int = 0,
+                 first: int = 0) -> torch.Tensor:
+    """[R, ACTIONS] fp16 Q of each branched action, averaged over redealt worlds (NaN elsewhere).
+
+    depth 0 plays each branch to the end; depth 1 scores the child with the oracle critic in
+    that world. first > 0 starts with that many worlds and deals the rest only to decisions
+    whose best action differs between those first worlds."""
+    args = (ext, actor, opponent, critic)
+    if 0 < first < worlds:
+        q = _world_q(*args, states, env_rows, seat, vs_pool, branch, reward_scale, first, depth)
+        best = q.masked_fill(~branch, float("-inf")).argmax(-1)
+        total, count = q.sum(0), torch.full((branch.shape[0], 1), float(first), device=branch.device)
+        rows = torch.nonzero((best != best[:1]).any(0)).squeeze(1)
+        if rows.numel():
+            more = _world_q(*args, states, env_rows.index_select(0, rows), seat.index_select(0, rows),
+                            vs_pool.index_select(0, rows), branch.index_select(0, rows), reward_scale,
+                            worlds - first, depth)
+            total.index_add_(0, rows, more.sum(0))
+            count.index_fill_(0, rows, float(worlds))
+        q = total / count
+    else:
+        q = _world_q(*args, states, env_rows, seat, vs_pool, branch, reward_scale, worlds, depth).mean(0)
     return torch.where(branch, q, float("nan")).to(torch.float16)
 
 
@@ -274,6 +334,9 @@ def collect(
     branch_max_top: float = 2.0,
     q_source: str = "critic",
     worlds: int = 4,
+    world_depth: int = 0,
+    worlds_first: int = 0,
+    branch_fraction: float = 1.0,
 ) -> Rollout:
     """Self-play games; with storage.all_actions also the Q of the branched actions."""
     if storage.all_actions and q_source == "critic" and critic is None:
@@ -337,11 +400,14 @@ def collect(
             if storage.all_actions:
                 probs = log_probs.exp()
                 open_ = probs.max(1).values < branch_max_top
+                if branch_fraction < 1.0:  # an unbiased subsample of the decisions worth branching
+                    open_ &= torch.rand(open_.shape, device=open_.device) < branch_fraction
                 branch = own_legal & (probs >= branch_min_prob) & open_.unsqueeze(1)
                 branch.scatter_(1, a.unsqueeze(1), branch.gather(1, a.unsqueeze(1)) | open_.unsqueeze(1))
                 if q_source == "worlds":
                     q = world_values(ext, actor, opponent_model, states, env_rows, seat,
-                                     opp.index_select(0, rows) >= 0, branch, reward_scale, worlds)
+                                     opp.index_select(0, rows) >= 0, branch, reward_scale, worlds,
+                                     critic=critic, depth=world_depth, first=worlds_first)
                 else:
                     q = action_values(ext, critic, states, env_rows, seat, branch, reward_scale)
                 extra = (q, log_probs.clamp_min(-60.0).to(torch.float16))
@@ -457,7 +523,7 @@ class PpoUpdater:
                  storage: RolloutStorage, minibatch: int, clip: float, value_coef: float,
                  grad_clip: float, use_graph: bool = True, belief: nn.Module | None = None,
                  belief_coef: float = 0.0, mc_coef: float = 1.0, policy_target: str = "pg",
-                 improve_kl: float = 0.02) -> None:
+                 improve_kl: float = 0.02, plain_coef: float = 1.0) -> None:
         self.actor, self.critic, self.optimizer, self.storage = actor, critic, optimizer, storage
         self.minibatch, self.clip, self.value_coef, self.grad_clip = minibatch, clip, value_coef, grad_clip
         self.belief, self.belief_coef = belief, belief_coef
@@ -465,6 +531,7 @@ class PpoUpdater:
         if policy_target not in ("pg", "improve"):
             raise ValueError("policy_target must be pg or improve")
         self.policy_target, self.improve_kl = policy_target, improve_kl
+        self.plain_coef = plain_coef  # all-action mode: weight of the usual PPO term on unbranched decisions
         self.use_graph = use_graph
         d = storage.device
         self.params = [p for group in optimizer.param_groups for p in group["params"]]
@@ -526,7 +593,7 @@ class PpoUpdater:
                 residual = ret - q.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
                 surr_mc = torch.min(ratio * residual, ratio.clamp(1 - self.clip, 1 + self.clip) * residual)
                 rows = -((p_old * surr_all).sum(1) + self.mc_coef * surr_mc)
-            policy_loss = torch.where(has, rows, plain).mean()
+            policy_loss = torch.where(has, rows, self.plain_coef * plain).mean()
         else:
             policy_loss = plain.mean()
         entropy_rows = -(log_probs.exp() * log_probs).sum(dim=1)
