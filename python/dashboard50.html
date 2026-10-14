@@ -402,9 +402,12 @@ function lineChart(card, cfg) {
 
   const tip = h("div", { class: "tip", hidden: true });
   plot.append(tip);
-  let idx = -1;
-  function show(i) {
-    idx = Math.max(0, Math.min(xs.length - 1, i));
+  // Hover snaps to iterations where some series has a value (evals are sparse on a shared x axis).
+  const pts = xs.map((_, i) => i).filter((i) => cfg.series.some((sr) => sr.values[i] != null && isFinite(sr.values[i])));
+  let pos = -1, idx = -1;
+  function show(p) {
+    pos = Math.max(0, Math.min(pts.length - 1, p));
+    idx = pts[pos];
     const px = X(xs[idx]);
     cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
     tip.replaceChildren(h("div", { class: "th" }, "iter " + intFmt.format(xs[idx])));
@@ -425,23 +428,23 @@ function lineChart(card, cfg) {
     tip.hidden = true; cross.setAttribute("visibility", "hidden");
     dots.forEach((d) => d.setAttribute("visibility", "hidden"));
   }
-  function nearest(clientX) {
+  function nearest(clientX) {  // position in pts of the closest iteration with data
     const r = svg.getBoundingClientRect();
     const vx = ((clientX - r.left) / r.width) * W;
     const target = x0 + ((vx - M.l) / (W - M.l - M.r)) * (x1 - x0);
-    let lo = 0, hi = xs.length - 1;
-    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (xs[mid] < target) lo = mid; else hi = mid; }
-    return Math.abs(xs[lo] - target) <= Math.abs(xs[hi] - target) ? lo : hi;
+    let lo = 0, hi = pts.length - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (xs[pts[mid]] < target) lo = mid; else hi = mid; }
+    return Math.abs(xs[pts[lo]] - target) <= Math.abs(xs[pts[hi]] - target) ? lo : hi;
   }
   hit.addEventListener("pointermove", (e) => show(nearest(e.clientX)));
   hit.addEventListener("pointerleave", hide);
   plot.tabIndex = 0;
-  plot.onfocus = () => show(idx < 0 ? xs.length - 1 : idx);
+  plot.onfocus = () => show(pos < 0 ? pts.length - 1 : pos);
   plot.onblur = hide;
   plot.onkeydown = (e) => {
-    const step = e.shiftKey ? Math.ceil(xs.length / 20) : 1;
-    if (e.key === "ArrowLeft") { show(idx - step); e.preventDefault(); }
-    if (e.key === "ArrowRight") { show(idx + step); e.preventDefault(); }
+    const step = e.shiftKey ? Math.ceil(pts.length / 20) : 1;
+    if (e.key === "ArrowLeft") { show(pos - step); e.preventDefault(); }
+    if (e.key === "ArrowRight") { show(pos + step); e.preventDefault(); }
   };
 }
 
