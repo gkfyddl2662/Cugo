@@ -5,14 +5,24 @@ a critic that also sees the opponent's hidden hand (unbiased baseline, lower
 variance), and an optional pool of frozen opponents. The same loop trains an
 exploiter when every game pits the learner against one frozen target.
 
-All-action mode (all_actions=True) branches every legal action of every learner
-decision one step with ext.branch_indexed and scores the child with the oracle
-critic. The branch replays the real stock, so the child already holds the flip
-that action would get: Q(a) = +-V(child), or the final score when the action
-ends the deal. The policy
-then learns from every action at once, plus the sampled action's return minus
-its Q as a control variate, which keeps the gradient unbiased whatever the
-critic's error.
+All-action mode (all_actions=True) branches legal actions of learner decisions
+one step with ext.branch_indexed and scores the child with the oracle critic.
+The branch replays the real stock, so the child already holds the flip that
+action would get: Q(a) = +-V(child), or the final score when the action ends
+the deal. Only actions that can move the policy are branched: those with
+probability >= branch_min_prob, at decisions whose top action is below
+branch_max_top, plus the sampled action there (a policy-gradient term scales
+with the action's probability, so a 0.1% action's Q barely registers).
+
+Two ways to learn from the Qs ("policy_target"):
+- "pg": the clipped surrogate in expectation over the branched actions with
+  A(a) = Q(a) - (their pi_old-weighted mean), plus the sampled action's
+  (return - Q) control variate: unbiased whatever the critic's error.
+  Decisions without branches fall back to the usual PPO term.
+- "improve": move toward pi*(a) ~ pi_old(a) exp(A(a) / tau) by cross-entropy
+  (MPO-style), tau chosen each iteration so KL(pi* || pi_old) averages
+  improve_kl. Can raise a low-probability action that the Qs favour, which "pg"
+  cannot; biased by critic error. Wants every action branched.
 """
 
 from __future__ import annotations
@@ -67,10 +77,10 @@ Q_CHUNK = 65536  # children per critic pass (a 2048-wide hidden layer is 256 MB 
 
 
 def action_values(ext: Any, critic: nn.Module, states: torch.Tensor, env_rows: torch.Tensor,
-                  seat: torch.Tensor, legal: torch.Tensor, reward_scale: float) -> torch.Tensor:
-    """[R, ACTIONS] fp16 Q of every legal action for the player to move (0 where illegal)."""
-    rows, acts = torch.nonzero(legal, as_tuple=True)
-    q = torch.zeros(legal.shape, dtype=torch.float16, device=legal.device)
+                  seat: torch.Tensor, branch: torch.Tensor, reward_scale: float) -> torch.Tensor:
+    """[R, ACTIONS] fp16 Q for the player to move of each action marked in branch (NaN elsewhere)."""
+    rows, acts = torch.nonzero(branch, as_tuple=True)
+    q = torch.full(branch.shape, float("nan"), dtype=torch.float16, device=branch.device)
     me = seat.index_select(0, rows)
     for i in range(0, rows.numel(), Q_CHUNK):
         r, a, m = rows[i:i + Q_CHUNK], acts[i:i + Q_CHUNK], me[i:i + Q_CHUNK]
@@ -147,6 +157,8 @@ def collect(
     storage: RolloutStorage,
     max_steps: int = 128,
     critic: nn.Module | None = None,
+    branch_min_prob: float = 0.0,
+    branch_max_top: float = 2.0,
 ) -> Rollout:
     """Self-play games; with critic (and storage.all_actions) also every action's Q."""
     if storage.all_actions and critic is None:
@@ -208,7 +220,11 @@ def collect(
             opp_hand = hands.gather(1, (1 - seat).unsqueeze(1)).squeeze(1)
             extra = ()
             if storage.all_actions:
-                extra = (action_values(ext, critic, states, env_rows, seat, own_legal, reward_scale),
+                probs = log_probs.exp()
+                open_ = probs.max(1).values < branch_max_top
+                branch = own_legal & (probs >= branch_min_prob) & open_.unsqueeze(1)
+                branch.scatter_(1, a.unsqueeze(1), branch.gather(1, a.unsqueeze(1)) | open_.unsqueeze(1))
+                extra = (action_values(ext, critic, states, env_rows, seat, branch, reward_scale),
                          log_probs.clamp_min(-60.0).to(torch.float16))
             storage.append(features.index_select(0, rows), own_legal,
                            a, logp, opp_hand, env_rows, seat, ext.stock_indexed(states, env_rows), *extra)
@@ -249,6 +265,15 @@ def collect(
     )
 
 
+def _branch_advantages(q_raw: torch.Tensor, old_logp: torch.Tensor, legal: torch.Tensor):
+    """Branched mask, A(a) = Q(a) - pi_old-weighted mean Q over the branched actions (0 elsewhere), Q (0 for NaN)."""
+    branched = ~torch.isnan(q_raw) & legal
+    q = torch.where(branched, q_raw.float(), 0.0)
+    p = old_logp.exp() * branched
+    mean = (p * q).sum(1, keepdim=True) / p.sum(1, keepdim=True).clamp_min(1e-12)
+    return branched, torch.where(branched, q - mean, 0.0), q
+
+
 @dataclass
 class TrainStats:
     policy_loss: float
@@ -261,7 +286,8 @@ class TrainStats:
     updates: int
     epochs: float
     belief_loss: float = float("nan")
-    q_explained_var: float = float("nan")  # 1 - Var(return - Q(taken action)) / Var(return)
+    q_explained_var: float = float("nan")  # 1 - Var(return - Q(taken action)) / Var(return), branched rows
+    inv_temp: float = float("nan")  # 1 / tau of the "improve" target
 
 
 def _critic_input(features: torch.Tensor, opp_hand: torch.Tensor, stock: torch.Tensor | None = None) -> torch.Tensor:
@@ -311,11 +337,15 @@ class PpoUpdater:
     def __init__(self, actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer,
                  storage: RolloutStorage, minibatch: int, clip: float, value_coef: float,
                  grad_clip: float, use_graph: bool = True, belief: nn.Module | None = None,
-                 belief_coef: float = 0.0, mc_coef: float = 1.0) -> None:
+                 belief_coef: float = 0.0, mc_coef: float = 1.0, policy_target: str = "pg",
+                 improve_kl: float = 0.02) -> None:
         self.actor, self.critic, self.optimizer, self.storage = actor, critic, optimizer, storage
         self.minibatch, self.clip, self.value_coef, self.grad_clip = minibatch, clip, value_coef, grad_clip
         self.belief, self.belief_coef = belief, belief_coef
         self.mc_coef = mc_coef  # weight of the sampled action's (return - Q) term in all-action mode
+        if policy_target not in ("pg", "improve"):
+            raise ValueError("policy_target must be pg or improve")
+        self.policy_target, self.improve_kl = policy_target, improve_kl
         self.use_graph = use_graph
         d = storage.device
         self.params = [p for group in optimizer.param_groups for p in group["params"]]
@@ -329,6 +359,7 @@ class PpoUpdater:
         # policy, value, entropy, kl, clipfrac, count, gostop entropy sum, gostop count, belief
         self.sums = torch.zeros(9, device=d)
         self.kl = torch.zeros((), device=d)
+        self.inv_temp = torch.zeros((), device=d)  # 1 / tau of the "improve" target
         self.graph: torch.cuda.CUDAGraph | None = None
         self._bind()
 
@@ -358,21 +389,27 @@ class PpoUpdater:
         new_logp = log_probs.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
         log_ratio = new_logp - logp_old[idx]
         ratio = log_ratio.exp()
+        plain = -torch.min(ratio * adv, ratio.clamp(1 - self.clip, 1 + self.clip) * adv)
         if self.storage.all_actions:
-            # Expected clipped surrogate over every action under the behaviour policy, with
-            # A(a) = Q(a) - sum_b pi_old(b) Q(b); plus the sampled action's (return - Q) term.
             q_store, old_store = self.storage.extra
-            q = q_store[idx].float()
             old_all = old_store[idx].float()
-            p_old = old_all.exp() * legal
-            adv_all = q - (p_old * q).sum(1, keepdim=True)
-            r_all = (log_probs - old_all).clamp_max(20.0).exp()
-            surr_all = torch.minimum(r_all * adv_all, r_all.clamp(1 - self.clip, 1 + self.clip) * adv_all)
-            residual = ret - q.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
-            surr_mc = torch.min(ratio * residual, ratio.clamp(1 - self.clip, 1 + self.clip) * residual)
-            policy_loss = -((p_old * surr_all).sum(1) + self.mc_coef * surr_mc).mean()
+            branched, adv_all, q = _branch_advantages(q_store[idx], old_all, legal)
+            has = branched.any(1)
+            if self.policy_target == "improve":
+                target = torch.softmax((old_all + self.inv_temp * adv_all).masked_fill(~legal, -1.0e30), 1)
+                rows = -(target * torch.where(legal, log_probs, 0.0)).sum(1)
+            else:
+                # Expected clipped surrogate over the branched actions under the behaviour policy,
+                # plus the sampled action's (return - Q) term; the sampled action is always branched.
+                p_old = old_all.exp() * branched
+                r_all = (log_probs - old_all).clamp_max(20.0).exp()
+                surr_all = torch.minimum(r_all * adv_all, r_all.clamp(1 - self.clip, 1 + self.clip) * adv_all)
+                residual = ret - q.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
+                surr_mc = torch.min(ratio * residual, ratio.clamp(1 - self.clip, 1 + self.clip) * residual)
+                rows = -((p_old * surr_all).sum(1) + self.mc_coef * surr_mc)
+            policy_loss = torch.where(has, rows, plain).mean()
         else:
-            policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - self.clip, 1 + self.clip) * adv).mean()
+            policy_loss = plain.mean()
         entropy_rows = -(log_probs.exp() * log_probs).sum(dim=1)
         entropy = entropy_rows.mean()
         if critic.value_bins:  # cross-entropy against the two-hot return (mean-preserving bins)
@@ -433,6 +470,28 @@ class PpoUpdater:
             self.sums.copy_(saved)
         self.graph.replay()
 
+    def _solve_inv_temp(self, n: int, legal_all: torch.Tensor, sample: int = 65536) -> float:
+        """1/tau with mean KL(pi* || pi_old) = improve_kl over branched decisions (bisection in log space)."""
+        q_store, old_store = self.storage.extra
+        rows = torch.randint(n, (min(n, sample),), device=legal_all.device)
+        legal = legal_all[rows]
+        old = old_store[rows].float().masked_fill(~legal, -1.0e30)
+        old = old - torch.logsumexp(old, 1, keepdim=True)
+        branched, adv, _ = _branch_advantages(q_store[rows], old, legal)
+        keep = branched.any(1)
+        old, adv, legal = old[keep], adv[keep], legal[keep]
+
+        def kl(beta: float) -> float:
+            z = (old + beta * adv).masked_fill(~legal, -1.0e30)
+            log_target = torch.log_softmax(z, 1)
+            return float((log_target.exp() * torch.where(legal, log_target - old, 0.0)).sum(1).mean())
+
+        lo, hi = -8.0, 12.0
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if kl(float(torch.exp(torch.tensor(mid)))) < self.improve_kl else (lo, mid)
+        return float(torch.exp(torch.tensor(0.5 * (lo + hi))))
+
     def _advantages(self, values: torch.Tensor, returns: torch.Tensor, lam: float) -> torch.Tensor:
         n = values.numel()
         return gae_advantages(values, returns, self.storage.tensors[5][:n], self.storage.tensors[6][:n], lam)
@@ -458,7 +517,11 @@ class PpoUpdater:
         q_explained_var = float("nan")
         if self.storage.all_actions:
             q_taken = self.storage.extra[0][:n].gather(1, data.actions.unsqueeze(1)).squeeze(1).float()
-            q_explained_var = 1.0 - float((data.returns - q_taken).var() / data.returns.var().clamp_min(1e-8))
+            ok = ~torch.isnan(q_taken)
+            ret_b = data.returns[ok]
+            q_explained_var = 1.0 - float((ret_b - q_taken[ok]).var() / ret_b.var().clamp_min(1e-8))
+            if self.policy_target == "improve":
+                self.inv_temp.fill_(self._solve_inv_temp(n, data.legal))
 
         self.actor.train()
         self.critic.train()
@@ -486,4 +549,5 @@ class PpoUpdater:
             kl=s[3] / count, clipfrac=s[4] / count, explained_var=explained_var,
             updates=updates, epochs=updates / max(1, n // self.minibatch), belief_loss=s[8] / count,
             q_explained_var=q_explained_var,
+            inv_temp=float(self.inv_temp) if self.policy_target == "improve" else float("nan"),
         )

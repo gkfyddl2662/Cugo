@@ -85,6 +85,16 @@ def main() -> None:
                         help="branch every legal action one step and learn from the critic's Q of each")
     parser.add_argument("--mc-coef", type=float, default=1.0,
                         help="all-action mode: weight of the sampled action's (return - Q) term (1 = unbiased)")
+    parser.add_argument("--policy-target", choices=("pg", "improve"), default="pg",
+                        help="all-action mode: unbiased all-action gradient, or MPO-style pi_old*exp(A/tau) target")
+    parser.add_argument("--improve-kl", type=float, default=0.02,
+                        help="'improve': tau is set each iteration so KL(target || pi_old) averages this")
+    parser.add_argument("--branch-min-prob", type=float, default=None,
+                        help="all-action mode: branch actions with at least this probability "
+                             "(default 0.01 for pg, 0 for improve)")
+    parser.add_argument("--branch-max-top", type=float, default=None,
+                        help="all-action mode: skip decisions whose top action has at least this probability "
+                             "(default 0.99 for pg, never for improve)")
     parser.add_argument("--critic-warmup", type=int, default=0,
                         help="first N iterations of this invocation train only the critic and belief head")
     args = parser.parse_args()
@@ -95,6 +105,11 @@ def main() -> None:
     # Fail fast instead of spilling into shared system memory (Windows sysmem fallback).
     torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     ext = load_extension()
+    improve = args.policy_target == "improve"
+    if args.branch_min_prob is None:
+        args.branch_min_prob = 0.0 if improve else 0.01
+    if args.branch_max_top is None:
+        args.branch_max_top = 2.0 if improve else 0.99
     if args.all_actions and args.exploiter:
         raise SystemExit("--all-actions needs self-play: the critic only knows the learner's side in --exploiter")
     storage = RolloutStorage(args.games * 26, device, all_actions=args.all_actions)
@@ -170,7 +185,9 @@ def main() -> None:
     print(f"value_bins={args.value_bins} value_top={args.value_top:g} critic_stock={int(args.critic_stock)} "
           f"belief_coef={args.belief_coef:g} critic_warmup={args.critic_warmup} "
           f"critic_restarted={','.join(restarted) or 'none'} memory_fraction={args.memory_fraction:g} "
-          f"all_actions={int(args.all_actions)} mc_coef={args.mc_coef:g}")
+          f"all_actions={int(args.all_actions)} mc_coef={args.mc_coef:g} policy_target={args.policy_target} "
+          f"improve_kl={args.improve_kl:g} branch_min_prob={args.branch_min_prob:g} "
+          f"branch_max_top={args.branch_max_top:g}")
     if args.reference is not None:  # every invocation, so a resumed log records the reference it evaluates against
         print(f"reference={args.reference.as_posix()} reference_policy={args.reference_policy}")
     config = vars(args) | {"algorithm": "ppo-oracle-critic-v1", "feature_contract": CONTRACT}
@@ -193,7 +210,8 @@ def main() -> None:
                        seed_offset=(args.seed * 10_000_000 + iteration) * args.games,
                        pool_fraction=pool_fraction if opponent is not None else 0.0, pool_greedy=args.pool_greedy,
                        reward_scale=args.reward_scale, storage=storage,
-                       critic=critic if args.all_actions else None)
+                       critic=critic if args.all_actions else None,
+                       branch_min_prob=args.branch_min_prob, branch_max_top=args.branch_max_top)
         if opponent is not None and not any(opponent is m for m in fixed_pool):
             opponent.cpu()
         torch.cuda.synchronize()
@@ -203,7 +221,8 @@ def main() -> None:
         if updater is None:
             updater = PpoUpdater(actor, critic, optimizer, storage, args.minibatch, args.clip,
                                  args.value_coef, args.grad_clip, use_graph=not args.no_graph,
-                                 belief=belief, belief_coef=args.belief_coef, mc_coef=args.mc_coef)
+                                 belief=belief, belief_coef=args.belief_coef, mc_coef=args.mc_coef,
+                                 policy_target=args.policy_target, improve_kl=args.improve_kl)
         stats = updater.update(data, args.epochs, entropy_coef, args.target_kl, args.gae_lambda)
         with torch.no_grad():
             torch._foreach_lerp_(ema_params, actor_params, 1.0 - args.ema_decay)
@@ -227,6 +246,7 @@ def main() -> None:
               f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}"
               + (f" belief_loss={stats.belief_loss:.5f}" if belief is not None else "")
               + (f" q_explained_var={stats.q_explained_var:.4f}" if args.all_actions else "")
+              + (f" improve_inv_temp={stats.inv_temp:.4g}" if args.all_actions and improve else "")
               + (" critic_warmup=1" if iteration <= warm_until else ""))
 
         if not args.exploiter and args.pool_every > 0 and iteration % args.pool_every == 0:
