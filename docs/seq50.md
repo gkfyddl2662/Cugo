@@ -79,6 +79,25 @@ The MLP trainer (`train_ppo50.py`) takes the same `--value-bins`, `--value-top`,
 
 Head to head at 400 the new options scored −1.35 [−2.84, +0.15] points per pair. Again no strength gain, at 2 GB more memory, so `ppo_j` continues from the baseline arm.
 
+### All-action training (MLP)
+
+`train_ppo50.py --all-actions` branches every legal action of every learner decision one step (`ext.branch_indexed`; 5.6 legal actions per decision on average, 7.9 M children per iteration) and scores each child with the oracle critic. The branch replays the real stock, so the child already holds the flip that action gets: Q(a) = ±V(child), or the final score when the action ends the deal. The policy loss is the clipped surrogate taken in expectation over all actions under the behaviour policy, with A(a) = Q(a) − Σ π_old(b) Q(b), plus the sampled action's (return − Q) term (`--mc-coef`, default 1), which keeps the gradient unbiased whatever the critic's error. Not for `--exploiter`: there the critic only knows the learner's side.
+
+A/B from `ppo_j` at 900, 200 iterations each (league, 131,072 deal pairs):
+
+| | Baseline | `--all-actions` |
+| --- | ---: | ---: |
+| vs. `ppo_h1500_v3` at 1100 | +3.47 [+1.88, +5.05] | +4.57 [+2.79, +6.36] |
+| vs. `ppo_j` at 900 | −0.90 [−2.39, +0.60] | −0.04 [−1.48, +1.40] |
+| self-play / update per iteration | 1.4 s / 7.4 s | 7.7 s / 7.5 s |
+| explained variance: V(h) / Q(taken action) | 0.33 / – | 0.33 / 0.37 |
+
+Head to head at 1100 the all-action arm scored +0.79 [−0.81, +2.38] points per pair: ahead on every comparison but not significant, at 1.7 times the wall-clock. `ppo_j` continues with it from 1100. Pool snapshots wait in host memory and only the iteration's opponent visits the GPU; 16 snapshots of a 2048×4 actor (140 MB each) would not fit beside the 1.2 GB of all-action buffers.
+
+### Exploiter
+
+`--exploiter --opponent T --init T --reference T` trains a copy of T against T alone; its margin over T is a lower bound on T's exploitability. Pass `--pool-greedy` so T plays greedy, as it is deployed: against a sampling T (about 8 points weaker) the exploiter learned that weaker policy's leaks and lost 2.3 points to greedy T after 200 iterations. With `--pool-greedy` and lr 4e-5, 200 iterations against `ppo_j` at 900 peaked at +0.56 [−0.71, +1.82] and ended at −0.17 [−1.59, +1.24]: no weakness found at that budget, which is a weak bound, not proof of none.
+
 Learning rates are GPU tensors, so the replayed Adam steps of `--update-graphs` read the current value and the warm-up switch needs no recapture. The optimizer has two groups (actor; critic and belief head) and gradients are clipped per network. Older single-group checkpoints are mapped by parameter name.
 
 The critic's value pre-pass runs in length-sorted batches (1.20 s to 0.93 s per iteration); it is GPU-bound, so capturing it as CUDA graphs gained nothing.

@@ -81,6 +81,10 @@ def main() -> None:
     parser.add_argument("--belief-coef", type=float, default=0.0,
                         help="weight of the actor's opponent-hand prediction loss (0 = no belief head)")
     parser.add_argument("--belief-width", type=int, default=512, help="hidden width of the belief head")
+    parser.add_argument("--all-actions", action="store_true",
+                        help="branch every legal action one step and learn from the critic's Q of each")
+    parser.add_argument("--mc-coef", type=float, default=1.0,
+                        help="all-action mode: weight of the sampled action's (return - Q) term (1 = unbiased)")
     parser.add_argument("--critic-warmup", type=int, default=0,
                         help="first N iterations of this invocation train only the critic and belief head")
     args = parser.parse_args()
@@ -91,7 +95,9 @@ def main() -> None:
     # Fail fast instead of spilling into shared system memory (Windows sysmem fallback).
     torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     ext = load_extension()
-    storage = RolloutStorage(args.games * 26, device)
+    if args.all_actions and args.exploiter:
+        raise SystemExit("--all-actions needs self-play: the critic only knows the learner's side in --exploiter")
+    storage = RolloutStorage(args.games * 26, device, all_actions=args.all_actions)
     updater: PpoUpdater | None = None
 
     actor = PpoActor(args.hidden, args.blocks, args.norm).to(device)
@@ -128,6 +134,15 @@ def main() -> None:
     if args.resume is not None:
         optimizer.load_state_dict(fit_optimizer(payload, actor, critic, belief))
         start_iteration = int(payload["iteration"])
+        if not args.exploiter and args.pool_every > 0:
+            # A snapshot taken at iteration k is the EMA actor saved in that iteration's checkpoint.
+            for k in range(args.pool_every, start_iteration + 1, args.pool_every):
+                path = args.resume.parent / f"iter_{k:06d}.pt"
+                if path.exists():
+                    snapshot = PpoActor(args.hidden, args.blocks, args.norm).to(device)
+                    snapshot.load_state_dict(load_ppo(path, device)["actor_ema"])
+                    snapshots.append(frozen(snapshot).cpu())
+            del snapshots[:-args.pool_size]
     # Learning rates live on the GPU: the captured update step reads them on every replay
     # (a float would be baked into the graph), so the warm-up switch needs no recapture.
     for group in optimizer.param_groups:
@@ -136,15 +151,6 @@ def main() -> None:
     warm_until = start_iteration + args.critic_warmup
     if args.critic_warmup > 0:
         optimizer.param_groups[0]["lr"].fill_(0.0)  # hold the actor while the critic catches up
-        if not args.exploiter and args.pool_every > 0:
-            # A snapshot taken at iteration k is the EMA actor saved in that iteration's checkpoint.
-            for k in range(args.pool_every, start_iteration + 1, args.pool_every):
-                path = args.resume.parent / f"iter_{k:06d}.pt"
-                if path.exists():
-                    snapshot = PpoActor(args.hidden, args.blocks, args.norm).to(device)
-                    snapshot.load_state_dict(load_ppo(path, device)["actor_ema"])
-                    snapshots.append(frozen(snapshot))
-            del snapshots[:-args.pool_size]
     if args.exploiter and not fixed_pool:
         raise SystemExit("--exploiter needs at least one --opponent")
     pool_fraction = 1.0 if args.exploiter else args.pool_fraction
@@ -163,7 +169,8 @@ def main() -> None:
           f"target_kl={args.target_kl:g} reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g}")
     print(f"value_bins={args.value_bins} value_top={args.value_top:g} critic_stock={int(args.critic_stock)} "
           f"belief_coef={args.belief_coef:g} critic_warmup={args.critic_warmup} "
-          f"critic_restarted={','.join(restarted) or 'none'} memory_fraction={args.memory_fraction:g}")
+          f"critic_restarted={','.join(restarted) or 'none'} memory_fraction={args.memory_fraction:g} "
+          f"all_actions={int(args.all_actions)} mc_coef={args.mc_coef:g}")
     if args.reference is not None:  # every invocation, so a resumed log records the reference it evaluates against
         print(f"reference={args.reference.as_posix()} reference_policy={args.reference_policy}")
     config = vars(args) | {"algorithm": "ppo-oracle-critic-v1", "feature_contract": CONTRACT}
@@ -176,12 +183,19 @@ def main() -> None:
         final = args.entropy if args.entropy_final is None else args.entropy_final
         entropy_coef = args.entropy + (final - args.entropy) * frac
         pool = fixed_pool + snapshots
+        # One opponent per iteration. Snapshots wait in host memory (16 x 140 MB at 2048x4
+        # would not fit beside the all-action buffers); the chosen one visits the GPU.
+        opponent = pool[int(torch.randint(len(pool), ()))].to(device) if pool and pool_fraction > 0 else None
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        data = collect(ext, actor, pool, args.games, seed_offset=(args.seed * 10_000_000 + iteration) * args.games,
-                       pool_fraction=pool_fraction if pool else 0.0, pool_greedy=args.pool_greedy,
-                       reward_scale=args.reward_scale, storage=storage)
+        data = collect(ext, actor, [opponent] if opponent is not None else [], args.games,
+                       seed_offset=(args.seed * 10_000_000 + iteration) * args.games,
+                       pool_fraction=pool_fraction if opponent is not None else 0.0, pool_greedy=args.pool_greedy,
+                       reward_scale=args.reward_scale, storage=storage,
+                       critic=critic if args.all_actions else None)
+        if opponent is not None and not any(opponent is m for m in fixed_pool):
+            opponent.cpu()
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         if args.critic_warmup > 0 and iteration == warm_until + 1:
@@ -189,7 +203,7 @@ def main() -> None:
         if updater is None:
             updater = PpoUpdater(actor, critic, optimizer, storage, args.minibatch, args.clip,
                                  args.value_coef, args.grad_clip, use_graph=not args.no_graph,
-                                 belief=belief, belief_coef=args.belief_coef)
+                                 belief=belief, belief_coef=args.belief_coef, mc_coef=args.mc_coef)
         stats = updater.update(data, args.epochs, entropy_coef, args.target_kl, args.gae_lambda)
         with torch.no_grad():
             torch._foreach_lerp_(ema_params, actor_params, 1.0 - args.ema_decay)
@@ -212,11 +226,12 @@ def main() -> None:
               f"ppo_clipfrac={stats.clipfrac:.4f} ppo_explained_var={stats.explained_var:.4f} "
               f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}"
               + (f" belief_loss={stats.belief_loss:.5f}" if belief is not None else "")
+              + (f" q_explained_var={stats.q_explained_var:.4f}" if args.all_actions else "")
               + (" critic_warmup=1" if iteration <= warm_until else ""))
 
         if not args.exploiter and args.pool_every > 0 and iteration % args.pool_every == 0:
             # The EMA is the release policy; the raw actor can swing between updates.
-            snapshots.append(frozen(ema_actor))
+            snapshots.append(frozen(ema_actor).cpu())
             del snapshots[:-args.pool_size]
 
         # Checkpoint first: a failed evaluation must not lose the iteration.

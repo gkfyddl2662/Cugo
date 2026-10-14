@@ -4,6 +4,15 @@ On-policy PPO with an entropy bonus (MMD-style regularization toward uniform),
 a critic that also sees the opponent's hidden hand (unbiased baseline, lower
 variance), and an optional pool of frozen opponents. The same loop trains an
 exploiter when every game pits the learner against one frozen target.
+
+All-action mode (all_actions=True) branches every legal action of every learner
+decision one step with ext.branch_indexed and scores the child with the oracle
+critic. The branch replays the real stock, so the child already holds the flip
+that action would get: Q(a) = +-V(child), or the final score when the action
+ends the deal. The policy
+then learns from every action at once, plus the sampled action's return minus
+its Q as a control variate, which keeps the gradient unbiased whatever the
+critic's error.
 """
 
 from __future__ import annotations
@@ -43,14 +52,39 @@ def _logits(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return (out[0] if isinstance(out, tuple) else out).float()
 
 
-def _act(model: nn.Module, features: torch.Tensor, legal: torch.Tensor, greedy: bool):
+def _act(model: nn.Module, features: torch.Tensor, legal: torch.Tensor, greedy: bool, full: bool = False):
     masked = _logits(model, features).masked_fill(~legal, -1.0e30)
     if greedy:
         actions = masked.argmax(dim=1)
     else:
         actions = torch.multinomial(torch.softmax(masked, dim=1), 1).squeeze(1)
-    logp = torch.log_softmax(masked, dim=1).gather(1, actions.unsqueeze(1)).squeeze(1)
-    return actions, logp
+    log_probs = torch.log_softmax(masked, dim=1)
+    logp = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    return (actions, logp, log_probs) if full else (actions, logp)
+
+
+Q_CHUNK = 65536  # children per critic pass (a 2048-wide hidden layer is 256 MB at this size)
+
+
+def action_values(ext: Any, critic: nn.Module, states: torch.Tensor, env_rows: torch.Tensor,
+                  seat: torch.Tensor, legal: torch.Tensor, reward_scale: float) -> torch.Tensor:
+    """[R, ACTIONS] fp16 Q of every legal action for the player to move (0 where illegal)."""
+    rows, acts = torch.nonzero(legal, as_tuple=True)
+    q = torch.zeros(legal.shape, dtype=torch.float16, device=legal.device)
+    me = seat.index_select(0, rows)
+    for i in range(0, rows.numel(), Q_CHUNK):
+        r, a, m = rows[i:i + Q_CHUNK], acts[i:i + Q_CHUNK], me[i:i + Q_CHUNK]
+        child, reward0, done = ext.branch_indexed(states, env_rows.index_select(0, r), a)[:3]
+        ids = torch.arange(child.shape[0], device=child.device)
+        features, _, players, _, _ = ext.observe_indexed(child, ids)
+        mover = players.to(torch.int64)
+        opp_hand = ext.hands_indexed(child, ids).gather(1, (1 - mover).unsqueeze(1)).squeeze(1)
+        stock = ext.stock_indexed(child, ids) if critic.stock else None
+        v = critic.value(critic(_critic_input(features, opp_hand, stock)))
+        v = torch.where(mover == m, v, -v)  # zero-sum: the opponent's value is ours negated
+        final = torch.where(m == 0, reward0, -reward0) / reward_scale
+        q[r, a] = torch.where(done, final, v).to(torch.float16)
+    return q
 
 
 class RolloutStorage:
@@ -60,15 +94,20 @@ class RolloutStorage:
     the overflow silently spills into shared system memory instead of failing.
     """
 
-    def __init__(self, capacity: int, device: torch.device) -> None:
+    def __init__(self, capacity: int, device: torch.device, all_actions: bool = False) -> None:
         self.capacity = 0
         self.device = device
         self.size = 0
+        self.all_actions = all_actions
+        self.extra: tuple[torch.Tensor, ...] = ()
         self._allocate(capacity)
 
     def _allocate(self, capacity: int) -> None:
-        old = self.__dict__.get("tensors")
+        old, old_extra = self.__dict__.get("tensors"), self.extra
         d = self.device
+        if self.all_actions:  # Q of every action, behaviour log-probs of every action (fp16: 0.6 GB each)
+            self.extra = (torch.empty((capacity, ACTIONS), dtype=torch.float16, device=d),
+                          torch.empty((capacity, ACTIONS), dtype=torch.float16, device=d))
         self.tensors = (
             torch.empty((capacity, FEATURES), dtype=torch.bfloat16, device=d),
             torch.empty((capacity, ACTIONS), dtype=torch.bool, device=d),
@@ -80,7 +119,7 @@ class RolloutStorage:
             torch.empty(capacity, dtype=torch.int64, device=d),  # stock (critic oracle input)
         )
         if old is not None:
-            for new_t, old_t in zip(self.tensors, old):
+            for new_t, old_t in zip((*self.tensors, *self.extra), (*old, *old_extra)):
                 new_t[:self.size].copy_(old_t[:self.size])
         self.capacity = capacity
 
@@ -88,7 +127,7 @@ class RolloutStorage:
         n = parts[0].shape[0]
         if self.size + n > self.capacity:
             self._allocate(int((self.size + n) * 1.25))
-        for t, part in zip(self.tensors, parts):
+        for t, part in zip((*self.tensors, *self.extra), parts):
             t[self.size:self.size + n].copy_(part)
         self.size += n
 
@@ -107,7 +146,11 @@ def collect(
     reward_scale: float,
     storage: RolloutStorage,
     max_steps: int = 128,
+    critic: nn.Module | None = None,
 ) -> Rollout:
+    """Self-play games; with critic (and storage.all_actions) also every action's Q."""
+    if storage.all_actions and critic is None:
+        raise ValueError("all-action storage needs the critic")
     device = torch.device("cuda")
     seeds, first = make_seeds(games, seed_offset, device)
     states = ext.create(seeds, first)
@@ -131,6 +174,8 @@ def collect(
     bad = torch.zeros((), dtype=torch.int64, device=device)
 
     actor.eval()
+    if critic is not None:
+        critic.eval()
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         for _ in range(max_steps):
             features, legal, players, done, status = ext.observe_indexed(states, active)
@@ -154,14 +199,19 @@ def collect(
             actions = torch.empty(active.numel(), dtype=torch.int64, device=device)
 
             rows = torch.nonzero(learner).squeeze(1)
-            a, logp = _act(actor, features.index_select(0, rows), legal.index_select(0, rows), False)
+            own_legal = legal.index_select(0, rows)
+            a, logp, log_probs = _act(actor, features.index_select(0, rows), own_legal, False, full=True)
             actions.index_copy_(0, rows, a)
             env_rows = active.index_select(0, rows)
             hands = ext.hands_indexed(states, env_rows)
             seat = player.index_select(0, rows)
             opp_hand = hands.gather(1, (1 - seat).unsqueeze(1)).squeeze(1)
-            storage.append(features.index_select(0, rows), legal.index_select(0, rows),
-                           a, logp, opp_hand, env_rows, seat, ext.stock_indexed(states, env_rows))
+            extra = ()
+            if storage.all_actions:
+                extra = (action_values(ext, critic, states, env_rows, seat, own_legal, reward_scale),
+                         log_probs.clamp_min(-60.0).to(torch.float16))
+            storage.append(features.index_select(0, rows), own_legal,
+                           a, logp, opp_hand, env_rows, seat, ext.stock_indexed(states, env_rows), *extra)
 
             if opponent_model is not None:
                 rows = torch.nonzero(~learner).squeeze(1)
@@ -211,6 +261,7 @@ class TrainStats:
     updates: int
     epochs: float
     belief_loss: float = float("nan")
+    q_explained_var: float = float("nan")  # 1 - Var(return - Q(taken action)) / Var(return)
 
 
 def _critic_input(features: torch.Tensor, opp_hand: torch.Tensor, stock: torch.Tensor | None = None) -> torch.Tensor:
@@ -260,10 +311,11 @@ class PpoUpdater:
     def __init__(self, actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer,
                  storage: RolloutStorage, minibatch: int, clip: float, value_coef: float,
                  grad_clip: float, use_graph: bool = True, belief: nn.Module | None = None,
-                 belief_coef: float = 0.0) -> None:
+                 belief_coef: float = 0.0, mc_coef: float = 1.0) -> None:
         self.actor, self.critic, self.optimizer, self.storage = actor, critic, optimizer, storage
         self.minibatch, self.clip, self.value_coef, self.grad_clip = minibatch, clip, value_coef, grad_clip
         self.belief, self.belief_coef = belief, belief_coef
+        self.mc_coef = mc_coef  # weight of the sampled action's (return - Q) term in all-action mode
         self.use_graph = use_graph
         d = storage.device
         self.params = [p for group in optimizer.param_groups for p in group["params"]]
@@ -281,7 +333,7 @@ class PpoUpdater:
         self._bind()
 
     def _bind(self) -> None:
-        self.bound = tuple(t.data_ptr() for t in self.storage.tensors)
+        self.bound = tuple(t.data_ptr() for t in (*self.storage.tensors, *self.storage.extra))
         self.adv = torch.zeros(self.storage.capacity, device=self.storage.device)
         self.ret = torch.zeros(self.storage.capacity, device=self.storage.device)
         self.graph = None
@@ -306,7 +358,21 @@ class PpoUpdater:
         new_logp = log_probs.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
         log_ratio = new_logp - logp_old[idx]
         ratio = log_ratio.exp()
-        policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - self.clip, 1 + self.clip) * adv).mean()
+        if self.storage.all_actions:
+            # Expected clipped surrogate over every action under the behaviour policy, with
+            # A(a) = Q(a) - sum_b pi_old(b) Q(b); plus the sampled action's (return - Q) term.
+            q_store, old_store = self.storage.extra
+            q = q_store[idx].float()
+            old_all = old_store[idx].float()
+            p_old = old_all.exp() * legal
+            adv_all = q - (p_old * q).sum(1, keepdim=True)
+            r_all = (log_probs - old_all).clamp_max(20.0).exp()
+            surr_all = torch.minimum(r_all * adv_all, r_all.clamp(1 - self.clip, 1 + self.clip) * adv_all)
+            residual = ret - q.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
+            surr_mc = torch.min(ratio * residual, ratio.clamp(1 - self.clip, 1 + self.clip) * residual)
+            policy_loss = -((p_old * surr_all).sum(1) + self.mc_coef * surr_mc).mean()
+        else:
+            policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - self.clip, 1 + self.clip) * adv).mean()
         entropy_rows = -(log_probs.exp() * log_probs).sum(dim=1)
         entropy = entropy_rows.mean()
         if critic.value_bins:  # cross-entropy against the two-hot return (mean-preserving bins)
@@ -373,7 +439,7 @@ class PpoUpdater:
 
     def update(self, data: Rollout, epochs: int, entropy_coef: float, target_kl: float,
                gae_lambda: float = 1.0) -> TrainStats:
-        if tuple(t.data_ptr() for t in self.storage.tensors) != self.bound:
+        if tuple(t.data_ptr() for t in (*self.storage.tensors, *self.storage.extra)) != self.bound:
             self._bind()
         n = data.actions.numel()
         chunk = 65536
@@ -389,6 +455,10 @@ class PpoUpdater:
         self.adv[:n].copy_(advantages)
         self.ret[:n].copy_(advantages + values)
         explained_var = 1.0 - float((data.returns - values).var() / data.returns.var().clamp_min(1e-8))
+        q_explained_var = float("nan")
+        if self.storage.all_actions:
+            q_taken = self.storage.extra[0][:n].gather(1, data.actions.unsqueeze(1)).squeeze(1).float()
+            q_explained_var = 1.0 - float((data.returns - q_taken).var() / data.returns.var().clamp_min(1e-8))
 
         self.actor.train()
         self.critic.train()
@@ -415,4 +485,5 @@ class PpoUpdater:
             entropy_gostop=s[6] / s[7] if s[7] else float("nan"),
             kl=s[3] / count, clipfrac=s[4] / count, explained_var=explained_var,
             updates=updates, epochs=updates / max(1, n // self.minibatch), belief_loss=s[8] / count,
+            q_explained_var=q_explained_var,
         )
