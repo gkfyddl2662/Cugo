@@ -94,6 +94,10 @@ A/B from `ppo_j` at 900, 200 iterations each (league, 131,072 deal pairs):
 
 Head to head at 1100 the all-action arm scored +0.79 [−0.81, +2.38] points per pair: ahead on every comparison but not significant, at 1.7 times the wall-clock. `ppo_j` continues with it from 1100. Pool snapshots wait in host memory and only the iteration's opponent visits the GPU; 16 snapshots of a 2048×4 actor (140 MB each) would not fit beside the 1.2 GB of all-action buffers.
 
+Branching only actions that can move the policy (`--branch-min-prob 0.01 --branch-max-top 0.99`, the default since 0d9b573) cut self-play from 7.7 s to 3.2 s per iteration (10.9 s in all, against 8.8 s without all-action and 15.3 s branching everything). At `ppo_j`/1100 the policy put ≥ 1% on 1.9 of 5.6 legal actions and half the decisions had a top action ≥ 99%, while an all-action gradient term scales with the action's probability.
+
+`--policy-target improve` (cross-entropy toward π_old·exp(A/τ), τ set so KL(target ‖ π_old) averages `--improve-kl`, every action branched) failed: from `ppo_j`/1300 with `--improve-kl 0.1`, entropy doubled (0.32 to 0.64) within 100 iterations and at 1500 it lost 25.1 [23.1, 27.1] points per pair to the `pg` arm. The critic's Q is too noisy (explained variance ~0.37) for an exponential reweighting: noise lifts low-probability actions it cannot also push down. The `pg` arm itself gained nothing over 1300 in those 200 iterations (+0.02 [−1.42, +1.45]).
+
 ### Exploiter
 
 `--exploiter --opponent T --init T --reference T` trains a copy of T against T alone; its margin over T is a lower bound on T's exploitability. Pass `--pool-greedy` so T plays greedy, as it is deployed: against a sampling T (about 8 points weaker) the exploiter learned that weaker policy's leaks and lost 2.3 points to greedy T after 200 iterations. With `--pool-greedy` and lr 4e-5, 200 iterations against `ppo_j` at 900 peaked at +0.56 [−0.71, +1.82] and ended at −0.17 [−1.59, +1.24]: no weakness found at that budget, which is a weak bound, not proof of none.
