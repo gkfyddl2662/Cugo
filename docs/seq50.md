@@ -124,6 +124,29 @@ Head to head, `ppo_j` at 2000 does not beat 1400 (1400 scores +0.26 [−1.28, +1
 
 A full iteration's gradient is ~97% noise, and the minibatches of 32,768 decisions are 40 times noisier. Exploiters trained at lr 1e-4 against a fixed greedy target, even the weak `ppo_h1500_v3` and even with Monte-Carlo advantages, lost ground in their own training score (−8.8 to −15 points per game over 350 iterations against `ppo_j`/2000) and were flat at lr 4e-5: a larger step only drifts. Playing branches to the end with shared luck (the cloned state keeps the stock order) did not help, at 3.4 times the self-play cost (21.7 s), so the noise is not the luck of future flips but how much an action's value depends on the hidden cards. The rollout variant was measured and not kept. An exploiter that finds nothing at this signal level says nothing about exploitability.
 
+### Redealt-world Q (`--q-source worlds`)
+
+Since the noise is the hidden cards, Q is averaged over worlds the learner cannot tell apart: at each branched decision the opponent's unrevealed hand and the stock are redealt uniformly among the cards the learner cannot see (cards shown by a shake stay put; `held` follows the new hand) and the stock order is reseeded. A world is kept only if the learner's 720 features and legal actions are bit-identical to the real state's: 96.9% are, the rest (mostly a pending flip that already revealed a stock card) keep the real deal. Each branch is played to the end greedily by both seats, who act on their own information sets, so nothing peeks. Measured at `ppo_j`/2000, 8 rollouts of 65,536 games:
+
+| Q for the all-action term (`--mc-coef 0`) | Self-play per iteration | Batch-gradient cosine |
+| --- | ---: | ---: |
+| GAE baseline (no all-action) | 1.4 s | 0.007 to 0.027 |
+| 4 worlds, play to the end | 93.9 s | 0.18 |
+| 2 worlds, 2 more where they disagree on the best action (`--worlds-first 2`) | 73.6 s | 0.28 |
+| 4 worlds, one step then the oracle critic (`--world-depth 1`) | 8.5 s | 0.85 |
+| same, adaptive | 6.5 s | 0.81 |
+
+With the (return − Q) term (`--mc-coef 1`) the cosine falls back to 0.01: the sampled return reintroduces the noise.
+
+Training, 100 iterations from `ppo_j`/2000 at 32,768 games per iteration (head to head, 131,072 deal pairs):
+
+| Arm | vs. `ppo_j`/2000 | Final entropy |
+| --- | ---: | ---: |
+| 4 worlds, play to the end | **+1.82 [+0.41, +3.23]** | 0.35 |
+| depth 1 + adaptive | −0.74 [−2.35, +0.86] | 0.60 |
+
+Play-to-the-end gained more in 100 iterations (72 minutes) than plain PPO did in the 600 before (1400 to 2000: +0.26 for 1400). Depth 1's high cosine was the critic's consistent bias: its action values were too flat to sharpen the policy and entropy nearly doubled; it lost 3.05 [1.45, 4.66] to the play-to-the-end arm. `worlds_j` continues from 2100 with play-to-the-end and `--worlds-first 2`, evaluated against `ppo_j`/2000 (the old reference no longer separates checkpoints).
+
 ### Exploiter
 
 `--exploiter --opponent T --init T --reference T` trains a copy of T against T alone; its margin over T is a lower bound on T's exploitability. Pass `--pool-greedy` so T plays greedy, as it is deployed: against a sampling T (about 8 points weaker) the exploiter learned that weaker policy's leaks and lost 2.3 points to greedy T after 200 iterations. With `--pool-greedy` and lr 4e-5, 200 iterations against `ppo_j` at 900 peaked at +0.56 [−0.71, +1.82] and ended at −0.17 [−1.59, +1.24]: no weakness found at that budget, which is a weak bound, not proof of none.

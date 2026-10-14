@@ -36,7 +36,8 @@ As of October 2026:
 | Policy | Model | vs. `ppo_h1500_v3` (points per deal pair) |
 | --- | --- | --- |
 | `ppo_h1500_v3` | 3×512 residual MLP, PPO | reference |
-| `ppo_j` (in training, iteration 1100, all-action PPO) | 4×2048 residual MLP, PPO | +4.6 |
+| `worlds_j` (in training from 2100) | 4×2048 residual MLP, PPO with redealt-world Q | +1.8 over `ppo_j`/2000 head to head |
+| `ppo_j` (stopped at 2000) | 4×2048 residual MLP, PPO | +4.2 |
 | `seq_hybrid` (paused at iteration 3000) | 4-layer transformer, events + 720 features | −3.8 |
 | `seq_events` (retired at iteration 300) | 4-layer transformer, events only | −218 |
 
