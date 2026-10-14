@@ -235,8 +235,7 @@ class SeqNet(nn.Module):
         allowed[:, :, 0] = True
         allowed[:, 1:length + 1, 1:length + 1] = torch.ones(length, length, dtype=torch.bool, device=dev).tril()
         allowed[:, length + 1:, 1:length + 1] = torch.arange(length, device=dev).view(1, 1, -1) < seen.unsqueeze(-1)
-        diag = torch.arange(length + 1, t, device=dev)
-        allowed[:, diag, diag] = True
+        allowed[:, length + 1:, length + 1:] = torch.eye(q, dtype=torch.bool, device=dev)
         h = self._encode(x, allowed)
         return self._out(h[:, length + 1:])
 

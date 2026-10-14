@@ -27,7 +27,7 @@ from cugo_contract50 import CONTRACT, load_checkpoint
 from cugo_eval50 import load_policy_checkpoint
 from cugo_ppo50 import DECISION_OFFSET, GOSTOP_KIND, TrainStats
 from cugo_ppo_nets50 import ACTIONS, FEATURES, make_seeds
-from cugo_seq50 import History, HistBatch, policy_logits, seq_actor, seq_critic, stored_columns
+from cugo_seq50 import MAX_EVENTS, History, HistBatch, policy_logits, seq_actor, seq_critic, stored_columns
 from cugo_seq_selfplay50 import GameLog, WaveCollector, make_opponent_slot
 from cugo_torch50_ext import load_extension
 from league50 import match
@@ -278,8 +278,167 @@ def run_games(model: nn.Module, g: GameRows, hb: HistBatch, rows: torch.Tensor, 
                                s.opp_hand[rows] if oracle else None, length=length)
 
 
+def ppo_minibatch(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer, params: list,
+                  s: SeqStorage, hb: HistBatch, rows: torch.Tensor, valid: torch.Tensor, length: int,
+                  adv_all: torch.Tensor, ret_all: torch.Tensor, gostop: torch.Tensor,
+                  args: argparse.Namespace, entropy_coef: torch.Tensor, sums: torch.Tensor,
+                  kl_out: torch.Tensor) -> None:
+    """One PPO step on [B, q] decision rows (valid marks real ones); accumulates stats into sums."""
+    w = valid.float()
+    total = w.sum().clamp_min(1.0)
+    with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
+        logits = actor.forward_games(hb, s.features[rows], s.legal[rows], s.count[rows], length=length).float()
+        value = critic.forward_games(hb, s.features[rows], s.legal[rows], s.count[rows], s.opp_hand[rows],
+                                     length=length).float()
+    legal, adv, ret = s.legal[rows], adv_all[rows], ret_all[rows]
+    log_probs = torch.log_softmax(logits.masked_fill(~legal, -1.0e30), dim=-1)
+    log_ratio = (log_probs.gather(-1, s.actions[rows].unsqueeze(-1)).squeeze(-1) - s.logp[rows]) * w
+    ratio = log_ratio.exp()
+    policy_loss = -(torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv) * w).sum() / total
+    entropy_rows = -(log_probs.exp() * log_probs).sum(dim=-1)
+    entropy = (entropy_rows * w).sum() / total
+    value_loss = (F.smooth_l1_loss(value, ret, reduction="none") * w).sum() / total
+    loss = policy_loss - entropy_coef * entropy + args.value_coef * value_loss
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    nn.utils.clip_grad_norm_(params, args.grad_clip, foreach=True)
+    optimizer.step()
+    with torch.no_grad():
+        kl = (((ratio - 1) - log_ratio) * w).sum() / total
+        kl_out.copy_(kl)
+        gs = gostop[rows].float() * w
+        sums += torch.stack((policy_loss.detach(), value_loss.detach(), entropy.detach(), kl,
+                             ((((ratio - 1).abs() > args.clip).float()) * w).sum() / total,
+                             torch.ones_like(kl), (entropy_rows.detach() * gs).sum(), gs.sum()))
+
+
+class UpdateGraphs:
+    """The PPO minibatch step captured as CUDA graphs and replayed.
+
+    A step launches a few hundred small kernels; eagerly the CPU needs longer to
+    launch them than the GPU needs to run them. Minibatches differ in their event
+    length and decision count, so both are rounded up to a multiple of QUANTUM and
+    each padded shape gets its own graph (padding is masked exactly like the padding
+    inside a minibatch). All graphs share one memory pool: they never run at the same
+    time and keep nothing between replays except the static buffers below, which
+    each iteration's GameRows, advantages and returns are copied into.
+    """
+
+    QUANTUM = 4
+
+    def __init__(self, actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer,
+                 storage: SeqStorage, log: GameLog, args: argparse.Namespace, max_decisions: int = 64) -> None:
+        self.actor, self.critic, self.optimizer, self.storage, self.log, self.args = (
+            actor, critic, optimizer, storage, log, args)
+        self.params = [*actor.parameters(), *critic.parameters()]
+        dev = storage.device
+        self.dummy = 2 * log.count.shape[0]  # one past the last (game, seat) sequence: all padding
+        self.max_q = max_decisions
+        self.rows = torch.full((self.dummy + 1, max_decisions), -1, dtype=torch.int64, device=dev)
+        self.games = torch.zeros(self.dummy + 1, dtype=torch.int64, device=dev)
+        self.seat = torch.zeros(self.dummy + 1, dtype=torch.int64, device=dev)
+        self.batch = torch.zeros(0, dtype=torch.int64, device=dev)
+        self.entropy_coef = torch.zeros((), device=dev)
+        self.sums = torch.zeros(8, device=dev)
+        self.kl = torch.zeros((), device=dev)
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.pool = None
+        self._bind()
+
+    def _bind(self) -> None:
+        s = self.storage
+        self.bound = tuple(getattr(s, name).data_ptr() for name in s.NAMES)
+        self.adv = torch.zeros(s.capacity, device=s.device)
+        self.ret = torch.zeros(s.capacity, device=s.device)
+        self.gostop = torch.zeros(s.capacity, dtype=torch.bool, device=s.device)
+        self.graphs, self.pool = {}, None
+
+    def load(self, g: GameRows, adv: torch.Tensor, ret: torch.Tensor, gostop: torch.Tensor,
+             plan: list, entropy_coef: float) -> None:
+        s = self.storage
+        if tuple(getattr(s, name).data_ptr() for name in s.NAMES) != self.bound:
+            self._bind()  # storage grew: every graph read the old buffers
+        seqs, width = g.rows.shape
+        if seqs > self.dummy or width > self.max_q:
+            raise RuntimeError(f"{seqs} sequences x {width} decisions exceed the update graphs' buffers")
+        n = adv.numel()
+        self.rows.fill_(-1)
+        self.rows[:seqs, :width] = g.rows
+        self.games[:seqs] = g.games
+        self.seat[:seqs] = g.seat
+        self.adv[:n] = adv
+        self.ret[:n] = ret
+        self.gostop[:n] = gostop
+        self.entropy_coef.fill_(entropy_coef)
+        self.sums.zero_()
+        largest = max(b.numel() for b, _, _ in plan)
+        if largest > self.batch.numel():
+            self.batch = torch.zeros(-(-largest // 64) * 64, dtype=torch.int64, device=s.device)
+            self.graphs, self.pool = {}, None
+
+    def _step(self, length: int, q: int) -> None:
+        seqs = self.batch
+        rows = self.rows.index_select(0, seqs)[:, :q]
+        games = self.games.index_select(0, seqs)
+        h = self.log
+        hb = HistBatch(h.events.index_select(0, games), h.count.index_select(0, games),
+                       h.start.index_select(0, games), self.seat.index_select(0, seqs))
+        ppo_minibatch(self.actor, self.critic, self.optimizer, self.params, self.storage, hb, rows.clamp_min(0),
+                      rows >= 0, length, self.adv, self.ret, self.gostop, self.args, self.entropy_coef,
+                      self.sums, self.kl)
+
+    def _capture(self, length: int, q: int) -> torch.cuda.CUDAGraph:
+        # Warm up eagerly (cuBLAS, compiled kernels for this shape), then undo that
+        # update in place so the minibatch is applied once, by the replay. The warm-up
+        # runs on the current stream: the allocator caches blocks per stream, and a side
+        # stream would hold a second copy of a step's activations.
+        weights = [p.detach().clone() for p in self.params]
+        moments = {p: {k: v.clone() for k, v in self.optimizer.state[p].items() if torch.is_tensor(v)}
+                   for p in self.params if p in self.optimizer.state}
+        saved = (self.sums.clone(), self.kl.clone())
+        self._step(length, q)
+        with torch.no_grad():
+            for p, w in zip(self.params, weights):
+                p.copy_(w)
+            for p in self.params:
+                before = moments.get(p)
+                for k, v in self.optimizer.state[p].items():
+                    if torch.is_tensor(v):
+                        v.copy_(before[k]) if before is not None else v.zero_()
+            self.sums.copy_(saved[0])
+            self.kl.copy_(saved[1])
+        self.optimizer.zero_grad(set_to_none=True)
+        graph = torch.cuda.CUDAGraph()
+        # The warm-up left autograd's gradient accumulators pointing at the default
+        # stream; let the capture redirect them to its own stream.
+        torch.autograd.graph.set_override_stale_capture_stream(True)
+        try:
+            with torch.cuda.graph(graph, pool=self.pool):
+                self._step(length, q)
+        finally:
+            torch.autograd.graph.set_override_stale_capture_stream(False)
+        if self.pool is None:
+            self.pool = graph.pool()
+        self.graphs[(length, q)] = graph
+        del weights, moments
+        torch.cuda.empty_cache()
+        return graph
+
+    def run(self, seqs: torch.Tensor, length: int, q: int) -> None:
+        quantum = self.QUANTUM
+        length = min(MAX_EVENTS, -(-length // quantum) * quantum)
+        q = min(self.max_q, -(-q // quantum) * quantum)
+        self.batch.fill_(self.dummy)
+        self.batch[:seqs.numel()].copy_(seqs)
+        graph = self.graphs.get((length, q))
+        if graph is None:
+            graph = self._capture(length, q)
+        graph.replay()
+
+
 def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer, storage: SeqStorage,
-           data: SeqRollout, args: argparse.Namespace, entropy_coef: float) -> TrainStats:
+           data: SeqRollout, args: argparse.Namespace, entropy_coef: float,
+           graphs: "UpdateGraphs | None" = None) -> TrainStats:
     n = storage.size
     s = storage
     g = GameRows(storage, data.hist)
@@ -299,39 +458,26 @@ def update(actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer
     gostop = s.features[:n, s.gostop_column] > 0.5
     actor.train()
     critic.train()
-    sums = torch.zeros(8, device=s.device)
+    plan = g.batches(args.minibatch, shuffle=True, bucket=args.length_bucket)
+    if graphs is None:
+        sums = torch.zeros(8, device=s.device)
+        kl = torch.zeros((), device=s.device)
+        coef = torch.full((), entropy_coef, device=s.device)
+    else:
+        graphs.load(g, adv_all, ret_all, gostop, plan, entropy_coef)
+        sums, kl = graphs.sums, graphs.kl
     kl_host = torch.zeros(1, pin_memory=True)
     kl_ready: torch.cuda.Event | None = None
     updates, stop = 0, False
-    plan = g.batches(args.minibatch, shuffle=True, bucket=args.length_bucket)
     for _ in range(args.epochs):
         for seqs, length, q in plan:
-            hb, rows, valid = g.take(seqs, q)
-            w = valid.float()
-            total = w.sum().clamp_min(1.0)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = run_games(actor, g, hb, rows, False, length).float()
-                value = run_games(critic, g, hb, rows, True, length).float()
-            legal, adv, ret = s.legal[rows], adv_all[rows], ret_all[rows]
-            log_probs = torch.log_softmax(logits.masked_fill(~legal, -1.0e30), dim=-1)
-            log_ratio = (log_probs.gather(-1, s.actions[rows].unsqueeze(-1)).squeeze(-1) - s.logp[rows]) * w
-            ratio = log_ratio.exp()
-            policy_loss = -(torch.min(ratio * adv, ratio.clamp(1 - args.clip, 1 + args.clip) * adv) * w).sum() / total
-            entropy_rows = -(log_probs.exp() * log_probs).sum(dim=-1)
-            entropy = (entropy_rows * w).sum() / total
-            value_loss = (F.smooth_l1_loss(value, ret, reduction="none") * w).sum() / total
-            loss = policy_loss - entropy_coef * entropy + args.value_coef * value_loss
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(params, args.grad_clip, foreach=True)
-            optimizer.step()
+            if graphs is None:
+                hb, rows, valid = g.take(seqs, q)
+                ppo_minibatch(actor, critic, optimizer, params, s, hb, rows, valid, length, adv_all, ret_all,
+                              gostop, args, coef, sums, kl)
+            else:
+                graphs.run(seqs, length, q)
             updates += 1
-            with torch.no_grad():
-                kl = (((ratio - 1) - log_ratio) * w).sum() / total
-                gs = gostop[rows].float() * w
-                sums += torch.stack((policy_loss.detach(), value_loss.detach(), entropy.detach(), kl,
-                                     ((((ratio - 1).abs() > args.clip).float()) * w).sum() / total,
-                                     torch.ones_like(kl), (entropy_rows.detach() * gs).sum(), gs.sum()))
             # Early stop on KL without stalling the GPU: read the value copied one
             # update ago (the next update is already queued while we wait).
             if kl_ready is not None:
@@ -402,6 +548,8 @@ def main() -> None:
     parser.add_argument("--collector", choices=("graph", "eager"), default="graph",
                         help="graph: KV-cached CUDA-graph self-play; eager: reference implementation")
     parser.add_argument("--wave", type=int, default=4096, help="games per CUDA-graph wave")
+    parser.add_argument("--update-graphs", action="store_true",
+                        help="replay the PPO minibatch step as CUDA graphs (needs --collector graph)")
     parser.add_argument("--length-bucket", type=int, default=0,
                         help="sort each window of N minibatches by game length (0 = off)")
     args = parser.parse_args()
@@ -416,7 +564,8 @@ def main() -> None:
     actor = seq_actor(args.mode, args.d_model, args.layers, args.heads).to(device)
     critic = seq_critic(args.mode, args.d_model, args.layers, args.heads).to(device)
     ema_actor = frozen(actor, args)
-    optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5, fused=True)
+    optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5, fused=True,
+                                 capturable=args.update_graphs)
     start_iteration = 0
     if args.init is not None:
         payload = load_checkpoint(args.init, device)
@@ -424,6 +573,8 @@ def main() -> None:
         critic.load_state_dict(payload["critic"])
         ema_actor.load_state_dict(payload["actor_ema"])
         optimizer.load_state_dict(payload["optimizer"])
+        for group in optimizer.param_groups:  # the checkpoint's setting would override ours
+            group["capturable"] = args.update_graphs
         start_iteration = int(payload["iteration"])
     ema_params, actor_params = list(ema_actor.parameters()), list(actor.parameters())
     snapshots: list[nn.Module] = []
@@ -447,6 +598,9 @@ def main() -> None:
         collector = WaveCollector(ext, actor, make_opponent_slot(actor, factory), args.wave,
                                   round(args.wave * args.pool_fraction), stored_columns(args.mode))
         log = GameLog(args.games, device)
+    if args.update_graphs and log is None:
+        raise SystemExit("--update-graphs needs --collector graph (its event log stays at one address)")
+    graphs = UpdateGraphs(actor, critic, optimizer, storage, log, args) if args.update_graphs else None
 
     algorithm = "seq-ppo-v1"
     print(f"torch={torch.__version__} device={torch.cuda.get_device_name(0)}")
@@ -457,7 +611,8 @@ def main() -> None:
           f"minibatch={args.minibatch} entropy={args.entropy:g} target_kl={args.target_kl:g} "
           f"reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g} pool_fraction={args.pool_fraction:g} "
           f"compile={int(args.compile)} start_iteration={start_iteration} pool={len(snapshots)} "
-          f"collector={args.collector} wave={args.wave} length_bucket={args.length_bucket}")
+          f"collector={args.collector} wave={args.wave} length_bucket={args.length_bucket} "
+          f"update_graphs={int(args.update_graphs)}")
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()} | {"algorithm": algorithm, "feature_contract": CONTRACT}
 
     total_games = 0
@@ -478,7 +633,7 @@ def main() -> None:
                                  args.pool_fraction if snapshots else 0.0, False, args.reward_scale, storage)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        stats = update(actor, critic, optimizer, storage, data, args, entropy_coef)
+        stats = update(actor, critic, optimizer, storage, data, args, entropy_coef, graphs)
         with torch.no_grad():
             torch._foreach_lerp_(ema_params, actor_params, 1.0 - args.ema_decay)
         torch.cuda.synchronize()
@@ -496,8 +651,8 @@ def main() -> None:
               f"ppo_value={stats.value_loss:.6f} ppo_entropy={stats.entropy:.6f} "
               f"ppo_entropy_gostop={stats.entropy_gostop:.6f} ppo_kl={stats.kl:.6f} "
               f"ppo_clipfrac={stats.clipfrac:.4f} ppo_explained_var={stats.explained_var:.4f} "
-              f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}",
-              flush=True)
+              f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}"
+              + ("" if graphs is None else f" update_graphs={len(graphs.graphs)}"), flush=True)
 
         if args.pool_every > 0 and iteration % args.pool_every == 0:
             # The EMA is the release policy; the raw actor can swing between updates.
