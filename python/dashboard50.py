@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import re
 import subprocess
 import time
+import zipfile
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -56,6 +59,8 @@ def parse_training_log(path: Path, mtime: float) -> dict:
     config: dict[str, float | str] = {}
     rows: dict[int, dict[str, float]] = {}
     checkpoint_dirs: list[str] = []
+    evals: dict[tuple[int, str], dict] = {}
+    reference: dict | None = None  # the reference policy of the current trainer invocation
     finished = failed = False
     final: dict[str, float | str] = {}
 
@@ -69,12 +74,21 @@ def parse_training_log(path: Path, mtime: float) -> dict:
             # crash means the crash belonged to an earlier invocation.
             if rows and iteration < max(rows):
                 rows = {i: r for i, r in rows.items() if i < iteration}
+                evals = {k: e for k, e in evals.items() if k[0] < iteration}
             failed = finished = False
             row = rows.setdefault(iteration, {})
             for key, value in pairs[1:]:
                 parsed = number(value)
                 if isinstance(parsed, float):
                     row[key] = parsed
+            logged = {key for key, _ in pairs}
+            for tag, variant in (("ref", "ema"), ("raw", "raw")):
+                if f"eval_{tag}_score" in logged:  # a re-run iteration replaces the earlier eval
+                    evals[(iteration, variant)] = {
+                        "iteration": iteration, "variant": variant, "score": row[f"eval_{tag}_score"],
+                        "ci_low": row.get(f"eval_{tag}_ci_low"), "ci_high": row.get(f"eval_{tag}_ci_high"),
+                        "win_pct": row.get(f"eval_{tag}_win_pct"), "reference": reference,
+                    }
         elif line.startswith("checkpoint="):
             parent = str(Path(line.split("=", 1)[1]).parent)
             if parent not in checkpoint_dirs:
@@ -84,10 +98,16 @@ def parse_training_log(path: Path, mtime: float) -> dict:
             final = {k: number(v) for k, v in KV.findall(line)}
         elif line.startswith("Traceback") or "Error:" in line:
             failed = True
+        elif line.startswith("reference="):  # printed by every trainer invocation, resumed ones too
+            values = dict(KV.findall(line))
+            reference = policy_ref(values["reference"], values.get("reference_policy"))
         elif not rows and line.startswith("device="):
             config["device"] = line[len("device="):].split(" capability=")[0]
         elif not rows and HEADER_LINE.match(line):
-            config.update({k: number(v) for k, v in KV.findall(line)})
+            values = dict(KV.findall(line))
+            config.update({k: number(v) for k, v in values.items()})
+            if "teacher" in values and reference is None:  # distillation evaluates against its teacher
+                reference = policy_ref(values["teacher"], "auto")
 
     if not rows:
         return {"is_run": False}
@@ -124,6 +144,8 @@ def parse_training_log(path: Path, mtime: float) -> dict:
         "total_games": sum(row.get("games", 0.0) for row in rows.values()),
         "measured_seconds": measured_s,
         "checkpoint_dirs": checkpoint_dirs,
+        "evals": [evals[k] for k in sorted(evals)],
+        "reference": reference,
         "latest": {k: v for i in iterations for k, v in rows[i].items()},
         "series": {
             "iter": sampled,
@@ -165,6 +187,183 @@ def parse_eval_log(path: Path, mtime: float) -> dict:
             record["outcome"] = "done"
     record.update(name=path.stem, mtime=mtime, a=sides.get("A"), b=sides.get("B"))
     return record
+
+
+class _Opaque:
+    """Stand-in for every pickled class except dicts: tensors and the like are never built."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def __setstate__(self, state) -> None:
+        pass
+
+
+class _ConfigUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        return OrderedDict if (module, name) == ("collections", "OrderedDict") else _Opaque
+
+    def persistent_load(self, pid):  # tensor storages stay in the archive
+        return None
+
+
+def read_checkpoint_meta(path: Path, mtime: float) -> dict:
+    """Iteration and reference policy of a torch.save zip checkpoint, without torch and
+    without running pickled code (every class resolves to an inert placeholder)."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            name = next(n for n in archive.namelist() if n.endswith("/data.pkl"))
+            with archive.open(name) as stream:
+                payload = _ConfigUnpickler(stream).load()
+    except (OSError, StopIteration, zipfile.BadZipFile, pickle.UnpicklingError, EOFError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+    ref = config.get("reference") or config.get("teacher")
+    policy = config.get("reference_policy") if config.get("reference") else "auto"
+    return {"iteration": payload.get("iteration"), "reference": policy_ref(ref, policy) if ref else None}
+
+
+def model_label(path: Path) -> str:
+    """Same naming as league50.label: <directory>/<iteration or stem>."""
+    return f"{path.parent.name}/{path.stem.replace('iter_', '')}"
+
+
+def policy_ref(path: str, policy) -> dict:
+    p = Path(str(path).replace("\\", "/"))
+    label = model_label(p)
+    if policy not in (None, "auto", "ppo"):
+        label += f" ({policy})"
+    return {"label": label, "path": p.as_posix()}
+
+
+def repo_path(name: str) -> Path:
+    path = Path(name.replace("\\", "/"))
+    return path if path.is_absolute() else REPO / path
+
+
+def resolve_evals(info: dict) -> tuple[list[dict], dict | None]:
+    """Attach the reference policy and checkpoint file to every training eval. Logs written
+    before the trainers printed `reference=` fall back to the checkpoint configs."""
+    saved: dict[int, Path] = {}
+    for name in info.get("checkpoint_dirs", []):
+        for file in repo_path(name).glob("iter_*.pt"):
+            match = ITER_FILE.search(file.name)
+            if match:
+                saved.setdefault(int(match.group(1)), file)
+
+    def meta(iteration: int) -> dict:
+        if not saved:
+            return {}
+        nearest = min(saved, key=lambda i: (abs(i - iteration), -i))
+        return cached(saved[nearest], read_checkpoint_meta)
+
+    out = []
+    for e in info.get("evals", []):
+        file = saved.get(e["iteration"])
+        reference = e["reference"] or meta(e["iteration"]).get("reference")
+        out.append(e | {"reference": reference,
+                        "file": file.relative_to(REPO).as_posix() if file else None})
+    current = info.get("reference")
+    if out and out[-1]["reference"]:
+        current = out[-1]["reference"]
+    elif current is None and saved:
+        current = meta(max(saved)).get("reference")
+    return out, current
+
+
+def reference_segments(evals: list[dict]) -> list[dict]:
+    """Consecutive iteration ranges evaluated against the same reference."""
+    segments: list[dict] = []
+    for e in evals:
+        ref = e["reference"] or {}
+        if segments and segments[-1]["label"] == ref.get("label"):
+            segments[-1]["last"] = e["iteration"]
+        else:
+            segments.append({"label": ref.get("label"), "path": ref.get("path"),
+                             "first": e["iteration"], "last": e["iteration"]})
+    return segments
+
+
+def ranking(build: Path) -> dict:
+    """Every paired result of a checkpoint against a reference policy, keeping the tightest
+    measurement per (checkpoint, variant, reference). Scores against different references
+    are not comparable, so the page ranks one reference at a time."""
+    entries: list[dict] = []
+    for path in training_logs(build):
+        info = cached(path, parse_training_log)
+        if not info["is_run"] or not info.get("evals"):
+            continue
+        evals, _ = resolve_evals(info)
+        dirs = info.get("checkpoint_dirs", [])
+        run = repo_path(dirs[0]).name if dirs else path.stem
+        for e in evals:
+            if not e["reference"]:
+                continue
+            entries.append({
+                "model": f"{run}/{e['iteration']:06d}", "run": run, "iteration": e["iteration"],
+                "variant": e["variant"], "score": e["score"], "ci_low": e["ci_low"], "ci_high": e["ci_high"],
+                "win_pct": e["win_pct"], "reference": e["reference"]["label"],
+                "reference_path": e["reference"]["path"], "file": e["file"],
+                "source": "train", "source_name": path.stem, "run_id": run_id(build, path),
+            })
+
+    references = {e["reference"]: e["reference_path"] for e in entries}
+
+    def side(label: str, variant: str) -> dict:
+        run, _, stem = label.partition("/")
+        file = build / "checkpoints" / run / (f"iter_{stem}.pt" if stem.isdigit() else f"{stem}.pt")
+        return {"model": label, "run": run, "iteration": int(stem) if stem.isdigit() else None,
+                "variant": variant, "file": file.relative_to(REPO).as_posix() if file.is_file() else None}
+
+    def add(model: dict, ref: str, score: float, lo, hi, win, source: str, name: str) -> None:
+        if ref in references and model["model"] != ref:
+            entries.append(model | {"score": score, "ci_low": lo, "ci_high": hi, "win_pct": win,
+                                    "reference": ref, "reference_path": references[ref],
+                                    "source": source, "source_name": name})
+
+    for path in sorted((build / "evals").glob("*.txt")):  # league50 round robins
+        for line in read_text(path).splitlines():
+            if not line.startswith("MATCH "):
+                continue
+            v = dict(KV.findall(line))
+            score, lo, hi = float(v["score"]), float(v["ci_low"]), float(v["ci_high"])
+            win = float(v["a_win_pct"]) if "a_win_pct" in v else None
+            add(side(v["a"], "ema"), v["b"], score, lo, hi, win, "league", path.stem)
+            add(side(v["b"], "ema"), v["a"], -score, -hi, -lo, None, "league", path.stem)
+
+    for path in sorted((build / "evals").glob("*.log")):  # eval50 head-to-head runs
+        e = cached(path, parse_eval_log)
+        pairs, a, b = e.get("pairs") or {}, e.get("a"), e.get("b")
+        if not (a and b and "ci_low" in pairs):
+            continue
+        sides = []
+        for s in (a, b):
+            stem = Path(s["file"]).stem.replace("iter_", "")
+            sides.append((policy_ref(f"{s['run']}/{s['file']}", s["policy"])["label"],
+                          side(f"{s['run']}/{stem}", "raw" if s["policy"] == "ppo_raw" else "ema")))
+        score, win = pairs["mean_score_A"], (e.get("result") or {}).get("A_win_pct")
+        add(sides[0][1], sides[1][0], score, pairs["ci_low"], pairs["ci_high"], win, "eval", path.stem)
+        add(sides[1][1], sides[0][0], -score, -pairs["ci_high"], -pairs["ci_low"], None, "eval", path.stem)
+
+    def width(e: dict) -> float:
+        return e["ci_high"] - e["ci_low"] if e["ci_low"] is not None else float("inf")
+
+    best: dict[tuple, dict] = {}
+    count: dict[tuple, int] = {}
+    for e in entries:
+        key = (e["model"], e["variant"], e["reference"])
+        count[key] = count.get(key, 0) + 1
+        if key not in best or width(e) < width(best[key]):
+            best[key] = e
+    rows = sorted((e | {"measurements": count[k]} for k, e in best.items()), key=lambda e: -e["score"])
+    totals: dict[str, int] = {}
+    for e in rows:
+        totals[e["reference"]] = totals.get(e["reference"], 0) + 1
+    # `references` follows the training logs, newest first: the reference in current use leads.
+    refs = [{"label": r, "path": p, "count": totals.get(r, 0)} for r, p in references.items()]
+    return {"references": refs, "entries": rows}
 
 
 def list_checkpoints(dirs: list[str]) -> list[dict]:
@@ -271,8 +470,13 @@ def make_handler(build: Path):
                     self.json({"error": "unknown run"}, 404)
                     return
                 info = cached(path, parse_training_log)
+                evals, reference = resolve_evals(info)
                 self.json(info | {"id": wanted, "name": path.stem, "status": live_status(info),
+                                  "evals": evals, "reference": reference,
+                                  "reference_segments": reference_segments(evals),
                                   "checkpoints": list_checkpoints(info.get("checkpoint_dirs", []))})
+            elif url.path == "/api/ranking":
+                self.json(ranking(build))
             else:
                 self.json({"error": "not found"}, 404)
 

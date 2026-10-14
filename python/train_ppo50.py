@@ -135,6 +135,8 @@ def main() -> None:
     print(f"lr={args.lr:g} epochs={args.epochs} minibatch={args.minibatch} clip={args.clip:g} "
           f"entropy={args.entropy:g} entropy_final={args.entropy_final if args.entropy_final is not None else args.entropy:g} "
           f"target_kl={args.target_kl:g} reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g}")
+    if args.reference is not None:  # every invocation, so a resumed log records the reference it evaluates against
+        print(f"reference={args.reference.as_posix()} reference_policy={args.reference_policy}")
     config = vars(args) | {"algorithm": "ppo-oracle-critic-v1", "feature_contract": CONTRACT}
     config = {k: (str(v) if isinstance(v, Path) or (isinstance(v, list) and v and isinstance(v[0], Path)) else v)
               for k, v in config.items()}

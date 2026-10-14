@@ -27,7 +27,7 @@ reinforcement-learning stack that trains Shin Matgo agents with it.
     Their self-play runs on a KV cache inside CUDA graphs, with a Triton decode
     kernel.
 - **Honest evaluation.** Paired, seat-swapped matches on identical deals; league
-  tables; a live training dashboard.
+  tables; a live training dashboard with a per-reference checkpoint ranking.
 
 ## Status
 
@@ -91,7 +91,7 @@ Evaluate and compare checkpoints:
 ```bash
 python python/eval50.py --a-checkpoint A.pt --b-checkpoint B.pt --pairs 131072
 python python/league50.py A.pt B.pt C.pt --pairs 65536
-python python/dashboard50.py        # http://127.0.0.1:8765
+python python/dashboard50.py        # http://127.0.0.1:8765 (training, ranking, evals)
 ```
 
 Run the Python scripts with `PYTHONPATH=python`, or from inside `python/`.

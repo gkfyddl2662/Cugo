@@ -613,6 +613,8 @@ def main() -> None:
           f"compile={int(args.compile)} start_iteration={start_iteration} pool={len(snapshots)} "
           f"collector={args.collector} wave={args.wave} length_bucket={args.length_bucket} "
           f"update_graphs={int(args.update_graphs)}")
+    if args.reference:  # every invocation, so a resumed log records the reference it evaluates against
+        print(f"reference={args.reference.as_posix()} reference_policy=auto")
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()} | {"algorithm": algorithm, "feature_contract": CONTRACT}
 
     total_games = 0
