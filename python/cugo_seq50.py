@@ -25,7 +25,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from cugo_contract50 import CONTEXT_INDEX
-from cugo_ppo_nets50 import ACTIONS, FEATURES, ORACLE_FEATURES, card_plane
+from cugo_ppo_nets50 import (ACTIONS, FEATURES, ORACLE_FEATURES, STOCK_FEATURES, BeliefHead, card_plane,  # noqa: F401
+                              stock_planes, two_hot, value_support)
 from cugo_seq_attention50 import decode_attention
 
 EVENT_WORDS = 9
@@ -35,40 +36,12 @@ KINDS = 12  # ActionKind50
 EVENT_SLOTS = 8  # played, own drawn, flipped, my gain, opp gain, my loss, opp loss, shown
 EVENT_IN = EVENT_SLOTS * 50 + KINDS + 2
 START_IN = 5 * 50 + 12 + 8 + 4
-STOCK_DRAWS = 8  # stock_indexed packs the next 8 draws, one card id per byte
-STOCK_FEATURES = STOCK_DRAWS * 50
 # Events-mode query columns (contract v4, see cugo_contract50): the decision
 # context (pending public cards, floor-choice cards, decision kind, first-player
 # bit, opponent hand count, post-chance scalars, Gukjin prompt flag), own hand,
 # capture counts and the round multiplier.
 
 _BITS: dict[torch.device, torch.Tensor] = {}
-
-
-def stock_planes(stock: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """[..., 8 * 50] one-hot of the next 8 stock draws (packed by ext.stock_indexed)."""
-    shifts = torch.arange(0, 8 * STOCK_DRAWS, 8, device=stock.device)
-    cards = (stock.unsqueeze(-1) >> shifts) & 0xFF
-    planes = cards.unsqueeze(-1) == torch.arange(50, device=stock.device)  # 0xFF matches no card
-    return planes.flatten(-2).to(dtype)
-
-
-def value_support(bins: int, top: float) -> torch.Tensor:
-    """Bin centers spaced evenly in symlog space over [-top, top] (scaled return units)."""
-    u = torch.linspace(-1.0, 1.0, bins, dtype=torch.float64) * torch.log1p(torch.tensor(top, dtype=torch.float64))
-    return (torch.sign(u) * torch.expm1(u.abs())).float()
-
-
-def two_hot(y: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
-    """Target distribution over the bins whose mean is exactly y (clamped to the support)."""
-    y = torch.minimum(torch.maximum(y, support[0]), support[-1])  # tensor bounds: no host sync in graphs
-    hi = torch.searchsorted(support, y.contiguous()).clamp(1, support.numel() - 1)
-    lo = hi - 1
-    w_hi = ((y - support[lo]) / (support[hi] - support[lo])).clamp(0.0, 1.0)
-    target = y.new_zeros(*y.shape, support.numel())
-    target.scatter_(-1, lo.unsqueeze(-1), (1.0 - w_hi).unsqueeze(-1))
-    target.scatter_add_(-1, hi.unsqueeze(-1), w_hi.unsqueeze(-1))
-    return target
 
 
 def _bits(x: torch.Tensor, width: int = 50) -> torch.Tensor:
@@ -379,19 +352,6 @@ def seq_critic(mode: str, d_model: int, layers: int, heads: int, stock: bool = F
                value_bins: int = 0, value_top: float = 40.0) -> SeqNet:
     return SeqNet(mode, 1, d_model, layers, heads, oracle=True, stock=stock, value_bins=value_bins,
                   value_top=value_top)
-
-
-class BeliefHead(nn.Module):
-    """Auxiliary actor head: which cards the opponent holds, from the decision's hidden
-    state. Trained against the true hand so the shared trunk learns to track it."""
-
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, d_model), nn.GELU(),
-                                 nn.Linear(d_model, ORACLE_FEATURES))
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.net(h)
 
 
 def policy_logits(model: nn.Module, features: torch.Tensor, legal: torch.Tensor,

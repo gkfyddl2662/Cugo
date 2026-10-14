@@ -25,7 +25,10 @@ def load_pair(path: Path, device: torch.device):
     payload = load_checkpoint(path, device)
     config = payload.get("config", {})
     shape = (int(config.get("hidden", 512)), int(config.get("blocks", 3)), config.get("norm", "layer"))
-    actor, critic = PpoActor(*shape).to(device), OracleCritic(*shape).to(device)
+    actor = PpoActor(*shape).to(device)
+    critic = OracleCritic(*shape, stock=bool(config.get("critic_stock", False)),
+                          value_bins=int(config.get("value_bins", 0)),
+                          value_top=float(config.get("value_top", 640.0))).to(device)
     # Distill the release policy (the weight EMA) when the teacher has one.
     actor.load_state_dict(payload.get("actor_ema", payload["actor"]))
     critic.load_state_dict(payload["critic"])
@@ -87,7 +90,9 @@ def main() -> None:
             critic_in = _critic_input(feats, data.opp_hand[idx])
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 t_logp = torch.log_softmax(teacher_actor(feats).float().masked_fill(~legal, -1.0e30), dim=1)
-                t_value = teacher_critic(critic_in).float()
+                teacher_in = (critic_in if not teacher_critic.stock else
+                              _critic_input(feats, data.opp_hand[idx], data.stock[idx]))
+                t_value = teacher_critic.value(teacher_critic(teacher_in))
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 s_logits = actor(feats).float()
                 s_value = critic(critic_in).float()

@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cugo_ppo_nets50 import ACTIONS, FEATURES, card_plane, make_seeds
+from cugo_ppo_nets50 import ACTIONS, FEATURES, card_plane, make_seeds, stock_planes, two_hot
 
 GOSTOP_KIND = 2  # decision-kind one-hot index for Go/Stop
 DECISION_OFFSET = 446
@@ -28,6 +28,7 @@ class Rollout:
     actions: torch.Tensor  # [N] int64
     logp: torch.Tensor  # [N] fp32, behaviour log-prob
     opp_hand: torch.Tensor  # [N] int64 card mask
+    stock: torch.Tensor  # [N] int64, next 8 stock draws (ext.stock_indexed)
     returns: torch.Tensor  # [N] fp32, scaled final score for the acting player
     games: int
     terminal: int
@@ -76,6 +77,7 @@ class RolloutStorage:
             torch.empty(capacity, dtype=torch.int64, device=d),
             torch.empty(capacity, dtype=torch.int64, device=d),
             torch.empty(capacity, dtype=torch.int64, device=d),
+            torch.empty(capacity, dtype=torch.int64, device=d),  # stock (critic oracle input)
         )
         if old is not None:
             for new_t, old_t in zip(self.tensors, old):
@@ -159,7 +161,7 @@ def collect(
             seat = player.index_select(0, rows)
             opp_hand = hands.gather(1, (1 - seat).unsqueeze(1)).squeeze(1)
             storage.append(features.index_select(0, rows), legal.index_select(0, rows),
-                           a, logp, opp_hand, env_rows, seat)
+                           a, logp, opp_hand, env_rows, seat, ext.stock_indexed(states, env_rows))
 
             if opponent_model is not None:
                 rows = torch.nonzero(~learner).squeeze(1)
@@ -180,7 +182,7 @@ def collect(
     if int(bad):
         raise RuntimeError("an active game had no legal action, a bad status or a failed step")
 
-    features, legal, actions, logp, opp_hand, env_ids, seat = storage.views()
+    features, legal, actions, logp, opp_hand, env_ids, seat, stock = storage.views()
     reward = final_reward0.index_select(0, env_ids)
     returns = torch.where(seat == 0, reward, -reward) / reward_scale
 
@@ -188,7 +190,7 @@ def collect(
     learner_score = torch.where(learner_seat == 0, final_reward0, -final_reward0)[pool_games]
     return Rollout(
         features=features, legal=legal, actions=actions, logp=logp,
-        opp_hand=opp_hand, returns=returns, games=games,
+        opp_hand=opp_hand, stock=stock, returns=returns, games=games,
         terminal=int((started & ~final_nagari).sum()),
         nagari=int((started & final_nagari).sum()),
         decision_steps=steps,
@@ -211,8 +213,11 @@ class TrainStats:
     belief_loss: float = float("nan")
 
 
-def _critic_input(features: torch.Tensor, opp_hand: torch.Tensor) -> torch.Tensor:
-    return torch.cat((features, card_plane(opp_hand, features.dtype)), dim=1)
+def _critic_input(features: torch.Tensor, opp_hand: torch.Tensor, stock: torch.Tensor | None = None) -> torch.Tensor:
+    parts = [features, card_plane(opp_hand, features.dtype)]
+    if stock is not None:
+        parts.append(stock_planes(stock, features.dtype))
+    return torch.cat(parts, dim=1)
 
 
 def gae_advantages(values: torch.Tensor, returns: torch.Tensor, env_ids: torch.Tensor,
@@ -254,16 +259,23 @@ class PpoUpdater:
 
     def __init__(self, actor: nn.Module, critic: nn.Module, optimizer: torch.optim.Optimizer,
                  storage: RolloutStorage, minibatch: int, clip: float, value_coef: float,
-                 grad_clip: float, use_graph: bool = True) -> None:
+                 grad_clip: float, use_graph: bool = True, belief: nn.Module | None = None,
+                 belief_coef: float = 0.0) -> None:
         self.actor, self.critic, self.optimizer, self.storage = actor, critic, optimizer, storage
         self.minibatch, self.clip, self.value_coef, self.grad_clip = minibatch, clip, value_coef, grad_clip
+        self.belief, self.belief_coef = belief, belief_coef
         self.use_graph = use_graph
         d = storage.device
-        self.params = [*actor.parameters(), *critic.parameters()]
+        self.params = [p for group in optimizer.param_groups for p in group["params"]]
+        # Gradients are clipped per network, so a critic loss on another scale (bins)
+        # cannot shrink the actor's step.
+        self.clip_groups = [list(actor.parameters()), list(critic.parameters())]
+        if belief is not None:
+            self.clip_groups.append(list(belief.parameters()))
         self.idx = torch.zeros(minibatch, dtype=torch.int64, device=d)
         self.entropy_coef = torch.zeros((), device=d)
-        # policy, value, entropy, kl, clipfrac, count, gostop entropy sum, gostop count
-        self.sums = torch.zeros(8, device=d)
+        # policy, value, entropy, kl, clipfrac, count, gostop entropy sum, gostop count, belief
+        self.sums = torch.zeros(9, device=d)
         self.kl = torch.zeros((), device=d)
         self.graph: torch.cuda.CUDAGraph | None = None
         self._bind()
@@ -275,15 +287,21 @@ class PpoUpdater:
         self.graph = None
 
     def _step(self) -> None:
-        features, legal_all, actions, logp_old, opp_hand, _, _ = self.storage.tensors
+        features, legal_all, actions, logp_old, opp_hand, _, _, stock = self.storage.tensors
         idx = self.idx
         feats = features[idx]
         legal = legal_all[idx]
         adv = self.adv[idx]
         ret = self.ret[idx]
+        critic = self.critic
         with torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False):
-            logits = self.actor(feats).float()
-            value = self.critic(_critic_input(feats, opp_hand[idx])).float()
+            if self.belief is not None:
+                logits, hidden = self.actor.forward_hidden(feats)
+                belief_logits = self.belief(hidden).float()
+            else:
+                logits = self.actor(feats)
+            logits = logits.float()
+            value = critic(_critic_input(feats, opp_hand[idx], stock[idx] if critic.stock else None)).float()
         log_probs = torch.log_softmax(logits.masked_fill(~legal, -1.0e30), dim=1)
         new_logp = log_probs.gather(1, actions[idx].unsqueeze(1)).squeeze(1)
         log_ratio = new_logp - logp_old[idx]
@@ -291,10 +309,20 @@ class PpoUpdater:
         policy_loss = -torch.min(ratio * adv, ratio.clamp(1 - self.clip, 1 + self.clip) * adv).mean()
         entropy_rows = -(log_probs.exp() * log_probs).sum(dim=1)
         entropy = entropy_rows.mean()
-        value_loss = F.smooth_l1_loss(value, ret)
+        if critic.value_bins:  # cross-entropy against the two-hot return (mean-preserving bins)
+            value_loss = -(two_hot(ret, critic.support) * torch.log_softmax(value, -1)).sum(-1).mean()
+        else:
+            value_loss = F.smooth_l1_loss(value, ret)
         loss = policy_loss - self.entropy_coef * entropy + self.value_coef * value_loss
+        if self.belief is not None:
+            hand = card_plane(opp_hand[idx], torch.float32)
+            belief_loss = F.binary_cross_entropy_with_logits(belief_logits, hand)
+            loss = loss + self.belief_coef * belief_loss
+        else:
+            belief_loss = torch.zeros((), device=loss.device)
         loss.backward()
-        nn.utils.clip_grad_norm_(self.params, self.grad_clip, foreach=True)
+        for group in self.clip_groups:
+            nn.utils.clip_grad_norm_(group, self.grad_clip, foreach=True)
         self.optimizer.step()
         with torch.no_grad():
             kl = ((ratio - 1) - log_ratio).mean()
@@ -303,7 +331,7 @@ class PpoUpdater:
             self.sums += torch.stack((
                 policy_loss.detach(), value_loss.detach(), entropy.detach(), kl,
                 ((ratio - 1).abs() > self.clip).float().mean(), torch.ones_like(kl),
-                (entropy_rows.detach() * g).sum(), g.sum()))
+                (entropy_rows.detach() * g).sum(), g.sum(), belief_loss.detach()))
 
     def _run(self) -> None:
         if not self.use_graph:
@@ -351,8 +379,10 @@ class PpoUpdater:
         chunk = 65536
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             self.critic.eval()
+            stock = self.critic.stock
             values = torch.cat([
-                self.critic(_critic_input(data.features[i:i + chunk], data.opp_hand[i:i + chunk])).float()
+                self.critic.value(self.critic(_critic_input(data.features[i:i + chunk], data.opp_hand[i:i + chunk],
+                                                            data.stock[i:i + chunk] if stock else None)))
                 for i in range(0, n, chunk)
             ])
         advantages = self._advantages(values, data.returns, gae_lambda)
@@ -384,5 +414,5 @@ class PpoUpdater:
             policy_loss=s[0] / count, value_loss=s[1] / count, entropy=s[2] / count,
             entropy_gostop=s[6] / s[7] if s[7] else float("nan"),
             kl=s[3] / count, clipfrac=s[4] / count, explained_var=explained_var,
-            updates=updates, epochs=updates / max(1, n // self.minibatch),
+            updates=updates, epochs=updates / max(1, n // self.minibatch), belief_loss=s[8] / count,
         )

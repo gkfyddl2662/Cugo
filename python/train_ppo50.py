@@ -8,10 +8,10 @@ from pathlib import Path
 
 import torch
 
-from cugo_contract50 import CONTRACT, load_checkpoint
+from cugo_contract50 import CONTRACT, fit_optimizer, fit_state, load_checkpoint, optimizer_names
 from cugo_eval50 import load_policy_checkpoint
 from cugo_ppo50 import PpoUpdater, RolloutStorage, collect
-from cugo_ppo_nets50 import OracleCritic, PpoActor
+from cugo_ppo_nets50 import BeliefHead, OracleCritic, PpoActor
 from cugo_torch50_ext import load_extension
 from league50 import match
 
@@ -72,8 +72,17 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("build/checkpoints/ppo50"))
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--no-graph", action="store_true", help="disable CUDA-graph training step")
-    parser.add_argument("--memory-fraction", type=float, default=0.85,
-                        help="cap on PyTorch's share of dedicated VRAM")
+    parser.add_argument("--memory-fraction", type=float, default=0.80,
+                        help="cap on PyTorch's share of dedicated VRAM (Windows pages GPU memory beyond ~12 GB of 16)")
+    parser.add_argument("--value-bins", type=int, default=0,
+                        help="distributional critic over N symlog-spaced bins (0 = smooth L1 regression)")
+    parser.add_argument("--value-top", type=float, default=640.0, help="largest |scaled return| the bins reach")
+    parser.add_argument("--critic-stock", action="store_true", help="the critic also sees the next 8 stock draws")
+    parser.add_argument("--belief-coef", type=float, default=0.0,
+                        help="weight of the actor's opponent-hand prediction loss (0 = no belief head)")
+    parser.add_argument("--belief-width", type=int, default=512, help="hidden width of the belief head")
+    parser.add_argument("--critic-warmup", type=int, default=0,
+                        help="first N iterations of this invocation train only the critic and belief head")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -86,15 +95,22 @@ def main() -> None:
     updater: PpoUpdater | None = None
 
     actor = PpoActor(args.hidden, args.blocks, args.norm).to(device)
-    critic = OracleCritic(args.hidden, args.blocks, args.norm).to(device)
+    critic = OracleCritic(args.hidden, args.blocks, args.norm, stock=args.critic_stock,
+                          value_bins=args.value_bins, value_top=args.value_top).to(device)
+    belief = BeliefHead(args.hidden, args.belief_width).to(device) if args.belief_coef > 0 else None
     if args.init is not None and args.resume is not None:
         raise SystemExit("--init starts a fresh run from weights; --resume continues one. Pick one.")
     start_iteration = 0
     source = args.resume or args.init
     payload = load_ppo(source, device) if source is not None else None
+    restarted: list[str] = []
     if payload is not None:
         actor.load_state_dict(payload["actor"])
-        critic.load_state_dict(payload["critic"])
+        # A critic that gained inputs or bins keeps its trunk (see cugo_contract50.fit_state).
+        critic_state, restarted = fit_state(payload["critic"], critic)
+        critic.load_state_dict(critic_state)
+        if belief is not None and "belief" in payload:
+            belief.load_state_dict(payload["belief"])
     # Exponential moving average of actor weights: the release/eval policy. Greedy play
     # flips on near-tied actions, so single updates occasionally crashed raw checkpoints
     # (e.g. -12.5 pts at one eval); averaging ~1/(1-decay) iterations smooths that out.
@@ -102,14 +118,24 @@ def main() -> None:
     if payload is not None and "actor_ema" in payload:
         ema_actor.load_state_dict(payload["actor_ema"])
     ema_params, actor_params = list(ema_actor.parameters()), list(actor.parameters())
-    optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=args.lr, eps=1e-5,
-                                 fused=True, capturable=True)
+    optimizer = torch.optim.Adam(
+        [{"params": list(actor.parameters())},
+         {"params": [*critic.parameters(), *(belief.parameters() if belief is not None else [])]}],
+        lr=args.lr, eps=1e-5, fused=True, capturable=True)
 
     fixed_pool = [load_policy_checkpoint(p, args.opponent_policy, device).model for p in args.opponent]
     snapshots: list[torch.nn.Module] = []
     if args.resume is not None:
-        optimizer.load_state_dict(payload["optimizer"])
+        optimizer.load_state_dict(fit_optimizer(payload, actor, critic, belief))
         start_iteration = int(payload["iteration"])
+    # Learning rates live on the GPU: the captured update step reads them on every replay
+    # (a float would be baked into the graph), so the warm-up switch needs no recapture.
+    for group in optimizer.param_groups:
+        group["capturable"] = True
+        group["lr"] = torch.tensor(args.lr, device=device)
+    warm_until = start_iteration + args.critic_warmup
+    if args.critic_warmup > 0:
+        optimizer.param_groups[0]["lr"].fill_(0.0)  # hold the actor while the critic catches up
         if not args.exploiter and args.pool_every > 0:
             # A snapshot taken at iteration k is the EMA actor saved in that iteration's checkpoint.
             for k in range(args.pool_every, start_iteration + 1, args.pool_every):
@@ -135,6 +161,9 @@ def main() -> None:
     print(f"lr={args.lr:g} epochs={args.epochs} minibatch={args.minibatch} clip={args.clip:g} "
           f"entropy={args.entropy:g} entropy_final={args.entropy_final if args.entropy_final is not None else args.entropy:g} "
           f"target_kl={args.target_kl:g} reward_scale={args.reward_scale:g} gae_lambda={args.gae_lambda:g}")
+    print(f"value_bins={args.value_bins} value_top={args.value_top:g} critic_stock={int(args.critic_stock)} "
+          f"belief_coef={args.belief_coef:g} critic_warmup={args.critic_warmup} "
+          f"critic_restarted={','.join(restarted) or 'none'} memory_fraction={args.memory_fraction:g}")
     if args.reference is not None:  # every invocation, so a resumed log records the reference it evaluates against
         print(f"reference={args.reference.as_posix()} reference_policy={args.reference_policy}")
     config = vars(args) | {"algorithm": "ppo-oracle-critic-v1", "feature_contract": CONTRACT}
@@ -155,9 +184,12 @@ def main() -> None:
                        reward_scale=args.reward_scale, storage=storage)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
+        if args.critic_warmup > 0 and iteration == warm_until + 1:
+            optimizer.param_groups[0]["lr"].fill_(args.lr)
         if updater is None:
             updater = PpoUpdater(actor, critic, optimizer, storage, args.minibatch, args.clip,
-                                 args.value_coef, args.grad_clip, use_graph=not args.no_graph)
+                                 args.value_coef, args.grad_clip, use_graph=not args.no_graph,
+                                 belief=belief, belief_coef=args.belief_coef)
         stats = updater.update(data, args.epochs, entropy_coef, args.target_kl, args.gae_lambda)
         with torch.no_grad():
             torch._foreach_lerp_(ema_params, actor_params, 1.0 - args.ema_decay)
@@ -178,7 +210,9 @@ def main() -> None:
               f"ppo_value={stats.value_loss:.6f} ppo_entropy={stats.entropy:.6f} "
               f"ppo_entropy_gostop={stats.entropy_gostop:.6f} ppo_kl={stats.kl:.6f} "
               f"ppo_clipfrac={stats.clipfrac:.4f} ppo_explained_var={stats.explained_var:.4f} "
-              f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}")
+              f"ppo_updates={stats.updates} ppo_epochs={stats.epochs:.2f} entropy_coef={entropy_coef:.5f}"
+              + (f" belief_loss={stats.belief_loss:.5f}" if belief is not None else "")
+              + (" critic_warmup=1" if iteration <= warm_until else ""))
 
         if not args.exploiter and args.pool_every > 0 and iteration % args.pool_every == 0:
             # The EMA is the release policy; the raw actor can swing between updates.
@@ -190,8 +224,9 @@ def main() -> None:
             path = args.checkpoint_dir / f"iter_{iteration:06d}.pt"
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"iteration": iteration, "actor": actor.state_dict(), "critic": critic.state_dict(),
-                        "actor_ema": ema_actor.state_dict(),
-                        "optimizer": optimizer.state_dict(), "config": config}, path)
+                        "actor_ema": ema_actor.state_dict(), "optimizer": optimizer.state_dict(),
+                        "optimizer_names": optimizer_names(actor, critic, belief), "config": config}
+                       | ({"belief": belief.state_dict()} if belief is not None else {}), path)
             print(f"checkpoint={path}")
 
         if reference is not None and args.eval_every > 0 and (iteration % args.eval_every == 0 or iteration == 1):

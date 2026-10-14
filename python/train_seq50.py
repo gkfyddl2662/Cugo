@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cugo_contract50 import CONTRACT, load_checkpoint, stop_points
+from cugo_contract50 import CONTRACT, fit_optimizer, fit_state, load_checkpoint, optimizer_names, stop_points
 from cugo_eval50 import load_policy_checkpoint
 from cugo_ppo50 import DECISION_OFFSET, GOSTOP_KIND, TrainStats
 from cugo_ppo_nets50 import ACTIONS, FEATURES, card_plane, make_seeds
@@ -567,81 +567,6 @@ def update(nets: Nets, storage: SeqStorage, data: SeqRollout, args: argparse.Nam
                       epochs=updates / max(1, len(plan)), belief_loss=t[8] / count)
 
 
-def _fit(old: torch.Tensor, new: torch.Tensor) -> tuple[torch.Tensor, bool]:
-    """Old tensor reshaped onto the new one: equal shapes pass, a matrix that gained input
-    columns (new oracle inputs, appended last) is zero-padded, anything else restarts at
-    zero. Returns (tensor, whether it was kept whole)."""
-    if old.shape == new.shape:
-        return old, True
-    if old.dim() == 2 and new.dim() == 2 and old.shape[0] == new.shape[0] and old.shape[1] < new.shape[1]:
-        out = new.new_zeros(new.shape, dtype=old.dtype)
-        out[:, :old.shape[1]] = old
-        return out, True
-    return torch.zeros_like(new, dtype=old.dtype), False
-
-
-def fit_state(saved: dict, module: nn.Module) -> tuple[dict, list[str]]:
-    """A checkpoint's state dict fitted to `module` (see _fit); names the tensors that restarted."""
-    out, restarted = {}, []
-    for name, tensor in module.state_dict().items():
-        if name not in saved:
-            out[name] = tensor
-            restarted.append(name)
-            continue
-        out[name], kept = _fit(saved[name], tensor)
-        if not kept:
-            restarted.append(name)
-    return out, restarted
-
-
-def optimizer_names(nets: Nets) -> list[list[str]]:
-    actor = [f"actor.{n}" for n, _ in nets.actor.named_parameters()]
-    rest = [f"critic.{n}" for n, _ in nets.critic.named_parameters()]
-    if nets.belief is not None:
-        rest += [f"belief.{n}" for n, _ in nets.belief.named_parameters()]
-    return [actor, rest]
-
-
-def fit_optimizer(payload: dict, nets: Nets) -> dict:
-    """The checkpoint's Adam state laid out for this optimizer's groups, matched by
-    parameter name. Checkpoints before the actor/critic split had one group in
-    actor-then-critic order. New parameters start without state; reshaped ones as _fit
-    says, with their step count reset when they restart."""
-    saved = payload["optimizer"]
-    names = payload.get("optimizer_names")
-    if names is None:
-        critic_names = [f"critic.{n}" for n in payload["critic"] if not n.startswith("support")]
-        names = [[f"actor.{n}" for n, _ in nets.actor.named_parameters()] + critic_names]
-    old_ids = [i for group in saved["param_groups"] for i in group["params"]]
-    flat = [name for group in names for name in group]
-    by_name = {name: saved["state"].get(i) for name, i in zip(flat, old_ids)}
-    current = {f"actor.{n}": p for n, p in nets.actor.named_parameters()}
-    current |= {f"critic.{n}": p for n, p in nets.critic.named_parameters()}
-    if nets.belief is not None:
-        current |= {f"belief.{n}": p for n, p in nets.belief.named_parameters()}
-    state, groups, k = {}, [], 0
-    for g, group_names in enumerate(optimizer_names(nets)):
-        ids = []
-        for name in group_names:
-            old = by_name.get(name)
-            if old is not None:
-                fitted, whole = {}, True
-                for key, value in old.items():
-                    if torch.is_tensor(value) and value.dim() > 0:
-                        value, kept = _fit(value, current[name])
-                        whole &= kept
-                    fitted[key] = value
-                if not whole and torch.is_tensor(fitted.get("step")):
-                    fitted["step"] = torch.zeros_like(fitted["step"])
-                state[k] = fitted
-            ids.append(k)
-            k += 1
-        group = dict(saved["param_groups"][min(g, len(saved["param_groups"]) - 1)])
-        group["params"] = ids
-        groups.append(group)
-    return {"state": state, "param_groups": groups}
-
-
 def frozen(model: nn.Module, args: argparse.Namespace, state: dict | None = None) -> nn.Module:
     """Eager, gradient-free copy of an actor (a fresh module, so compiled wrappers are not copied)."""
     copy_ = seq_actor(args.mode, args.d_model, args.layers, args.heads).to(next(model.parameters()).device)
@@ -683,7 +608,7 @@ def main() -> None:
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--memory-fraction", type=float, default=0.85)
+    parser.add_argument("--memory-fraction", type=float, default=0.80)
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile the transformer stacks (dynamic shapes; needs triton)")
     parser.add_argument("--collector", choices=("graph", "eager"), default="graph",
@@ -734,7 +659,7 @@ def main() -> None:
         if belief is not None and "belief" in payload:
             belief.load_state_dict(payload["belief"])
         ema_actor.load_state_dict(payload["actor_ema"])
-        optimizer.load_state_dict(fit_optimizer(payload, nets))
+        optimizer.load_state_dict(fit_optimizer(payload, actor, critic, belief))
         for group in optimizer.param_groups:  # the checkpoint's settings would override ours
             group["capturable"] = args.update_graphs
             group["lr"] = args.lr
@@ -845,7 +770,7 @@ def main() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"iteration": iteration, "actor": actor.state_dict(), "critic": critic.state_dict(),
                         "actor_ema": ema_actor.state_dict(), "optimizer": optimizer.state_dict(),
-                        "optimizer_names": optimizer_names(nets), "config": config}
+                        "optimizer_names": optimizer_names(actor, critic, belief), "config": config}
                        | ({"belief": belief.state_dict()} if belief is not None else {}), path)
             print(f"checkpoint={path}", flush=True)
 
