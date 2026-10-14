@@ -333,6 +333,35 @@ __global__ void hands_indexed_kernel(const TorchEnv50* envs,
   hands[2 * i + 1] = static_cast<std::int64_t>(turn.hand1);
 }
 
+// The stock is a card mask drawn by a SplitMix64 stream: every draw (flips and bonus
+// replacements alike) takes the next uniform card of the mask, so the next draws are
+// fixed by (stock, rng_state). Packs the next 8 card ids into one int64, byte k = draw k,
+// 0xFF once the stock is empty.
+__global__ void stock_indexed_kernel(const TorchEnv50* envs,
+                                     const std::int64_t* env_ids,
+                                     std::int64_t* stock,
+                                     std::int64_t count,
+                                     std::int64_t env_count) {
+  const std::int64_t i =
+      static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+
+  const std::int64_t env_id = env_ids[i];
+  std::uint64_t packed = ~0ull;
+  if (env_id >= 0 && env_id < env_count) {
+    const auto& turn = envs[env_id].game.special.game.turn;
+    cugo::core::CardMask remaining = turn.stock;
+    std::uint64_t rng = turn.rng_state;
+    for (int k = 0; k < 8; ++k) {
+      const cugo::core::CardId card = cugo::game::draw_stock_card(remaining, rng);
+      if (!cugo::core::is_standard_card(card)) break;
+      packed &= ~(0xFFull << (8 * k));
+      packed |= static_cast<std::uint64_t>(card) << (8 * k);
+    }
+  }
+  stock[i] = static_cast<std::int64_t>(packed);
+}
+
 std::vector<torch::Tensor> allocate_observation_tensors(
     std::int64_t count,
     const c10::Device& device) {
@@ -496,6 +525,30 @@ std::vector<torch::Tensor> cugo_torch50_step_indexed_cuda(
   }
 
   return outputs;
+}
+
+torch::Tensor cugo_torch50_stock_indexed_cuda(torch::Tensor states,
+                                              torch::Tensor env_ids) {
+  check_states(states);
+  check_cuda_1d(env_ids, at::kLong, "env_ids");
+  check_same_device(states, env_ids, "states", "env_ids");
+
+  const c10::cuda::CUDAGuard guard(states.device());
+  const std::int64_t count = env_ids.numel();
+  auto stock = torch::empty(
+      {count}, torch::TensorOptions().device(states.device()).dtype(at::kLong));
+
+  if (count != 0) {
+    const int blocks = static_cast<int>((count + kThreads - 1) / kThreads);
+    stock_indexed_kernel<<<blocks, kThreads, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const TorchEnv50*>(states.data_ptr<std::uint8_t>()),
+        env_ids.data_ptr<std::int64_t>(), stock.data_ptr<std::int64_t>(), count,
+        states.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  return stock;
 }
 
 std::vector<torch::Tensor> cugo_torch50_step_events_indexed_cuda(

@@ -152,7 +152,7 @@ def load_extension(*, verbose: bool = False) -> Any:
 
     repo = Path(__file__).resolve().parents[1]
     source_dir = repo / "python" / "csrc"
-    build_dir = repo / "build" / "torch_extensions" / "cugo_torch50_ext_v5"
+    build_dir = repo / "build" / "torch_extensions" / "cugo_torch50_ext_v6"
     build_dir.mkdir(parents=True, exist_ok=True)
 
     os.environ.setdefault("MAX_JOBS", "4")
@@ -178,7 +178,7 @@ def load_extension(*, verbose: bool = False) -> Any:
         cuda_flags = ["-O3", "-std=c++20"]
 
     return cpp_extension.load(
-        name="cugo_torch50_ext_v5",
+        name="cugo_torch50_ext_v6",
         sources=[
             str(source_dir / "torch50_ext.cpp"),
             str(source_dir / "torch50_ext.cu"),

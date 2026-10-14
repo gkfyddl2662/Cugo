@@ -16,7 +16,7 @@ This means one network head can handle ordinary play, bonus play, shake/bomb/gre
 
 ## Dense feature layout
 
-`kTorch50FeatureCount = 720` floats (contract v4, extension `cugo_torch50_ext_v5`). Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`. New inputs go where a zero weight leaves an old network's output unchanged: `python/migrate_ppo50.py` widens 560-feature checkpoints, and `python/cugo_contract50.py` upgrades v3 checkpoints to v4 when they are loaded.
+`kTorch50FeatureCount = 720` floats (contract v4, extension `cugo_torch50_ext_v6`). Features are in `[0, 1]` except the side payment, which is clipped to `[-1, 1]`. New inputs go where a zero weight leaves an old network's output unchanged: `python/migrate_ppo50.py` widens 560-feature checkpoints, and `python/cugo_contract50.py` upgrades v3 checkpoints to v4 when they are loaded.
 
 | Range | Size | Meaning |
 | --- | ---: | --- |

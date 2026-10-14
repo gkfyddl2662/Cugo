@@ -21,11 +21,16 @@ The JIT extension exposes three operations:
   - `actions` is CUDA `int64 [N]` in the unified 179-action space.
   - `reward0` is from player 0's perspective and is non-zero on terminal settlement only.
 
+Self-play also uses indexed variants (`observe_indexed`, `step_indexed`, `step_events_indexed`, `clone_indexed`, `branch_indexed`) and two oracle reads for the critic:
+
+- `hands_indexed(states, env_ids) -> int64 [N, 2]`: both players' hand masks.
+- `stock_indexed(states, env_ids) -> int64 [N]`: the next 8 stock draws, one card id per byte (0xFF once the stock is empty). Every draw takes the next uniform card of the stock mask from the state's SplitMix64 stream, so `(stock, rng_state)` fixes the order. Over 160k decisions of random play, every later prediction continued the earlier one (cards only left from its front) and no predicted card was ever in a hand.
+
 The kernels use PyTorch's current CUDA stream. Game state never has to cross PCIe during self-play.
 
 ## JIT build
 
-`python/cugo_torch50_ext.py` uses `torch.utils.cpp_extension.load()` with the repository `include/` directory and C++20/CUDA C++20 flags. The build cache is stored under `build/torch_extensions/cugo_torch50_ext_v5`; the version suffix changes with the feature contract, so a running trainer that loaded an older build keeps working while a new one compiles.
+`python/cugo_torch50_ext.py` uses `torch.utils.cpp_extension.load()` with the repository `include/` directory and C++20/CUDA C++20 flags. The build cache is stored under `build/torch_extensions/cugo_torch50_ext_v6`; the version suffix changes with the feature contract or the exported operations, so a running trainer that loaded an older build keeps working while a new one compiles.
 
 For the Windows CUDA 13.2 development machine, use a PyTorch CUDA 13.2 build. PyTorch 2.14.0 provides `cu132` wheels.
 

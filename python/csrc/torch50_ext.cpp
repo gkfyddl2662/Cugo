@@ -25,6 +25,8 @@ std::vector<torch::Tensor> cugo_torch50_branch_indexed_cuda(
     torch::Tensor actions);
 torch::Tensor cugo_torch50_hands_indexed_cuda(torch::Tensor states,
                                               torch::Tensor env_ids);
+torch::Tensor cugo_torch50_stock_indexed_cuda(torch::Tensor states,
+                                              torch::Tensor env_ids);
 std::vector<torch::Tensor> cugo_torch50_step_events_indexed_cuda(
     torch::Tensor states,
     torch::Tensor env_ids,
@@ -49,6 +51,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Clone selected rows and apply actions without mutating parents");
   m.def("hands_indexed", &cugo_torch50_hands_indexed_cuda,
         "Return [N, 2] int64 card masks of both players' hidden hands");
+  m.def("stock_indexed", &cugo_torch50_stock_indexed_cuda,
+        "Return [N] int64: the next 8 stock draws, one card id per byte (0xFF = none)");
   m.def("step_events_indexed", &cugo_torch50_step_events_indexed_cuda,
         "step_indexed that also returns [N, EVENT_WORDS] int64 event records");
   m.def("start", &cugo_torch50_start_cuda,
